@@ -1,18 +1,26 @@
-# ALPHA ANALYZER V16 — MCX Clean Display
+# ALPHA ANALYZER V17 — Long / Short / Setup Dashboards + SL
 
-MCX now uses the same simple display as NSE:
+Each NSE and MCX module now has:
+- 🟢 LONG TRADES
+- 🔴 SHORT TRADES
+- 🟡 SETUPS FORMING
+- All scanned instruments
 
-Script | LTP | Bias | Trade Recommendation
+Each trade row displays:
+Script | LTP | Bias | SL | Recommendation
 
-MCX Intraday:
-- Daily 0.25% / 3-box P&F direction filter once per day.
-- Only Bullish/Bearish commodities retained.
-- 0.15% / 3-box / 1-minute P&F.
-- Matching DTB/DBS gives BUY/SELL.
+SL is taken from the P&F structure:
+- Long = pullback O-column low
+- Short = pullback X-column high
 
-MCX Positional:
-- 0.25% / 3-box / daily close.
-- DTB = BUY; DBS = SELL.
+NSE Intraday:
+- Daily 0.25% Anchor filter remains once per trading day.
+- Intraday 0.15% P&F + existing 10-SMA filter.
+- No OI or sector analysis.
 
-BUY rows are green and SELL rows are red.
-The old raw P&F JSON/debug output is removed.
+NSE Positional:
+- 0.25% / 3-box / daily P&F.
+
+MCX:
+- Intraday: daily 0.25% direction filter -> 0.15% intraday P&F.
+- Positional: 0.25% / 3-box / daily P&F.
