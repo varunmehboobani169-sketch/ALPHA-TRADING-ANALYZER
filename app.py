@@ -135,6 +135,14 @@ def load_instruments():
     if "expiry_date" in df.columns:
         df["expiry_date"] = pd.to_datetime(df["expiry_date"], errors="coerce")
 
+    # Exclude Dhan/test symbols such as 011NSETEST, 021NSETEST, ... from every scanner.
+    text_cols = [c for c in ["trading_symbol", "custom_symbol", "symbol_name", "underlying_symbol"] if c in df.columns]
+    if text_cols:
+        test_mask = pd.Series(False, index=df.index)
+        for c in text_cols:
+            test_mask = test_mask | df[c].astype(str).str.upper().str.contains("NSETEST", na=False)
+        df = df.loc[~test_mask].copy()
+
     # Reliable underlying symbol:
     # RELIANCE-Aug2026-FUT -> RELIANCE
     # SILVER-04Sep2026-FUT -> SILVER
@@ -1052,9 +1060,9 @@ def evaluate_three_stars(pnf, oi_state_text, sector_info, direction):
 
     # Star 3: sector/NIFTY ratio P&F has the same directional pattern.
     if direction == "LONG":
-        sector_star = sector_info.get("bias") == "Bullish" and sector_info.get("star", False)
+        sector_star = sector_info.get("bias") == "Bullish"
     else:
-        sector_star = sector_info.get("bias") == "Bearish" and sector_info.get("star", False)
+        sector_star = sector_info.get("bias") == "Bearish"
 
     stars = int(pnf_star) + int(oi_star) + int(sector_star)
     return stars, pnf_star, oi_star, sector_star
@@ -1094,10 +1102,12 @@ def run_nse_pnf_scan(sys_mode, anchor_min, require_oi, universe_signature):
             else:
                 oi_ok = True
 
-            if pnf["signal_side"] == "LONG":
-                status = "🟢 BUY" if oi_ok else "WAIT - OI"
-            elif pnf["signal_side"] == "SHORT":
-                status = "🔴 SELL" if oi_ok else "WAIT - OI"
+            # P&F DTB/DBS is the actual entry trigger.
+            # OI and Sector are ranking stars only.
+            if pnf["signal_side"] == "LONG" and pnf.get("dtb"):
+                status = "🟢 BUY"
+            elif pnf["signal_side"] == "SHORT" and pnf.get("dbs"):
+                status = "🔴 SELL"
             elif not pnf["anchor"]:
                 status = "WAIT - NO ANCHOR"
             elif pnf["bias"] == "Bullish":
@@ -1121,7 +1131,7 @@ def run_nse_pnf_scan(sys_mode, anchor_min, require_oi, universe_signature):
                 "Futures OI": oi_state_text,
                 "OI Δ": oi_info.get("oi_change", np.nan),
                 "System": status,
-                "Stars": "⭐" * stars if stars else "—",
+                "Stars": "⭐" * int(stars) if stars else "—",
                 "Star Count": stars,
                 "P&F ⭐": "⭐" if pnf_star else "—",
                 "OI ⭐": "⭐" if oi_star else "—",
@@ -1191,9 +1201,8 @@ if mode == "Market Overview":
 elif mode == "Trade Ranking":
     st.subheader("Trade Ranking — 3-Star Model")
     st.caption(
-        "⭐ P&F = exact 3-column stock pattern | "
-        "⭐ OI = futures price/ΔOI buildup confirmation | "
-        "⭐ Sector = sector/NIFTY ratio P&F confirmation"
+        "The first column is the complete trade rating: ⭐ P&F + ⭐ OI + ⭐ Sector. "
+        "P&F remains the entry trigger; the stars rank the setup."
     )
     sys_mode = st.radio("P&F timeframe", ["Intraday", "Positional"], horizontal=True)
     res = run_nse_pnf_scan(
@@ -1214,7 +1223,7 @@ elif mode == "Trade Ranking":
         st.dataframe(
             ranked[[
                 "Stars","Symbol","Sector","Bias","Pattern","Anchor Boxes","Pullback Boxes",
-                "P&F ⭐","OI ⭐","Sector ⭐","Sector Ratio","Futures OI","System","Entry Level","SL","Reason"
+                "Sector Ratio","Futures OI","System","Entry Level","SL","Reason"
             ]],
             use_container_width=True, hide_index=True
         )
@@ -1225,8 +1234,8 @@ elif mode == "Trade Ranking":
         else:
             st.dataframe(
                 strongest[[
-                    "Symbol","Sector","Bias","Pattern","Anchor Boxes","Pullback Boxes",
-                    "P&F ⭐","OI ⭐","Sector ⭐","System","Entry Level","SL"
+                    "Stars","Symbol","Sector","Bias","Pattern","Anchor Boxes","Pullback Boxes",
+                    "Sector Ratio","System","Entry Level","SL"
                 ]],
                 use_container_width=True, hide_index=True
             )
@@ -1260,14 +1269,17 @@ elif mode in ("NSE Intraday P&F", "NSE Positional P&F"):
         c1.metric("Stocks scanned", len(res))
         c2.metric("Bullish", int((res["Bias"] == "Bullish").sum()))
         c3.metric("Bearish", int((res["Bias"] == "Bearish").sum()))
-        c4.metric("Trade-ready", int(res["System"].isin(["🟢 BUY","🔴 SELL"]).sum()))
+        c4.metric("P&F entries", int(res["System"].isin(["🟢 BUY","🔴 SELL"]).sum()))
+        st.caption(
+            f"Exact 3-column DTB/DBS found: {int(res['System'].isin(['🟢 BUY','🔴 SELL']).sum())}. "
+            "The first column shows the total 0–3 star rating."
+        )
 
         cols = ["⭐","Symbol","Sector","Pattern","Anchor Boxes","Anchor","DTB","DBS",
                 "Futures OI","OI Δ","System","SL","Reason"]
         cols = [
             "Stars","Symbol","Sector","Pattern","Prospective","Anchor Boxes","Pullback Boxes",
-            "P&F ⭐","OI ⭐","Sector ⭐","Sector Ratio","Anchor","DTB","DBS",
-            "Futures OI","OI Δ","System","Entry Level","SL","Reason"
+            "Sector Ratio","Anchor","DTB","DBS","Futures OI","OI Δ","System","Entry Level","SL","Reason"
         ]
         available = [c for c in cols if c in res.columns]
         st.dataframe(res[available], use_container_width=True, hide_index=True)
@@ -1426,7 +1438,7 @@ elif mode in ("MCX Intraday", "MCX Positional"):
 # ----------------------------
 else:
     st.subheader("Diagnostics")
-    st.write("Use this page when any scan is empty. It shows exactly where data stops.")
+    st.write("Operational diagnostics: credentials, instrument counts, API activity and errors.")
     st.write({
         "client_code_present": bool(st.session_state.alpha_client_id),
         "access_token_present": bool(st.session_state.alpha_access_token),
@@ -1444,45 +1456,8 @@ else:
     with st.expander("Instrument master columns"):
         st.write(list(instruments.columns))
 
-    with st.expander("Sample NSE futures"):
-        nse = nearest_fno(instruments, "NSE")
-        st.dataframe(nse.head(20), use_container_width=True, hide_index=True)
-
-    with st.expander("Sample MCX futures"):
-        mcx = nearest_fno(instruments, "MCX")
-        st.dataframe(mcx.head(20), use_container_width=True, hide_index=True)
 
 
-    st.markdown("### Quick API test")
-    nse_u = nearest_fno(instruments, "NSE")
-    mcx_u = nearest_fno(instruments, "MCX")
-    tc1, tc2 = st.columns(2)
-    with tc1:
-        if not nse_u.empty:
-            syms = nse_u["underlying_symbol"].astype(str).tolist()
-            test_sym = st.selectbox("Test NSE future", syms, key="test_nse_symbol")
-            if st.button("Test NSE daily data"):
-                rr = nse_u[nse_u["underlying_symbol"] == test_sym].iloc[0]
-                try:
-                    test_df = get_daily(rr["security_id"], lookback=30)
-                    st.success(f"{test_sym}: {len(test_df)} daily rows returned")
-                    st.dataframe(test_df.tail(10), use_container_width=True, hide_index=True)
-                except Exception as e:
-                    st.error(str(e))
-                    st.exception(e)
-    with tc2:
-        if not mcx_u.empty:
-            syms = mcx_u["underlying_symbol"].astype(str).tolist()
-            test_sym = st.selectbox("Test MCX future", syms, key="test_mcx_symbol")
-            if st.button("Test MCX daily data"):
-                rr = mcx_u[mcx_u["underlying_symbol"] == test_sym].iloc[0]
-                try:
-                    test_df = get_mcx_daily(rr["security_id"])
-                    st.success(f"{test_sym}: {len(test_df)} daily rows returned")
-                    st.dataframe(test_df.tail(10), use_container_width=True, hide_index=True)
-                except Exception as e:
-                    st.error(str(e))
-                    st.exception(e)
 
     if st.session_state.last_error:
         st.error(st.session_state.last_error)
