@@ -387,15 +387,37 @@ def sector_of(symbol):
     return SECTOR_MAP.get(str(symbol).upper(), "Other")
 
 def batch_future_quotes(future_df):
+    """
+    Fetch current futures LTP + OI.
+
+    Dhan's /marketfeed/ltp returns LTP only. OI is available from
+    /marketfeed/quote, so use the Quote endpoint for futures.
+    The API supports up to 1000 instruments/request; we use chunks of 500
+    to make the scanner more tolerant of a bad/invalid instrument ID.
+    """
     if future_df.empty:
         return {}
-    body = api_post(
-        "/marketfeed/ltp",
-        {"NSE_FNO": future_df["security_id"].astype(int).tolist()},
-        "NSE futures LTP/OI quote"
-    )
-    data = parse_data(body).get("NSE_FNO", {})
-    return {int(k): v for k, v in data.items() if isinstance(v, dict)}
+
+    ids = [int(x) for x in future_df["security_id"].dropna().tolist()]
+    result = {}
+
+    chunk_size = 500
+    for i in range(0, len(ids), chunk_size):
+        chunk = ids[i:i + chunk_size]
+        body = api_post(
+            "/marketfeed/quote",
+            {"NSE_FNO": chunk},
+            "NSE futures LTP/OI quote",
+        )
+
+        data = parse_data(body).get("NSE_FNO", {})
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if isinstance(v, dict):
+                    result[int(k)] = v
+
+    return result
+
 
 def previous_oi_from_history(sec_id):
     # One request per selected candidate, intentionally only used for ranking.

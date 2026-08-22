@@ -1,12 +1,15 @@
-# ALPHA ANALYZER FROM SCRATCH V2 — Ranking
+# ALPHA ANALYZER FROM SCRATCH V3 — Futures Quote Fix
 
-Adds a 4-slot ranking display:
-- ⭐ P&F directional pattern
-- ⭐ Futures OI buildup (current OI > previous daily OI)
-- ⭐ Sector P&F breadth support
-- 🟢★ New 3-column pattern (>15 Anchor -> 1–5 Pullback -> 3rd column)
+Fixes the ranking-version runtime error in the futures quote call.
 
-P&F DTB/DBS remains the actual entry trigger. The stars rank/confirm the setup.
+Root cause:
+- Dhan's `/marketfeed/ltp` endpoint returns LTP/ticker data.
+- Futures OI is returned by `/marketfeed/quote`.
+- The previous version incorrectly requested `/marketfeed/ltp` while expecting `oi`.
 
-The ranking build keeps the base data path working and uses batch live quotes for cash and futures.
-Previous OI history is only requested for currently directional candidates.
+V3:
+- Uses `/marketfeed/quote` for NSE futures LTP + OI.
+- Chunks futures requests in groups of 500.
+- Shows live futures quote coverage.
+- Keeps the clean from-scratch NSE cash/P&F data path.
+- P&F entry rules are unchanged.
