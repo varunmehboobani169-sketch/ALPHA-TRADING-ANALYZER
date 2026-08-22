@@ -55,9 +55,11 @@ with st.sidebar:
     st.divider()
     auto = st.checkbox("Auto refresh", True)
     refresh_min = st.selectbox("Refresh interval", [1, 2, 3, 5], index=2)
-    max_scan = st.slider("F&O/MCX scan size", 5, 80, 20, step=5)
+    scan_all_fno = st.checkbox("Scan ALL NSE F&O stocks", True)
+    max_scan = st.slider("F&O/MCX scan size (when ALL is off)", 20, 640, 100, step=20)
     anchor_boxes = st.number_input("Minimum anchor boxes", 5, 30, 15)
     sector_threshold = st.slider("Super sector breadth %", 50, 90, 70)
+    require_oi = st.checkbox("Require OI confirmation", True)
 
     if st.button("Clear login"):
         st.session_state.alpha_client_id = ""
@@ -244,88 +246,161 @@ def get_mcx_daily(sec_id):
     return candles_to_df(api_post("/charts/historical", payload, "mcx_daily"))
 
 # ----------------------------
-# P&F engine
-# This is a close-only percentage-box implementation.
+# Improved Point & Figure engine
 # ----------------------------
-def pnf_columns(closes, box_pct=0.0025, reversal=3):
-    prices = pd.Series(closes).dropna().astype(float).tolist()
+def _box_up(price, pct):
+    return price * (1.0 + pct)
+
+def _box_down(price, pct):
+    return price * (1.0 - pct)
+
+def pnf_build_columns(closes, box_pct=0.0025, reversal=3):
+    """
+    Close-only percentage P&F.
+
+    Rules:
+    - Uses only completed closes supplied by the caller.
+    - A box is a multiplicative percentage move.
+    - Reversal requires `reversal` boxes from the current extreme.
+    - Keeps full column history so Anchor -> retracement -> DTB/DBS
+      can be evaluated structurally.
+    """
+    prices = pd.Series(closes).dropna().astype(float)
+    prices = prices[prices > 0].tolist()
     if len(prices) < 3:
         return []
 
     cols = []
     direction = None
-    anchor_price = prices[0]
+    start_price = prices[0]
+    high = start_price
+    low = start_price
     boxes = 0
-    current_high = anchor_price
-    current_low = anchor_price
+    last_extreme = start_price
 
-    for p in prices[1:]:
+    def close_column():
+        if direction is not None and boxes > 0:
+            cols.append({
+                "type": direction,
+                "boxes": int(boxes),
+                "high": float(high),
+                "low": float(low),
+            })
+
+    for price in prices[1:]:
         if direction is None:
-            if p >= anchor_price * (1 + box_pct):
+            up_level = _box_up(start_price, box_pct)
+            down_level = _box_down(start_price, box_pct)
+
+            if price >= up_level:
                 direction = "X"
-                boxes = 1
-                current_high = anchor_price * (1 + box_pct)
-                while p >= current_high * (1 + box_pct):
-                    current_high *= (1 + box_pct)
+                high = start_price
+                low = start_price
+                boxes = 0
+                while price >= _box_up(high, box_pct):
+                    high = _box_up(high, box_pct)
                     boxes += 1
-                current_low = anchor_price
-            elif p <= anchor_price * (1 - box_pct):
+                last_extreme = high
+            elif price <= down_level:
                 direction = "O"
-                boxes = 1
-                current_low = anchor_price * (1 - box_pct)
-                while p <= current_low * (1 - box_pct):
-                    current_low *= (1 - box_pct)
+                high = start_price
+                low = start_price
+                boxes = 0
+                while price <= _box_down(low, box_pct):
+                    low = _box_down(low, box_pct)
                     boxes += 1
-                current_high = anchor_price
+                last_extreme = low
             continue
 
         if direction == "X":
-            while p >= current_high * (1 + box_pct):
-                current_high *= (1 + box_pct)
+            while price >= _box_up(high, box_pct):
+                high = _box_up(high, box_pct)
                 boxes += 1
-            reversal_level = current_high * ((1 - box_pct) ** reversal)
-            if p <= reversal_level:
-                cols.append({"type": "X", "boxes": boxes, "high": current_high, "low": current_low})
-                direction = "O"
-                current_low = current_high * (1 - box_pct)
-                current_high = current_low * (1 + box_pct)
-                boxes = reversal
-        else:
-            while p <= current_low * (1 - box_pct):
-                current_low *= (1 - box_pct)
-                boxes += 1
-            reversal_level = current_low * ((1 + box_pct) ** reversal)
-            if p >= reversal_level:
-                cols.append({"type": "O", "boxes": boxes, "high": current_high, "low": current_low})
-                direction = "X"
-                current_high = current_low * (1 + box_pct)
-                current_low = current_high * (1 - box_pct)
-                boxes = reversal
+            last_extreme = high
 
-    if direction:
+            reversal_level = high * ((1.0 - box_pct) ** reversal)
+            if price <= reversal_level:
+                close_column()
+                direction = "O"
+                # Start the new O column from the X extreme and fill the
+                # confirmed reversal distance.
+                new_low = high
+                new_boxes = 0
+                while price <= _box_down(new_low, box_pct):
+                    new_low = _box_down(new_low, box_pct)
+                    new_boxes += 1
+                low = new_low
+                high = high
+                boxes = max(reversal, new_boxes)
+                last_extreme = low
+
+        else:
+            while price <= _box_down(low, box_pct):
+                low = _box_down(low, box_pct)
+                boxes += 1
+            last_extreme = low
+
+            reversal_level = low * ((1.0 + box_pct) ** reversal)
+            if price >= reversal_level:
+                close_column()
+                direction = "X"
+                new_high = low
+                new_boxes = 0
+                while price >= _box_up(new_high, box_pct):
+                    new_high = _box_up(new_high, box_pct)
+                    new_boxes += 1
+                high = new_high
+                low = low
+                boxes = max(reversal, new_boxes)
+                last_extreme = high
+
+    if direction is not None and boxes > 0:
         cols.append({
             "type": direction,
-            "boxes": boxes,
-            "high": current_high,
-            "low": current_low,
+            "boxes": int(boxes),
+            "high": float(high),
+            "low": float(low),
         })
     return cols
 
-def pnf_analysis(df, box_pct, anchor_min=15):
-    if df.empty or len(df) < 5:
-        return {
-            "bias": "NO DATA",
-            "anchor": False, "dtb": False, "dbs": False,
-            "signal_side": None, "reason": "Insufficient price history",
-            "sl": np.nan, "columns": 0
-        }
 
-    cols = pnf_columns(df["close"], box_pct, 3)
-    out = {
-        "bias": "Neutral", "anchor": False, "dtb": False, "dbs": False,
-        "signal_side": None, "reason": "No fresh setup",
-        "sl": np.nan, "columns": len(cols)
+def pnf_analysis(df, box_pct, anchor_min=15, reversal=3):
+    """
+    Improved P&F signal definition:
+
+    LONG:
+      1. An earlier X-column is an Anchor (>= anchor_min boxes).
+      2. That anchor is followed by at least one O-column.
+      3. The current X-column breaks above the immediately prior X-column high.
+      4. The current signal must be the latest completed X column.
+      5. Structural SL = latest completed O-column low.
+
+    SHORT:
+      1. An earlier O-column is an Anchor (>= anchor_min boxes).
+      2. That anchor is followed by at least one X-column.
+      3. The current O-column breaks below the immediately prior O-column low.
+      4. The current signal must be the latest completed O column.
+      5. Structural SL = latest completed X-column high.
+
+    This prevents a generic "bullish column" from being treated as a DTB.
+    """
+    empty = {
+        "bias": "NO DATA", "anchor": False, "dtb": False, "dbs": False,
+        "signal_side": None, "reason": "Insufficient price history",
+        "sl": np.nan, "columns": 0, "anchor_boxes": 0,
+        "signal_price": np.nan, "pattern": "—"
     }
+
+    if df is None or df.empty or "close" not in df.columns:
+        return empty.copy()
+
+    closes = pd.to_numeric(df["close"], errors="coerce").dropna()
+    if len(closes) < 10:
+        return empty.copy()
+
+    cols = pnf_build_columns(closes, box_pct, reversal)
+    out = empty.copy()
+    out["columns"] = len(cols)
     if not cols:
         out["bias"] = "NO P&F"
         out["reason"] = "Could not build P&F columns"
@@ -333,62 +408,106 @@ def pnf_analysis(df, box_pct, anchor_min=15):
 
     cur = cols[-1]
     out["bias"] = "Bullish" if cur["type"] == "X" else "Bearish"
+    out["signal_price"] = float(closes.iloc[-1])
+
+    # Need at least 4 columns for a clean anchor -> opposite -> signal structure.
+    if len(cols) < 3:
+        out["reason"] = f"P&F built ({len(cols)} columns); waiting for anchor/retest structure"
+        return out
 
     if cur["type"] == "X":
-        prev_x = None
-        for c in reversed(cols[:-1]):
-            if c["type"] == "X":
-                prev_x = c
+        # The previous completed X column immediately before the retracement.
+        prev_x_idx = None
+        for i in range(len(cols) - 2, -1, -1):
+            if cols[i]["type"] == "X":
+                prev_x_idx = i
                 break
-        if prev_x is None:
+
+        if prev_x_idx is None:
             out["reason"] = "No previous X-column"
             return out
 
-        anchor = None
-        for c in cols[:-1]:
-            if c["type"] == "X" and c["boxes"] >= anchor_min:
-                anchor = c
-        out["anchor"] = anchor is not None
+        # Anchor must be earlier than the previous X column.
+        anchor_idx = None
+        for i in range(0, prev_x_idx):
+            if cols[i]["type"] == "X" and cols[i]["boxes"] >= anchor_min:
+                anchor_idx = i
+        if anchor_idx is None:
+            out["reason"] = f"No earlier X Anchor >= {anchor_min} boxes"
+            return out
 
-        if anchor is None:
-            out["reason"] = f"No X-column anchor >= {anchor_min} boxes"
-        elif cur["high"] > prev_x["high"]:
+        # There must have been an O-column after the anchor.
+        has_retrace = any(cols[j]["type"] == "O" for j in range(anchor_idx + 1, len(cols) - 1))
+        out["anchor"] = True
+        out["anchor_boxes"] = cols[anchor_idx]["boxes"]
+
+        if not has_retrace:
+            out["reason"] = f"Anchor found ({cols[anchor_idx]['boxes']} boxes); no O retracement yet"
+            return out
+
+        if cur["high"] > cols[prev_x_idx]["high"]:
             out["dtb"] = True
             out["signal_side"] = "LONG"
-            out["reason"] = f"Anchor ({anchor['boxes']} boxes) + DTB"
-            # Structural SL = most recent O-column low.
-            last_o = next((c for c in reversed(cols[:-1]) if c["type"] == "O"), None)
-            if last_o:
-                out["sl"] = last_o["low"]
+            out["pattern"] = "DTB"
+            out["reason"] = (
+                f"DTB after {cols[anchor_idx]['boxes']}-box X Anchor; "
+                f"breaks prior X high"
+            )
+            # SL = latest completed O column before current X.
+            latest_o = next((cols[j] for j in range(len(cols)-2, -1, -1)
+                             if cols[j]["type"] == "O"), None)
+            if latest_o:
+                out["sl"] = latest_o["low"]
         else:
-            out["reason"] = "Anchor present; current X-column has no fresh DTB"
+            out["reason"] = (
+                f"Anchor {cols[anchor_idx]['boxes']} boxes; "
+                f"current X has not broken prior X high"
+            )
+
     else:
-        prev_o = None
-        for c in reversed(cols[:-1]):
-            if c["type"] == "O":
-                prev_o = c
+        prev_o_idx = None
+        for i in range(len(cols) - 2, -1, -1):
+            if cols[i]["type"] == "O":
+                prev_o_idx = i
                 break
-        if prev_o is None:
+
+        if prev_o_idx is None:
             out["reason"] = "No previous O-column"
             return out
 
-        anchor = None
-        for c in cols[:-1]:
-            if c["type"] == "O" and c["boxes"] >= anchor_min:
-                anchor = c
-        out["anchor"] = anchor is not None
+        anchor_idx = None
+        for i in range(0, prev_o_idx):
+            if cols[i]["type"] == "O" and cols[i]["boxes"] >= anchor_min:
+                anchor_idx = i
+        if anchor_idx is None:
+            out["reason"] = f"No earlier O Anchor >= {anchor_min} boxes"
+            return out
 
-        if anchor is None:
-            out["reason"] = f"No O-column anchor >= {anchor_min} boxes"
-        elif cur["low"] < prev_o["low"]:
+        has_retrace = any(cols[j]["type"] == "X" for j in range(anchor_idx + 1, len(cols) - 1))
+        out["anchor"] = True
+        out["anchor_boxes"] = cols[anchor_idx]["boxes"]
+
+        if not has_retrace:
+            out["reason"] = f"Anchor found ({cols[anchor_idx]['boxes']} boxes); no X retracement yet"
+            return out
+
+        if cur["low"] < cols[prev_o_idx]["low"]:
             out["dbs"] = True
             out["signal_side"] = "SHORT"
-            out["reason"] = f"Anchor ({anchor['boxes']} boxes) + DBS"
-            last_x = next((c for c in reversed(cols[:-1]) if c["type"] == "X"), None)
-            if last_x:
-                out["sl"] = last_x["high"]
+            out["pattern"] = "DBS"
+            out["reason"] = (
+                f"DBS after {cols[anchor_idx]['boxes']}-box O Anchor; "
+                f"breaks prior O low"
+            )
+            latest_x = next((cols[j] for j in range(len(cols)-2, -1, -1)
+                             if cols[j]["type"] == "X"), None)
+            if latest_x:
+                out["sl"] = latest_x["high"]
         else:
-            out["reason"] = "Anchor present; current O-column has no fresh DBS"
+            out["reason"] = (
+                f"Anchor {cols[anchor_idx]['boxes']} boxes; "
+                f"current O has not broken prior O low"
+            )
 
     return out
 
@@ -418,13 +537,17 @@ def oi_state(df):
         return "LONG UNWINDING", pchg, d_oi
     return "NEUTRAL", pchg, d_oi
 
-def system_result(pnf, oi):
+def system_result(pnf, oi, require_oi=True):
     # Both long and short are supported for the scanner.
     if pnf["signal_side"] == "LONG":
+        if not require_oi:
+            return "🟢 BUY", True
         if oi == "LONG BUILDUP":
             return "🟢 BUY", True
         return "WAIT - OI", False
     if pnf["signal_side"] == "SHORT":
+        if not require_oi:
+            return "🔴 SELL", True
         if oi == "SHORT BUILDUP":
             return "🔴 SELL", True
         return "WAIT - OI", False
@@ -564,7 +687,7 @@ if mode == "NSE P&F":
     sys_mode = st.radio("Trading mode", ["Positional", "Intraday"], horizontal=True)
     box = 0.0025 if sys_mode == "Positional" else 0.0015
     st.info(
-        f"{sys_mode}: {box*100:.2f}% box | 3-box reversal | "
+        f"{sys_mode}: {box*100:.2f}% box | 3-box reversal | Anchor ≥ {anchor_boxes} boxes | "
         f"{'daily closes' if sys_mode=='Positional' else '1-minute closes'} only."
     )
 
@@ -575,9 +698,9 @@ if mode == "NSE P&F":
 
     sym = "underlying_symbol"
     uni[sym] = uni[sym].astype(str).str.upper().str.strip()
-    selected = choose_rows(uni.sort_values(sym), max_scan)
+    selected = uni.sort_values(sym).reset_index(drop=True) if scan_all_fno else choose_rows(uni.sort_values(sym), max_scan)
 
-    progress = st.progress(0)
+    progress = st.progress(0, text=f"Scanning {len(selected)} NSE F&O stocks...")
     rows = []
     for i, (_, r) in enumerate(selected.iterrows(), 1):
         symbol = str(r[sym])
@@ -589,7 +712,7 @@ if mode == "NSE P&F":
                 hist = hist[hist["datetime"] < now.floor("min")].copy()
             pnf = pnf_analysis(hist, box, int(anchor_boxes))
             oi, pchg, doichg = oi_state(hist)
-            status, qualified = system_result(pnf, oi)
+            status, qualified = system_result(pnf, oi, require_oi=require_oi)
             rows.append({
                 "Symbol": symbol,
                 "Sector": sector_of(symbol),
@@ -601,6 +724,8 @@ if mode == "NSE P&F":
                 "Price Δ%": pchg,
                 "OI Δ": doichg,
                 "System": status,
+                "Pattern": pnf.get("pattern", "—"),
+                "Anchor Boxes": pnf.get("anchor_boxes", 0),
                 "SL": pnf["sl"],
                 "Reason": pnf["reason"],
             })
@@ -608,10 +733,10 @@ if mode == "NSE P&F":
             rows.append({
                 "Symbol": symbol, "Sector": sector_of(symbol), "Bias":"ERROR",
                 "Anchor":"❌","DTB":"❌","DBS":"❌","OI":"ERROR",
-                "Price Δ%":np.nan,"OI Δ":np.nan,"System":"DATA ERROR","SL":np.nan,
+                "Price Δ%":np.nan,"OI Δ":np.nan,"System":"DATA ERROR","Pattern":"—","Anchor Boxes":0,"SL":np.nan,
                 "Reason":str(e)[:250]
             })
-        progress.progress(i/len(selected))
+        progress.progress(i/len(selected), text=f"Scanning NSE F&O: {i}/{len(selected)}")
     progress.empty()
 
     res = pd.DataFrame(rows)
@@ -622,26 +747,67 @@ if mode == "NSE P&F":
         res["⭐"] = ""
 
     c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Stocks scanned", len(res))
-    c2.metric("BUY signals", int((res["System"]=="🟢 BUY").sum()))
-    c3.metric("SELL signals", int((res["System"]=="🔴 SELL").sum()))
+    c1.metric("F&O stocks scanned", len(res))
+    c2.metric("Bullish P&F", int((res["Bias"]=="Bullish").sum()))
+    c3.metric("Bearish P&F", int((res["Bias"]=="Bearish").sum()))
     c4.metric("Data errors", int((res["System"]=="DATA ERROR").sum()))
 
-    st.subheader("System Results")
-    st.dataframe(
-        res[["⭐","Symbol","Sector","Bias","Anchor","DTB","DBS","OI","Price Δ%","OI Δ","System","SL","Reason"]],
-        use_container_width=True, hide_index=True
+    bullish = res[res["Bias"]=="Bullish"].copy()
+    bearish = res[res["Bias"]=="Bearish"].copy()
+
+    # Only bullish and bearish names are shown in the scanner.
+    # Neutral / no-P&F / data-error rows remain available through Diagnostics.
+    bullish = bullish.sort_values(
+        by=["DTB","Anchor Boxes","⭐","Symbol"],
+        ascending=[False, False, False, True]
+    )
+    bearish = bearish.sort_values(
+        by=["DBS","Anchor Boxes","⭐","Symbol"],
+        ascending=[False, False, False, True]
     )
 
-    buys = res[res["System"]=="🟢 BUY"]
-    sells = res[res["System"]=="🔴 SELL"]
-    a,b = st.columns(2)
-    with a:
-        st.markdown("### 🟢 BUY")
-        st.dataframe(buys[["⭐","Symbol","Sector","System","SL","Reason"]], use_container_width=True, hide_index=True)
-    with b:
-        st.markdown("### 🔴 SELL")
-        st.dataframe(sells[["⭐","Symbol","Sector","System","SL","Reason"]], use_container_width=True, hide_index=True)
+    st.subheader("NSE F&O P&F Scanner")
+    st.caption("ALL available NSE F&O futures are scanned. Only bullish and bearish P&F stocks are displayed below.")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("### 🟢 BULLISH STOCKS")
+        if bullish.empty:
+            st.info("No bullish P&F stocks currently detected.")
+        else:
+            st.dataframe(
+                bullish[["⭐","Symbol","Sector","Pattern","Anchor Boxes","Anchor","DTB","OI","System","SL","Reason"]],
+                use_container_width=True, hide_index=True
+            )
+
+    with right:
+        st.markdown("### 🔴 BEARISH STOCKS")
+        if bearish.empty:
+            st.info("No bearish P&F stocks currently detected.")
+        else:
+            st.dataframe(
+                bearish[["⭐","Symbol","Sector","Pattern","Anchor Boxes","Anchor","DBS","OI","System","SL","Reason"]],
+                use_container_width=True, hide_index=True
+            )
+
+    st.markdown("#### Trade-ready setups")
+    ready_left, ready_right = st.columns(2)
+    with ready_left:
+        buys = bullish[bullish["System"]=="🟢 BUY"]
+        st.metric("🟢 BUY setups", len(buys))
+        if not buys.empty:
+            st.dataframe(
+                buys[["⭐","Symbol","Sector","Pattern","Anchor Boxes","OI","System","SL"]],
+                use_container_width=True, hide_index=True
+            )
+    with ready_right:
+        sells = bearish[bearish["System"]=="🔴 SELL"]
+        st.metric("🔴 SELL setups", len(sells))
+        if not sells.empty:
+            st.dataframe(
+                sells[["⭐","Symbol","Sector","Pattern","Anchor Boxes","OI","System","SL"]],
+                use_container_width=True, hide_index=True
+            )
 
 # ----------------------------
 # Sector breadth
@@ -803,4 +969,8 @@ else:
         st.error(st.session_state.last_error)
 
 st.divider()
-st.caption(f"Page refresh: {datetime.now().strftime('%d-%b-%Y %H:%M:%S')} | API calls in this browser session: {len(st.session_state.api_log)}")
+st.caption(
+    f"Page refresh: {datetime.now().strftime('%d-%b-%Y %H:%M:%S')} | "
+    f"API calls in this browser session: {len(st.session_state.api_log)} | "
+    f"NSE scan mode: {'ALL F&O' if scan_all_fno else f'{max_scan} stocks'}"
+)

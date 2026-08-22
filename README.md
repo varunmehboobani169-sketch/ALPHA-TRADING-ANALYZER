@@ -1,12 +1,9 @@
-# ALPHA ANALYZER V11
+# ALPHA ANALYZER V13
 
-Critical data-pipeline fixes:
-- Correctly maps Dhan's compact instrument master `SEM_SMST_SECURITY_ID`.
-- Builds the underlying symbol from `SEM_TRADING_SYMBOL` (e.g. RELIANCE-Aug2026-FUT -> RELIANCE).
-- Filters to active/future contracts and chooses the nearest expiry per underlying.
-- Handles historical timestamps defensively.
-- Adds visible NSE/MCX active-futures counts.
-- Adds Diagnostics quick-test buttons for one NSE future and one MCX future.
-- Shows actual API exceptions instead of silently hiding them.
-
-Replace app.py and requirements.txt in GitHub. Keep the access token out of GitHub.
+NSE P&F Scanner changes:
+- Scans ALL NSE F&O futures by default (discovered from the Dhan instrument master).
+- Optional scan-size control if the user turns ALL off.
+- Displays only Bullish and Bearish P&F stocks in two side-by-side columns.
+- Neutral / no-signal / data-error rows are omitted from the main scanner but remain countable in the header/Diagnostics.
+- Bullish and Bearish lists are sorted to surface DTB/DBS and larger Anchor structures first.
+- Trade-ready BUY and SELL setups are shown separately underneath.
