@@ -789,6 +789,11 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
                 bias = p["bias"]
                 sl = p.get("sl", np.nan)
 
+            # Entry is the P&F trigger level:
+            # DTB/SETUP LONG -> Anchor high
+            # DBS/SETUP SHORT -> Anchor low
+            entry = p.get("entry_level", np.nan)
+
             # Ensure SL is displayed for BUY/SELL/SETUP. If pattern does not
             # yet have a pullback-based SL, derive a structural fallback from
             # the last three P&F columns.
@@ -809,7 +814,7 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
                 "Script": symbol,
                 "LTP": ltp,
                 "Bias": bias,
-                "Entry": p.get("entry_level", np.nan),
+                "Entry": entry,
                 "SL": sl,
                 "Recommendation": rec,
             })
@@ -837,7 +842,7 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
         st.info("No bullish trades currently.")
     else:
         st.dataframe(
-            long_df[["Script", "LTP", "Bias", "SL", "Recommendation"]],
+            long_df[["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]],
             use_container_width=True, hide_index=True
         )
 
@@ -846,7 +851,7 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
         st.info("No bearish trades currently.")
     else:
         st.dataframe(
-            short_df[["Script", "LTP", "Bias", "SL", "Recommendation"]],
+            short_df[["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]],
             use_container_width=True, hide_index=True
         )
 
@@ -855,13 +860,13 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
         st.info("No setups forming currently.")
     else:
         st.dataframe(
-            setup_df[["Script", "LTP", "Bias", "SL", "Recommendation"]],
+            setup_df[["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]],
             use_container_width=True, hide_index=True
         )
 
     st.markdown("## All Scanned")
     st.dataframe(
-        res[["Script", "LTP", "Bias", "SL", "Recommendation"]],
+        res[["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]],
         use_container_width=True, hide_index=True
     )
 
@@ -978,7 +983,7 @@ elif page in ("MCX Intraday", "MCX Positional"):
                 "Script": symbol,
                 "LTP": ltp,
                 "Bias": bias,
-                "Entry": p.get("entry_level", np.nan),
+                "Entry": entry,
                 "SL": sl,
                 "Recommendation": rec,
             })
@@ -1003,25 +1008,25 @@ elif page in ("MCX Intraday", "MCX Positional"):
     if long_df.empty:
         st.info("No bullish trades currently.")
     else:
-        st.dataframe(long_df[["Script","LTP","Bias","SL","Recommendation"]],
+        st.dataframe(long_df[["Script","LTP","Bias","Entry","SL","Recommendation"]],
                      use_container_width=True, hide_index=True)
 
     st.markdown("## 🔴 BEARISH / SHORT TRADES")
     if short_df.empty:
         st.info("No bearish trades currently.")
     else:
-        st.dataframe(short_df[["Script","LTP","Bias","SL","Recommendation"]],
+        st.dataframe(short_df[["Script","LTP","Bias","Entry","SL","Recommendation"]],
                      use_container_width=True, hide_index=True)
 
     st.markdown("## 🟡 SETUPS FORMING")
     if setup_df.empty:
         st.info("No setups forming currently.")
     else:
-        st.dataframe(setup_df[["Script","LTP","Bias","SL","Recommendation"]],
+        st.dataframe(setup_df[["Script","LTP","Bias","Entry","SL","Recommendation"]],
                      use_container_width=True, hide_index=True)
 
     st.markdown("## All Scanned")
-    st.dataframe(res[["Script","LTP","Bias","SL","Recommendation"]],
+    st.dataframe(res[["Script","LTP","Bias","Entry","SL","Recommendation"]],
                  use_container_width=True, hide_index=True)
 
 else:

@@ -1,12 +1,17 @@
-# ALPHA ANALYZER V19 — Entry Price Added
+# ALPHA ANALYZER V20 — Entry Display Fix
 
-NSE and MCX trade dashboards now show:
+The previous version calculated Entry correctly but did not include the Entry
+column in the Long/Short/Setup dashboard display.
 
+V20 fixes this.
+
+Every NSE and MCX dashboard now shows:
 Script | LTP | Bias | Entry | SL | Recommendation
 
-Entry is taken from the P&F breakout/entry level:
-- Bullish DTB = Anchor high breakout level.
-- Bearish DBS = Anchor low breakdown level.
-- Prospective setup = the current Anchor breakout level being watched.
+Entry:
+- DTB / bullish setup = Anchor high
+- DBS / bearish setup = Anchor low
 
-SL remains the structural P&F stop used by the existing logic.
+SL:
+- Existing P&F structural stop
+- Fallback to previous opposite P&F column extreme when needed
