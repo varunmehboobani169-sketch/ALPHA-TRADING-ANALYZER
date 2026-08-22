@@ -1,13 +1,15 @@
-# ALPHA ANALYZER V22 — Remove NSETEST Symbols
+# ALPHA ANALYZER V25 — Four-Star Model
 
-Filters out test instruments containing `NSETEST` from the instrument master before any
-NSE/MCX universe is built.
+Exactly four visible rating slots:
 
-Examples removed:
-011NSETEST
-021NSETEST
-031NSETEST
-...
-181NSETEST
+1. ⭐ P&F
+2. ⭐ OI
+3. ⭐ Sector/NIFTY relative-strength P&F
+4. 🟢★ New 3-column P&F pattern
 
-No trading-logic changes.
+New pattern:
+>15-box Anchor -> 1–5 box Pullback -> 3rd column.
+
+The first three stars are normal confirmation stars. The fourth slot is specifically the green New Pattern star.
+
+P&F DTB/DBS remains the actual entry trigger.

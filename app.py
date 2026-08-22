@@ -434,6 +434,7 @@ def pnf_analysis(df, box_pct, anchor_min=15, reversal=3):
         "anchor_boxes": 0,
         "pullback_boxes": 0,
         "pattern": "—",
+        "pf_pattern": False,
         "signal_price": np.nan,
         "entry_level": np.nan,
     }
@@ -467,6 +468,9 @@ def pnf_analysis(df, box_pct, anchor_min=15, reversal=3):
         out["pullback_boxes"] = c2["boxes"]
         out["entry_level"] = c1["high"]
 
+        if out["anchor"] and (1 <= c2["boxes"] <= 5):
+            out["pf_pattern"] = True
+
         if not out["anchor"]:
             out["reason"] = f"3-column sequence found, but Anchor is {c1['boxes']} X's (must be > {anchor_min})"
             return out
@@ -499,6 +503,9 @@ def pnf_analysis(df, box_pct, anchor_min=15, reversal=3):
         out["anchor_boxes"] = c1["boxes"]
         out["pullback_boxes"] = c2["boxes"]
         out["entry_level"] = c1["low"]
+
+        if out["anchor"] and (1 <= c2["boxes"] <= 5):
+            out["pf_pattern"] = True
 
         if not out["anchor"]:
             out["reason"] = f"3-column sequence found, but Anchor is {c1['boxes']} O's (must be > {anchor_min})"
@@ -1048,24 +1055,51 @@ st.caption(
 
 
 
-def evaluate_three_stars(pnf, oi_state_text, sector_info, direction):
-    # Star 1: stock P&F pattern is confirmed.
-    pnf_star = bool(
-        (direction == "LONG" and pnf.get("dtb")) or
-        (direction == "SHORT" and pnf.get("dbs"))
+def evaluate_trade_stars(pnf, oi_state_text, sector_info, direction):
+    """
+    Star model requested by user:
+      ⭐ = current directional P&F pattern
+      🟢⭐ = additional green star when the NEW 3-column setup is present
+      ⭐ = OI confirmation
+      ⭐ = sector/relative-strength confirmation
+
+    The first visible column is a compact overall star string.
+    P&F DTB/DBS remains the actual entry trigger.
+    """
+    # Base P&F pattern: any running bullish/bearish P&F structure.
+    pf_star = pnf.get("pf_pattern", False) and (
+        (direction == "LONG") or (direction == "SHORT") or pnf.get("bias") in ("Bullish","Bearish")
     )
 
-    # Star 2: meaningful futures OI buildup in the same direction.
+    # New 3-column pattern: valid Anchor >15 -> 1-5 pullback -> 3rd column.
+    new_pattern_star = pnf.get("pf_pattern", False) and (
+        pnf.get("pattern") in (
+            "PROSPECTIVE LONG", "PROSPECTIVE SHORT",
+            "NEW 3-COLUMN DTB", "NEW 3-COLUMN DBS"
+        )
+    )
+
     oi_star = oi_state_text == "OI BUILDUP"
 
-    # Star 3: sector/NIFTY ratio P&F has the same directional pattern.
+    sector_star = False
     if direction == "LONG":
         sector_star = sector_info.get("bias") == "Bullish"
-    else:
+    elif direction == "SHORT":
         sector_star = sector_info.get("bias") == "Bearish"
+    else:
+        # For a running pattern before signal, align to P&F bias.
+        if pnf.get("bias") == "Bullish":
+            sector_star = sector_info.get("bias") == "Bullish"
+        elif pnf.get("bias") == "Bearish":
+            sector_star = sector_info.get("bias") == "Bearish"
 
-    stars = int(pnf_star) + int(oi_star) + int(sector_star)
-    return stars, pnf_star, oi_star, sector_star
+    # Core visible rating:
+    # 1 = P&F pattern
+    # +1 = OI
+    # +1 = sector
+    # Additional green star is displayed separately in "Stars".
+    base_stars = int(pf_star) + int(oi_star) + int(sector_star)
+    return base_stars, pf_star, new_pattern_star, oi_star, sector_star
 
 # ----------------------------
 # Shared NSE P&F scanner
@@ -1131,8 +1165,14 @@ def run_nse_pnf_scan(sys_mode, anchor_min, require_oi, universe_signature):
                 "Futures OI": oi_state_text,
                 "OI Δ": oi_info.get("oi_change", np.nan),
                 "System": status,
-                "Stars": "⭐" * int(stars) if stars else "—",
+                "Stars": (
+                    ("⭐" if pnf_star else "☆") +
+                    ("⭐" if oi_star else "☆") +
+                    ("⭐" if sector_star else "☆") +
+                    ("🟢★" if new_pattern_star else "☆")
+                ),
                 "Star Count": stars,
+                "Four-Star Score": stars + (1 if new_pattern_star else 0),
                 "P&F ⭐": "⭐" if pnf_star else "—",
                 "OI ⭐": "⭐" if oi_star else "—",
                 "Sector ⭐": "⭐" if sector_star else "—",
@@ -1158,6 +1198,8 @@ def run_nse_pnf_scan(sys_mode, anchor_min, require_oi, universe_signature):
                 "System": "DATA ERROR",
                 "Stars": "—",
                 "Star Count": 0,
+                "Four-Star Score": 0,
+                "New Pattern": "—",
                 "P&F ⭐": "—",
                 "OI ⭐": "—",
                 "Sector ⭐": "—",
@@ -1201,8 +1243,9 @@ if mode == "Market Overview":
 elif mode == "Trade Ranking":
     st.subheader("Trade Ranking — 3-Star Model")
     st.caption(
-        "The first column is the complete trade rating: ⭐ P&F + ⭐ OI + ⭐ Sector. "
-        "P&F remains the entry trigger; the stars rank the setup."
+        "⭐ = running P&F directional pattern. 🟢★ = NEW 3-column setup "
+        "(>15 Anchor → 1–5 pullback → 3rd column). OI and Sector add normal confirmation stars. "
+        "DTB/DBS remains the entry trigger."
     )
     sys_mode = st.radio("P&F timeframe", ["Intraday", "Positional"], horizontal=True)
     res = run_nse_pnf_scan(
