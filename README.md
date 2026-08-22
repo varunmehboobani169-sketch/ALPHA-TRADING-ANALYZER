@@ -1,15 +1,21 @@
-# ALPHA ANALYZER FROM SCRATCH V3 — Futures Quote Fix
+# ALPHA ANALYZER V6 — Same-Contract Futures OI
 
-Fixes the ranking-version runtime error in the futures quote call.
+OI is now calculated directly from the exact active futures contract selected for each stock.
 
-Root cause:
-- Dhan's `/marketfeed/ltp` endpoint returns LTP/ticker data.
-- Futures OI is returned by `/marketfeed/quote`.
-- The previous version incorrectly requested `/marketfeed/ltp` while expecting `oi`.
+For the same contract:
+- Current OI
+- Previous OI
+- Change in OI
+- Change in OI %
+- Futures price change %
+- OI interpretation
 
-V3:
-- Uses `/marketfeed/quote` for NSE futures LTP + OI.
-- Chunks futures requests in groups of 500.
-- Shows live futures quote coverage.
-- Keeps the clean from-scratch NSE cash/P&F data path.
-- P&F entry rules are unchanged.
+Classification:
+- Price up + OI up = LONG BUILDUP
+- Price down + OI up = SHORT BUILDUP
+- Price up + OI down = SHORT COVERING
+- Price down + OI down = LONG UNWINDING
+
+OI can award the OI star when it confirms the P&F direction.
+P&F remains the actual entry trigger.
+If OI retrieval fails, P&F still works and the row shows OI UNAVAILABLE.

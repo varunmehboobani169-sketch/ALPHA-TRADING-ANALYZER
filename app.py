@@ -362,13 +362,13 @@ def analyze_new_pattern(df, box_pct, anchor_min=15, pullback_max=5):
 
 
 # -----------------------------
-# Ranking engine
+# Optional confirmation modules
 # -----------------------------
 SECTOR_MAP = {
-    "RELIANCE":"Energy","ONGC":"Energy","COALINDIA":"Energy","IOC":"Energy","BPCL":"Energy","GAIL":"Energy",
     "HDFCBANK":"Banking","ICICIBANK":"Banking","SBIN":"Banking","AXISBANK":"Banking","KOTAKBANK":"Banking",
     "INDUSINDBK":"Banking","BANKBARODA":"Banking","PNB":"Banking","FEDERALBNK":"Banking","IDFCFIRSTB":"Banking",
     "BAJFINANCE":"Financials","BAJAJFINSV":"Financials","SHRIRAMFIN":"Financials","CHOLAFIN":"Financials","MUTHOOTFIN":"Financials",
+    "RELIANCE":"Energy","ONGC":"Energy","COALINDIA":"Energy","IOC":"Energy","BPCL":"Energy","GAIL":"Energy",
     "TCS":"IT","INFY":"IT","HCLTECH":"IT","WIPRO":"IT","TECHM":"IT","LTIM":"IT","MPHASIS":"IT","COFORGE":"IT",
     "MARUTI":"Auto","M&M":"Auto","TATAMOTORS":"Auto","HEROMOTOCO":"Auto","EICHERMOT":"Auto","BAJAJ-AUTO":"Auto","TVSMOTOR":"Auto","ASHOKLEY":"Auto",
     "SUNPHARMA":"Pharma","CIPLA":"Pharma","DRREDDY":"Pharma","DIVISLAB":"Pharma","APOLLOHOSP":"Pharma","LUPIN":"Pharma","AUROPHARMA":"Pharma","TORNTPHARM":"Pharma",
@@ -380,49 +380,31 @@ SECTOR_MAP = {
     "TRENT":"Consumer","TITAN":"Consumer","DMART":"Consumer","KALYANKJIL":"Consumer","JUBLFOOD":"Consumer",
 }
 SECTOR_BASKETS = {}
-for _sym, _sector in SECTOR_MAP.items():
-    SECTOR_BASKETS.setdefault(_sector, []).append(_sym)
+for _s, _sec in SECTOR_MAP.items():
+    SECTOR_BASKETS.setdefault(_sec, []).append(_s)
 
 def sector_of(symbol):
     return SECTOR_MAP.get(str(symbol).upper(), "Other")
 
-def batch_future_quotes(future_df):
-    """
-    Fetch current futures LTP + OI.
-
-    Dhan's /marketfeed/ltp returns LTP only. OI is available from
-    /marketfeed/quote, so use the Quote endpoint for futures.
-    The API supports up to 1000 instruments/request; we use chunks of 500
-    to make the scanner more tolerant of a bad/invalid instrument ID.
-    """
-    if future_df.empty:
+def future_quote_map(fut):
+    """Current futures LTP/Quote for the exact active contract."""
+    if fut.empty:
+        return {}
+    try:
+        ids = fut["security_id"].dropna().astype(int).tolist()
+        body = api_post("/marketfeed/quote", {"NSE_FNO": ids}, "NSE futures quote")
+        data = parse_data(body).get("NSE_FNO", {})
+        return {int(k): v for k, v in data.items() if isinstance(v, dict)}
+    except Exception:
         return {}
 
-    ids = [int(x) for x in future_df["security_id"].dropna().tolist()]
-    result = {}
-
-    chunk_size = 500
-    for i in range(0, len(ids), chunk_size):
-        chunk = ids[i:i + chunk_size]
-        body = api_post(
-            "/marketfeed/quote",
-            {"NSE_FNO": chunk},
-            "NSE futures LTP/OI quote",
-        )
-
-        data = parse_data(body).get("NSE_FNO", {})
-        if isinstance(data, dict):
-            for k, v in data.items():
-                if isinstance(v, dict):
-                    result[int(k)] = v
-
-    return result
-
-
-def previous_oi_from_history(sec_id):
-    # One request per selected candidate, intentionally only used for ranking.
+def futures_oi_history(sec_id, lookback_days=7):
+    """
+    Fetch OI history for the SAME futures contract.
+    This avoids comparing one expiry's OI to another expiry's OI.
+    """
     end = datetime.now().date()
-    start = end - timedelta(days=5)
+    start = end - timedelta(days=lookback_days)
     payload = {
         "securityId": str(int(sec_id)),
         "exchangeSegment": "NSE_FNO",
@@ -432,101 +414,132 @@ def previous_oi_from_history(sec_id):
         "fromDate": str(start),
         "toDate": str(end + timedelta(days=1)),
     }
-    body = api_post("/charts/historical", payload, "previous futures OI")
+    body = api_post("/charts/historical", payload, "same-contract futures OI")
     data = parse_data(body)
-    if not isinstance(data, dict) or "open_interest" not in data:
-        return np.nan
-    s = pd.to_numeric(pd.Series(data["open_interest"]), errors="coerce").dropna()
-    return float(s.iloc[-1]) if not s.empty else np.nan
 
-def sector_relative_strength_map(master, symbols, mode):
-    """
-    Lightweight sector/NIFTY relative-strength ranking.
-    This version uses today's spot day change as the sector basket proxy,
-    so it adds ranking information without multiplying historical API calls.
-    P&F remains the primary stock pattern.
-    """
-    result = {s: {"sector": sector_of(s), "sector_bias": "UNAVAILABLE", "sector_star": False} for s in symbols}
-
-    # Calculate per-sector average spot day change from the rows already available.
-    # The caller fills Spot Day %; no extra API calls are made here.
-    return result
-
-def rank_rows(rows, future_quotes):
-    if not rows:
+    if not isinstance(data, dict):
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows)
-    # Sector
-    df["Sector"] = df["Symbol"].map(sector_of)
+    oi = pd.to_numeric(pd.Series(data.get("open_interest", [])), errors="coerce")
+    close = pd.to_numeric(pd.Series(data.get("close", [])), errors="coerce")
+    ts = pd.to_numeric(pd.Series(data.get("timestamp", [])), errors="coerce")
 
-    # Futures OI confirmation:
-    # current OI vs previous daily OI will be filled only for candidates.
-    df["OI State"] = "UNAVAILABLE"
-    df["OI Δ"] = np.nan
-    return df
+    n = min(len(oi), len(close), len(ts))
+    if n == 0:
+        return pd.DataFrame()
 
-def apply_rank_stars(df, previous_oi_map):
-    if df.empty:
-        return df
+    out = pd.DataFrame({
+        "timestamp": ts.iloc[:n].to_numpy(),
+        "close": close.iloc[:n].to_numpy(),
+        "oi": oi.iloc[:n].to_numpy(),
+    })
 
-    # Sector strength based on P&F breadth among the scanned stocks.
-    breadth = (
-        df.groupby("Sector")
-          .agg(
-              valid=("Symbol", "count"),
-              bullish=("Bias", lambda s: (s == "Bullish").sum()),
-              bearish=("Bias", lambda s: (s == "Bearish").sum())
-          )
-          .reset_index()
-    )
-    breadth["bullish_pct"] = 100 * breadth["bullish"] / breadth["valid"].replace(0, np.nan)
-    breadth["bearish_pct"] = 100 * breadth["bearish"] / breadth["valid"].replace(0, np.nan)
+    unit = "ms" if out["timestamp"].dropna().median() > 10**12 else "s"
+    out["datetime"] = pd.to_datetime(out["timestamp"], unit=unit, errors="coerce")
+    out = out.dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+    return out
 
-    bmap = breadth.set_index("Sector").to_dict("index")
+def classify_futures_oi(sec_id, direction):
+    """
+    Same active contract:
+    current OI - previous OI = ΔOI
+    current futures close - previous futures close = price direction
 
-    def sector_star(row):
-        b = bmap.get(row["Sector"])
-        if not b:
-            return False
-        if row["Bias"] == "Bullish":
-            return b["bullish_pct"] >= 50
-        if row["Bias"] == "Bearish":
-            return b["bearish_pct"] >= 50
-        return False
+    Long:  price up + OI up
+    Short: price down + OI up
+    Short covering: price up + OI down
+    Long unwinding: price down + OI down
+    """
+    try:
+        h = futures_oi_history(sec_id)
+        if len(h) < 2:
+            return {
+                "state": "UNAVAILABLE",
+                "current_oi": np.nan,
+                "previous_oi": np.nan,
+                "oi_change": np.nan,
+                "oi_change_pct": np.nan,
+                "price_change_pct": np.nan,
+                "star": False,
+            }
 
-    # P&F star: any directional P&F.
-    df["PF Star"] = df["Bias"].isin(["Bullish", "Bearish"])
+        a = h.iloc[-2]
+        b = h.iloc[-1]
 
-    # Green star: exact new 3-column pattern is running or confirmed.
-    df["Green Star"] = df["Pattern"].isin(["NEW PATTERN", "DTB", "DBS"])
+        prev_oi = float(a["oi"]) if pd.notna(a["oi"]) else np.nan
+        cur_oi = float(b["oi"]) if pd.notna(b["oi"]) else np.nan
 
-    # OI star: price direction + positive futures OI change.
-    oi_ok = []
-    for _, row in df.iterrows():
-        sid = int(row["Future ID"]) if pd.notna(row["Future ID"]) else None
-        prev = previous_oi_map.get(sid, np.nan) if sid is not None else np.nan
-        cur = row["Future OI"]
-        if pd.isna(cur) or pd.isna(prev):
-            oi_ok.append(False)
+        prev_price = float(a["close"]) if pd.notna(a["close"]) else np.nan
+        cur_price = float(b["close"]) if pd.notna(b["close"]) else np.nan
+
+        if any(pd.isna(x) for x in [prev_oi, cur_oi, prev_price, cur_price]):
+            return {
+                "state": "UNAVAILABLE",
+                "current_oi": cur_oi,
+                "previous_oi": prev_oi,
+                "oi_change": np.nan,
+                "oi_change_pct": np.nan,
+                "price_change_pct": np.nan,
+                "star": False,
+            }
+
+        oi_change = cur_oi - prev_oi
+        oi_change_pct = (oi_change / prev_oi * 100.0) if prev_oi else np.nan
+        price_change_pct = ((cur_price / prev_price) - 1.0) * 100.0 if prev_price else np.nan
+
+        if price_change_pct > 0 and oi_change > 0:
+            state = "LONG BUILDUP"
+            star = direction == "LONG"
+        elif price_change_pct < 0 and oi_change > 0:
+            state = "SHORT BUILDUP"
+            star = direction == "SHORT"
+        elif price_change_pct > 0 and oi_change < 0:
+            state = "SHORT COVERING"
+            star = False
+        elif price_change_pct < 0 and oi_change < 0:
+            state = "LONG UNWINDING"
+            star = False
         else:
-            d_oi = float(cur) - float(prev)
-            oi_ok.append(d_oi > 0)
-    df["OI Star"] = oi_ok
+            state = "NEUTRAL"
+            star = False
 
-    df["Sector Star"] = df.apply(sector_star, axis=1)
-    df["Stars"] = (
-        df["PF Star"].astype(int)
-        + df["OI Star"].astype(int)
-        + df["Sector Star"].astype(int)
-    )
-    df["Star Display"] = (
-        df["PF Star"].map(lambda x: "⭐" if x else "☆")
-        + df["OI Star"].map(lambda x: "⭐" if x else "☆")
-        + df["Sector Star"].map(lambda x: "⭐" if x else "☆")
-        + df["Green Star"].map(lambda x: "🟢★" if x else "☆")
-    )
-    return df
+        return {
+            "state": state,
+            "current_oi": cur_oi,
+            "previous_oi": prev_oi,
+            "oi_change": oi_change,
+            "oi_change_pct": oi_change_pct,
+            "price_change_pct": price_change_pct,
+            "star": star,
+        }
+    except Exception:
+        return {
+            "state": "UNAVAILABLE",
+            "current_oi": np.nan,
+            "previous_oi": np.nan,
+            "oi_change": np.nan,
+            "oi_change_pct": np.nan,
+            "price_change_pct": np.nan,
+            "star": False,
+        }
+
+
+def sector_breadth_star(df, symbol, direction):
+    """Sector confirmation from the already-scanned P&F universe; no extra API calls."""
+    sec = sector_of(symbol)
+    if sec == "Other":
+        return {"sector": sec, "breadth": np.nan, "star": False}
+    x = df[df["Sector"] == sec].copy()
+    valid = x[x["Bias"].isin(["Bullish", "Bearish"])]
+    if valid.empty:
+        return {"sector": sec, "breadth": np.nan, "star": False}
+    if direction == "LONG":
+        pct = 100.0 * (valid["Bias"] == "Bullish").mean()
+        return {"sector": sec, "breadth": pct, "star": pct >= 50.0}
+    if direction == "SHORT":
+        pct = 100.0 * (valid["Bias"] == "Bearish").mean()
+        return {"sector": sec, "breadth": pct, "star": pct >= 50.0}
+    return {"sector": sec, "breadth": np.nan, "star": False}
 
 
 # -----------------------------
@@ -573,6 +586,11 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
     mode = "Intraday" if page == "NSE Intraday P&F" else "Positional"
     box = 0.0015 if mode == "Intraday" else 0.0025
     st.title(page)
+    st.caption(
+        "Core = cash/spot P&F. OI is calculated from the SAME active futures contract: "
+        "Current OI − Previous OI, combined with futures price direction. "
+        "A failure in OI will NOT create DATA ERROR in the P&F scan."
+    )
 
     fut = future_universe(master, "NSE")
     if fut.empty:
@@ -580,49 +598,31 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
         st.stop()
 
     fut = fut.dropna(subset=["underlying_security_id"]).copy()
+    spot_map = batch_ltp("NSE_EQ", fut["underlying_security_id"].astype(int).tolist())
 
-    # One batched live cash quote for the complete universe.
-    spot_map = batch_ltp(
-        "NSE_EQ",
-        fut["underlying_security_id"].astype(int).tolist()
-    )
-
-    # One batched futures LTP/OI quote for the complete universe.
-    future_quote_map = batch_future_quotes(fut)
-
-    # We use previous OI only for ranking candidates. To avoid excessive API usage,
-    # fetch it after P&F classification for stars only on currently bullish/bearish rows.
+    # PASS 1: core P&F only. This should always remain independent.
     rows = []
-    progress = st.progress(0, text=f"Scanning {len(fut)} stocks...")
+    progress = st.progress(0, text=f"Scanning P&F for {len(fut)} stocks...")
     for i, (_, r) in enumerate(fut.iterrows(), 1):
         symbol = str(r["underlying_symbol"])
         sid_cash = int(r["underlying_security_id"])
-        sid_future = int(r["security_id"])
-        spot = spot_map.get(sid_cash, np.nan)
-        q = future_quote_map.get(sid_future, {})
-        future_ltp = pd.to_numeric(q.get("last_price"), errors="coerce")
-        future_oi = pd.to_numeric(q.get("oi"), errors="coerce")
-
         try:
             h = historical(sid_cash, "NSE_EQ", "EQUITY", mode)
             p = analyze_new_pattern(h, box)
-
             rows.append({
                 "Symbol": symbol,
                 "Sector": sector_of(symbol),
-                "Spot LTP": spot,
-                "Future LTP": future_ltp,
-                "Future OI": future_oi,
-                "Future ID": sid_future,
+                "Spot LTP": spot_map.get(sid_cash, np.nan),
+                "Future ID": int(r["security_id"]),
                 "Bias": p["bias"],
                 "Pattern": p["pattern"],
                 "Anchor": p["anchor_boxes"],
                 "Pullback": p["pullback_boxes"],
                 "System": (
-                    "🟢 BUY" if p["dtb"]
-                    else "🔴 SELL" if p["dbs"]
-                    else "🟡 PROSPECTIVE" if p["prospective"]
-                    else "WAIT"
+                    "🟢 BUY" if p["dtb"] else
+                    "🔴 SELL" if p["dbs"] else
+                    "🟡 PROSPECTIVE" if p["prospective"] else
+                    "WAIT"
                 ),
                 "Entry": p["entry_level"],
                 "SL": p["sl"],
@@ -632,10 +632,8 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
             rows.append({
                 "Symbol": symbol,
                 "Sector": sector_of(symbol),
-                "Spot LTP": spot,
-                "Future LTP": future_ltp,
-                "Future OI": future_oi,
-                "Future ID": sid_future,
+                "Spot LTP": spot_map.get(sid_cash, np.nan),
+                "Future ID": int(r["security_id"]),
                 "Bias": "ERROR",
                 "Pattern": "DATA ERROR",
                 "Anchor": 0,
@@ -645,90 +643,113 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
                 "SL": np.nan,
                 "Reason": str(e)[:250],
             })
-        progress.progress(i / len(fut), text=f"Scanning {i}/{len(fut)}")
+        progress.progress(i / len(fut), text=f"P&F {i}/{len(fut)}")
     progress.empty()
 
     res = pd.DataFrame(rows)
 
-    # Previous daily OI only for rows with a valid P&F direction/new pattern.
-    candidate_ids = [
-        int(x) for x in res.loc[
-            res["Bias"].isin(["Bullish", "Bearish"]),
-            "Future ID"
-        ].dropna().unique()
-    ]
-    previous_oi = {}
-    oi_bar = st.progress(0, text=f"Reading previous OI for {len(candidate_ids)} candidates...")
-    for j, sid in enumerate(candidate_ids, 1):
-        try:
-            previous_oi[sid] = previous_oi_from_history(sid)
-        except Exception:
-            previous_oi[sid] = np.nan
-        if candidate_ids:
-            oi_bar.progress(j / len(candidate_ids))
-    oi_bar.empty()
+    # PASS 2: OI from the exact SAME active futures contract.
+    oi_enabled = st.checkbox("Enable OI confirmation", True, key=f"oi_{mode}")
+    res["OI State"] = "OFF"
+    res["Current OI"] = np.nan
+    res["Previous OI"] = np.nan
+    res["OI Δ"] = np.nan
+    res["OI Δ %"] = np.nan
+    res["OI Price Δ %"] = np.nan
+    res["OI ⭐"] = False
 
-    res = apply_rank_stars(res, previous_oi)
+    if oi_enabled and not res.empty:
+        directional = res[res["Bias"].isin(["Bullish", "Bearish"])].copy()
+        oi_bar = st.progress(0, text=f"Calculating same-contract futures OI for {len(directional)} directional stocks...")
+        for j, (_, row) in enumerate(directional.iterrows(), 1):
+            direction = "LONG" if row["Bias"] == "Bullish" else "SHORT"
+            conf = classify_futures_oi(int(row["Future ID"]), direction)
+            mask = res["Symbol"] == row["Symbol"]
+            res.loc[mask, "OI State"] = conf["state"]
+            res.loc[mask, "Current OI"] = conf["current_oi"]
+            res.loc[mask, "Previous OI"] = conf["previous_oi"]
+            res.loc[mask, "OI Δ"] = conf["oi_change"]
+            res.loc[mask, "OI Δ %"] = conf["oi_change_pct"]
+            res.loc[mask, "OI Price Δ %"] = conf["price_change_pct"]
+            res.loc[mask, "OI ⭐"] = conf["star"]
+            oi_bar.progress(j / len(directional))
+        oi_bar.empty()
 
-    # Show only bullish and bearish stocks in their respective columns.
-    bullish = res[res["Bias"] == "Bullish"].copy()
-    bearish = res[res["Bias"] == "Bearish"].copy()
+    # PASS 3: sector breadth from the completed P&F scan.
+    res["Sector Breadth %"] = np.nan
+    res["Sector ⭐"] = False
+    for symbol in res["Symbol"].tolist():
+        row = res[res["Symbol"] == symbol].iloc[0]
+        direction = "LONG" if row["Bias"] == "Bullish" else "SHORT" if row["Bias"] == "Bearish" else None
+        s = sector_breadth_star(res, symbol, direction)
+        res.loc[res["Symbol"] == symbol, "Sector Breadth %"] = s["breadth"]
+        res.loc[res["Symbol"] == symbol, "Sector ⭐"] = s["star"]
 
-    bullish = bullish.sort_values(
-        ["Stars", "Green Star", "Anchor", "Pullback", "Symbol"],
-        ascending=[False, False, False, True, True]
+    # 3 normal stars + green additional star for the exact new 3-column setup.
+    res["P&F ⭐"] = res["Bias"].isin(["Bullish", "Bearish"])
+    res["Green ⭐"] = res["Pattern"].isin(["NEW PATTERN", "DTB", "DBS"])
+    res["Star Count"] = (
+        res["P&F ⭐"].astype(int)
+        + res["OI ⭐"].astype(int)
+        + res["Sector ⭐"].astype(int)
     )
-    bearish = bearish.sort_values(
-        ["Stars", "Green Star", "Anchor", "Pullback", "Symbol"],
-        ascending=[False, False, False, True, True]
+    res["Stars"] = (
+        res["P&F ⭐"].map(lambda x: "⭐" if x else "☆")
+        + res["OI ⭐"].map(lambda x: "⭐" if x else "☆")
+        + res["Sector ⭐"].map(lambda x: "⭐" if x else "☆")
+        + res["Green ⭐"].map(lambda x: "🟢★" if x else "☆")
     )
 
-    a,b,c,d = st.columns(4)
-    a.metric("F&O stocks", len(res))
-    b.metric("Bullish", len(bullish))
-    c.metric("Bearish", len(bearish))
-    d.metric("3-star", int((res["Stars"] == 3).sum()))
+    # Keep P&F entry independent from confirmations.
+    res["System"] = np.where(
+        res["Pattern"].eq("DTB"), "🟢 BUY",
+        np.where(
+            res["Pattern"].eq("DBS"), "🔴 SELL",
+            np.where(res["Pattern"].eq("NEW PATTERN"), "🟡 PROSPECTIVE", res["System"])
+        )
+    )
 
-    st.caption("Stars: ⭐ P&F pattern | ⭐ OI buildup | ⭐ Sector P&F breadth | 🟢★ New 3-column pattern")
+    bullish = res[res["Bias"] == "Bullish"].sort_values(
+        ["Star Count", "Green ⭐", "Anchor", "Pullback"],
+        ascending=[False, False, False, True]
+    )
+    bearish = res[res["Bias"] == "Bearish"].sort_values(
+        ["Star Count", "Green ⭐", "Anchor", "Pullback"],
+        ascending=[False, False, False, True]
+    )
 
-    left, right = st.columns(2)
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Stocks", len(res))
+    c2.metric("Bullish", len(bullish))
+    c3.metric("Bearish", len(bearish))
+    c4.metric("⭐3", int((res["Star Count"] == 3).sum()))
+
+    left,right = st.columns(2)
     with left:
         st.markdown("### 🟢 BULLISH")
-        if bullish.empty:
-            st.info("No bullish P&F stocks.")
-        else:
-            st.dataframe(
-                bullish[
-                    ["Star Display","Symbol","Sector","Spot LTP","Future LTP","Future OI",
-                     "Pattern","Anchor","Pullback","System","Entry","SL"]
-                ],
-                use_container_width=True, hide_index=True
-            )
-    with right:
-        st.markdown("### 🔴 BEARISH")
-        if bearish.empty:
-            st.info("No bearish P&F stocks.")
-        else:
-            st.dataframe(
-                bearish[
-                    ["Star Display","Symbol","Sector","Spot LTP","Future LTP","Future OI",
-                     "Pattern","Anchor","Pullback","System","Entry","SL"]
-                ],
-                use_container_width=True, hide_index=True
-            )
-
-    st.markdown("### ⭐⭐⭐ Top Ranked Setups")
-    top3 = res[res["Stars"] == 3].copy()
-    if top3.empty:
-        st.info("No 3-star setups currently.")
-    else:
         st.dataframe(
-            top3[
-                ["Star Display","Symbol","Sector","Bias","Pattern","Anchor","Pullback",
-                 "Spot LTP","Future OI","System","Entry","SL","Reason"]
+            bullish[
+                ["Stars","Symbol","Sector","Spot LTP","Pattern","Anchor","Pullback",
+                 "OI State","Current OI","Previous OI","OI Δ","OI Δ %","OI Price Δ %",
+                 "Sector Breadth %","System","Entry","SL"]
             ],
             use_container_width=True, hide_index=True
         )
+    with right:
+        st.markdown("### 🔴 BEARISH")
+        st.dataframe(
+            bearish[
+                ["Stars","Symbol","Sector","Spot LTP","Pattern","Anchor","Pullback",
+                 "OI State","Current OI","Previous OI","OI Δ","OI Δ %","OI Price Δ %",
+                 "Sector Breadth %","System","Entry","SL"]
+            ],
+            use_container_width=True, hide_index=True
+        )
+
+    st.caption(
+        "Stars: ⭐ P&F | ⭐ OI confirmation | ⭐ Sector breadth | 🟢★ New 3-column pattern. "
+        "P&F DTB/DBS remains the actual entry trigger."
+    )
 
 elif page in ("MCX Intraday", "MCX Positional"):
     mode = "Intraday" if page == "MCX Intraday" else "Positional"
