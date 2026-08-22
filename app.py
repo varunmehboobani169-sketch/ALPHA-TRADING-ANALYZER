@@ -654,7 +654,6 @@ if page == "Market Overview":
 
 elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
     mode = "Intraday" if page == "NSE Intraday P&F" else "Positional"
-    box = 0.0015 if mode == "Intraday" else 0.0025
     st.title(page)
 
     fut = future_universe(master, "NSE")
@@ -662,162 +661,139 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
         st.error("No NSE FUTSTK universe found.")
         st.stop()
 
-    if mode == "Intraday":
-        st.info(f"Nearest-contract universe: {len(fut)} stocks. Only the 1st active future per stock is used.")
-        st.caption(
-            "Intraday logic: 0.15% / 3-box / 1-minute P&F. "
-            "Daily 0.25% / 3-box P&F is the direction filter. "
-            "Only the nearest active futures contract is used for each stock; "
-            "2nd/3rd expiries are not scanned."
-        )
-    else:
-        st.caption(
-            "Positional logic: 0.25% / 3-box / daily-close P&F."
-        )
-    if fut.empty:
-        st.error("No NSE FUTSTK universe found.")
-        st.stop()
-
-    fut = fut.dropna(subset=["underlying_security_id"]).copy()
-
-    # -----------------------
-    # POSITIONAL: all stocks
-    # -----------------------
     if mode == "Positional":
+        st.caption("Positional P&F: cash/spot price | 0.25% box | 3-box reversal | daily close.")
         candidates = fut.copy()
-        st.info(f"Scanning all {len(candidates)} NSE F&O stocks on the daily 0.25% P&F.")
-
-    # -----------------------
-    # INTRADAY: daily P&F filter first
-    # -----------------------
     else:
-        daily_rows = []
-        dprog = st.progress(0, text=f"Building daily 0.25% P&F filter for {len(fut)} stocks...")
+        st.caption(
+            "Intraday P&F only: LAST DAILY COLUMN must be an Anchor "
+            "(X or O >15 boxes) using 0.25%/3-box P&F. "
+            "Only those stocks are scanned on 0.15%/3-box/1-minute P&F. "
+            "No OI. No sector analysis."
+        )
 
+        # Higher-timeframe P&F filter:
+        # THE LAST DAILY COLUMN ITSELF must be the Anchor:
+        # X-column >15 boxes for bullish, or O-column >15 boxes for bearish.
+        drows = []
+        prog = st.progress(0, text=f"Daily P&F Anchor filter: {len(fut)} stocks...")
         for i, (_, r) in enumerate(fut.iterrows(), 1):
-            bias, reason = daily_direction_filter(int(r["underlying_security_id"]))
-            daily_rows.append({
-                "Symbol": r["underlying_symbol"],
-                "Future ID": int(r["security_id"]),
-                "Cash ID": int(r["underlying_security_id"]),
-                "Daily Bias": bias,
-                "Daily Reason": reason,
+            try:
+                h = cached_cash_daily(int(r["underlying_security_id"]))
+                cols = build_pnf(h["close"], 0.0025, 3)
+                if cols:
+                    last = cols[-1]
+                    if last["type"] == "X" and last["boxes"] > 15:
+                        daily_bias = "Bullish"
+                        daily_anchor = True
+                    elif last["type"] == "O" and last["boxes"] > 15:
+                        daily_bias = "Bearish"
+                        daily_anchor = True
+                    else:
+                        daily_bias = "Sideways"
+                        daily_anchor = False
+                else:
+                    daily_bias = "Unavailable"
+                    daily_anchor = False
+            except Exception:
+                daily_bias = "Unavailable"
+                daily_anchor = False
+
+            drows.append({
+                "Symbol": str(r["underlying_symbol"]),
+                "Daily Bias": daily_bias,
+                "Daily Anchor": daily_anchor,
             })
-            dprog.progress(i / len(fut), text=f"Daily filter {i}/{len(fut)}")
+            prog.progress(i / len(fut), text=f"Daily Anchor filter: {i}/{len(fut)}")
+        prog.empty()
 
-        dprog.empty()
-        daily_df = pd.DataFrame(daily_rows)
+        daily_df = pd.DataFrame(drows)
+        allowed_symbols = set(
+            daily_df[daily_df["Daily Anchor"]]["Symbol"]
+        )
+        candidates = fut[fut["underlying_symbol"].isin(allowed_symbols)].copy()
 
-        bullish = daily_df[daily_df["Daily Bias"] == "Bullish"]
-        bearish = daily_df[daily_df["Daily Bias"] == "Bearish"]
-        candidates_symbols = set(pd.concat([bullish, bearish])["Symbol"].tolist())
+        st.info(
+            f"Daily P&F filter: {len(candidates)} directional stocks retained "
+            f"from {len(fut)} NSE F&O stocks. Sideways stocks are excluded."
+        )
 
-        candidates = fut[fut["underlying_symbol"].isin(candidates_symbols)].copy()
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total F&O stocks", len(fut))
-        c2.metric("Daily Bullish", len(bullish))
-        c3.metric("Daily Bearish", len(bearish))
-        st.caption(f"Intraday P&F scan reduced to {len(candidates)} stocks; sideways daily stocks are excluded.")
-
-    # Live spot quote only for remaining candidates.
+    # Only live cash price is displayed; it is not used as an additional entry filter.
     spot_map = batch_ltp(
         "NSE_EQ",
         candidates["underlying_security_id"].astype(int).tolist()
-    )
+    ) if not candidates.empty else {}
 
     rows = []
-    progress = st.progress(0, text=f"Scanning intraday/positional P&F for {len(candidates)} stocks...")
-
+    prog = st.progress(0, text=f"Intraday P&F scan: {len(candidates)} stocks...")
     for i, (_, r) in enumerate(candidates.iterrows(), 1):
         symbol = str(r["underlying_symbol"])
         sid_cash = int(r["underlying_security_id"])
+        spot = spot_map.get(sid_cash, np.nan)
+
         try:
-            h = (
-                cached_cash_intraday(sid_cash)
-                if mode == "Intraday"
-                else cached_cash_daily(sid_cash)
-            )
-            p = analyze_new_pattern(h, box)
-
             if mode == "Intraday":
-                db = daily_df[daily_df["Symbol"] == symbol].iloc[0]
-                daily_bias = db["Daily Bias"]
+                h = cached_cash_intraday(sid_cash)
+                ip = analyze_new_pattern(h, 0.0015, anchor_min=15, pullback_max=5)
+                daily_bias = daily_df.loc[daily_df["Symbol"] == symbol, "Daily Bias"].iloc[0]
+
+                # Entry is purely P&F: intraday DTB/DBS must agree with daily P&F direction.
+                if ip["dtb"] and daily_bias == "Bullish":
+                    rec = "🟢 BUY"
+                elif ip["dbs"] and daily_bias == "Bearish":
+                    rec = "🔴 SELL"
+                elif ip["prospective"] and (
+                    (daily_bias == "Bullish" and ip["bias"] == "Bullish") or
+                    (daily_bias == "Bearish" and ip["bias"] == "Bearish")
+                ):
+                    rec = "🟡 SETUP"
+                else:
+                    rec = "NO TRADE"
+
+                rows.append({
+                    "Script": symbol,
+                    "LTP": spot,
+                    "Bias": daily_bias,
+                    "Intraday Trade Recommendation": rec,
+                })
             else:
-                daily_bias = p["bias"]
-
+                h = cached_cash_daily(sid_cash)
+                pp = analyze_new_pattern(h, 0.0025, anchor_min=15, pullback_max=5)
+                rec = (
+                    "🟢 BUY" if pp["dtb"] else
+                    "🔴 SELL" if pp["dbs"] else
+                    "🟡 SETUP" if pp["prospective"] else
+                    "NO TRADE"
+                )
+                rows.append({
+                    "Script": symbol,
+                    "LTP": spot,
+                    "Bias": pp["bias"],
+                    "Intraday Trade Recommendation": rec,
+                })
+        except Exception:
             rows.append({
-                "Symbol": symbol,
-                "Daily Bias": daily_bias,
-                "Spot LTP": spot_map.get(sid_cash, np.nan),
-                "Bias": p["bias"],
-                "Pattern": p["pattern"],
-                "Anchor": p["anchor_boxes"],
-                "Pullback": p["pullback_boxes"],
-                "System": (
-                    "🟢 BUY" if p["dtb"] and (mode == "Positional" or daily_bias == "Bullish")
-                    else "🔴 SELL" if p["dbs"] and (mode == "Positional" or daily_bias == "Bearish")
-                    else "🟡 PROSPECTIVE" if p["prospective"]
-                    else "WAIT"
-                ),
-                "Entry": p["entry_level"],
-                "SL": p["sl"],
-                "Reason": p["reason"],
-            })
-        except Exception as e:
-            rows.append({
-                "Symbol": symbol,
-                "Daily Bias": daily_bias if mode == "Intraday" else "—",
-                "Spot LTP": spot_map.get(sid_cash, np.nan),
-                "Bias": "ERROR",
-                "Pattern": "DATA ERROR",
-                "Anchor": 0,
-                "Pullback": 0,
-                "System": "DATA ERROR",
-                "Entry": np.nan,
-                "SL": np.nan,
-                "Reason": str(e)[:250],
+                "Script": symbol,
+                "LTP": spot,
+                "Bias": "UNAVAILABLE",
+                "Intraday Trade Recommendation": "DATA ERROR",
             })
 
-        progress.progress(i / len(candidates), text=f"P&F scan {i}/{len(candidates)}")
-    progress.empty()
+        prog.progress(i / max(len(candidates), 1), text=f"P&F scan: {i}/{len(candidates)}")
+    prog.empty()
 
     res = pd.DataFrame(rows)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Scanned", len(res))
-    c2.metric("Bullish P&F", int((res["Bias"] == "Bullish").sum()))
-    c3.metric("Bearish P&F", int((res["Bias"] == "Bearish").sum()))
-    c4.metric("Confirmed Entries", int(res["System"].isin(["🟢 BUY", "🔴 SELL"]).sum()))
-
-    left, right = st.columns(2)
-    with left:
-        st.markdown("### 🟢 BULLISH")
-        bullish_view = res[res["Bias"] == "Bullish"].copy()
-        if bullish_view.empty:
-            st.info("No bullish setups.")
-        else:
-            st.dataframe(
-                bullish_view[
-                    ["Symbol","Daily Bias","Spot LTP","Pattern","Anchor","Pullback",
-                     "System","Entry","SL","Reason"]
-                ],
-                use_container_width=True, hide_index=True
-            )
-
-    with right:
-        st.markdown("### 🔴 BEARISH")
-        bearish_view = res[res["Bias"] == "Bearish"].copy()
-        if bearish_view.empty:
-            st.info("No bearish setups.")
-        else:
-            st.dataframe(
-                bearish_view[
-                    ["Symbol","Daily Bias","Spot LTP","Pattern","Anchor","Pullback",
-                     "System","Entry","SL","Reason"]
-                ],
-                use_container_width=True, hide_index=True
-            )
+    st.subheader("Intraday Trade Recommendations" if mode == "Intraday" else "Positional P&F")
+    if res.empty:
+        st.info("No stocks available.")
+    else:
+        # Keep the display intentionally minimal as requested.
+        st.dataframe(
+            res[["Script", "LTP", "Bias", "Intraday Trade Recommendation"]],
+            use_container_width=True,
+            hide_index=True,
+        )
 
 elif page in ("MCX Intraday", "MCX Positional"):
     mode = "Intraday" if page == "MCX Intraday" else "Positional"
@@ -826,92 +802,24 @@ elif page in ("MCX Intraday", "MCX Positional"):
 
     fut = future_universe(master, "MCX")
     if fut.empty:
-        st.error("No MCX FUTCOM universe found in the instrument master.")
+        st.error("No MCX FUTCOM universe found.")
         st.stop()
-
-    st.info(
-        f"MCX nearest-contract universe: {len(fut)} commodities. "
-        f"Mode: {mode} | {'0.15% / 3-box / 1-minute close' if mode == 'Intraday' else '0.25% / 3-box / daily close'}."
-    )
 
     names = sorted(fut["underlying_symbol"].astype(str).unique())
     symbol = st.selectbox("Commodity", names)
     r = fut[fut["underlying_symbol"] == symbol].iloc[0]
 
-    # Live LTP sanity check.
     try:
-        ltp_map = batch_ltp("MCX_COMM", [int(r["security_id"])])
-        st.metric("Live MCX LTP", f"{ltp_map.get(int(r['security_id']), np.nan):,.2f}")
-    except Exception as e:
-        st.warning(f"Live MCX LTP unavailable: {e}")
-
-    try:
-        # Explicit MCX historical request so failures are easier to isolate.
-        if mode == "Positional":
-            payload = {
-                "securityId": str(int(r["security_id"])),
-                "exchangeSegment": "MCX_COMM",
-                "instrument": "FUTCOM",
-                "expiryCode": 0,
-                "oi": False,
-                "fromDate": str(datetime.now().date() - timedelta(days=220)),
-                "toDate": str(datetime.now().date() + timedelta(days=1)),
-            }
-            body = api_post("/charts/historical", payload, "MCX daily history")
-        else:
-            payload = {
-                "securityId": str(int(r["security_id"])),
-                "exchangeSegment": "MCX_COMM",
-                "instrument": "FUTCOM",
-                "interval": "1",
-                "oi": False,
-                "fromDate": (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S"),
-                "toDate": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            body = api_post("/charts/intraday", payload, "MCX 1-minute history")
-
-        data = parse_data(body)
-        if not isinstance(data, dict) or "close" not in data:
-            raise RuntimeError(f"No MCX close data returned: {str(body)[:500]}")
-
-        n = len(data["close"])
-        h = pd.DataFrame({
-            "close": data["close"],
-            "timestamp": data.get("timestamp", [None] * n),
-        })
-        h["close"] = pd.to_numeric(h["close"], errors="coerce")
-        ts = pd.to_numeric(h["timestamp"], errors="coerce")
-        unit = "ms" if (not ts.dropna().empty and ts.dropna().median() > 10**12) else "s"
-        h["datetime"] = pd.to_datetime(ts, unit=unit, errors="coerce")
-        h = h.dropna(subset=["close"]).sort_values("datetime").reset_index(drop=True)
-
-        if mode == "Intraday":
-            h = h[h["datetime"] < pd.Timestamp.now().floor("min")].copy()
-
-        st.caption(f"Historical candles returned: {len(h)}")
+        h = historical(
+            r["security_id"],
+            "MCX_COMM",
+            "FUTCOM",
+            mode,
+        )
         p = analyze_new_pattern(h, box)
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Bias", p["bias"])
-        c2.metric("Pattern", p["pattern"])
-        c3.metric("Entry", f"{p['entry_level']:,.2f}" if pd.notna(p["entry_level"]) else "—")
-        c4.metric("SL", f"{p['sl']:,.2f}" if pd.notna(p["sl"]) else "—")
-
-        if p["dtb"]:
-            st.success("🟢 BUY — DTB confirmed")
-        elif p["dbs"]:
-            st.error("🔴 SELL — DBS confirmed")
-        elif p["prospective"]:
-            st.warning("🟡 PROSPECTIVE — pattern forming")
-        else:
-            st.info(p["reason"])
-
-        st.write(f"**Reason:** {p['reason']}")
-
+        st.write(p)
     except Exception as e:
         st.error(f"MCX data error: {e}")
-        with st.expander("MCX error details"):
-            st.exception(e)
 
 else:
     st.title("Diagnostics")
@@ -920,8 +828,6 @@ else:
         "access_token_present": bool(st.session_state.access_token),
         "master_rows": len(master),
         "nse_futures": len(future_universe(master, "NSE")),
-        "nse_cash_mapped": int(future_universe(master, "NSE")["underlying_security_id"].notna().sum())
-            if not future_universe(master, "NSE").empty and "underlying_security_id" in future_universe(master, "NSE").columns else 0,
         "mcx_futures": len(future_universe(master, "MCX")),
     })
     if st.session_state.api_log:
