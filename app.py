@@ -657,6 +657,11 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
     box = 0.0015 if mode == "Intraday" else 0.0025
     st.title(page)
 
+    fut = future_universe(master, "NSE")
+    if fut.empty:
+        st.error("No NSE FUTSTK universe found.")
+        st.stop()
+
     if mode == "Intraday":
         st.info(f"Nearest-contract universe: {len(fut)} stocks. Only the 1st active future per stock is used.")
         st.caption(
@@ -669,8 +674,6 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
         st.caption(
             "Positional logic: 0.25% / 3-box / daily-close P&F."
         )
-
-    fut = future_universe(master, "NSE")
     if fut.empty:
         st.error("No NSE FUTSTK universe found.")
         st.stop()
@@ -823,24 +826,92 @@ elif page in ("MCX Intraday", "MCX Positional"):
 
     fut = future_universe(master, "MCX")
     if fut.empty:
-        st.error("No MCX FUTCOM universe found.")
+        st.error("No MCX FUTCOM universe found in the instrument master.")
         st.stop()
+
+    st.info(
+        f"MCX nearest-contract universe: {len(fut)} commodities. "
+        f"Mode: {mode} | {'0.15% / 3-box / 1-minute close' if mode == 'Intraday' else '0.25% / 3-box / daily close'}."
+    )
 
     names = sorted(fut["underlying_symbol"].astype(str).unique())
     symbol = st.selectbox("Commodity", names)
     r = fut[fut["underlying_symbol"] == symbol].iloc[0]
 
+    # Live LTP sanity check.
     try:
-        h = historical(
-            r["security_id"],
-            "MCX_COMM",
-            "FUTCOM",
-            mode,
-        )
+        ltp_map = batch_ltp("MCX_COMM", [int(r["security_id"])])
+        st.metric("Live MCX LTP", f"{ltp_map.get(int(r['security_id']), np.nan):,.2f}")
+    except Exception as e:
+        st.warning(f"Live MCX LTP unavailable: {e}")
+
+    try:
+        # Explicit MCX historical request so failures are easier to isolate.
+        if mode == "Positional":
+            payload = {
+                "securityId": str(int(r["security_id"])),
+                "exchangeSegment": "MCX_COMM",
+                "instrument": "FUTCOM",
+                "expiryCode": 0,
+                "oi": False,
+                "fromDate": str(datetime.now().date() - timedelta(days=220)),
+                "toDate": str(datetime.now().date() + timedelta(days=1)),
+            }
+            body = api_post("/charts/historical", payload, "MCX daily history")
+        else:
+            payload = {
+                "securityId": str(int(r["security_id"])),
+                "exchangeSegment": "MCX_COMM",
+                "instrument": "FUTCOM",
+                "interval": "1",
+                "oi": False,
+                "fromDate": (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S"),
+                "toDate": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            body = api_post("/charts/intraday", payload, "MCX 1-minute history")
+
+        data = parse_data(body)
+        if not isinstance(data, dict) or "close" not in data:
+            raise RuntimeError(f"No MCX close data returned: {str(body)[:500]}")
+
+        n = len(data["close"])
+        h = pd.DataFrame({
+            "close": data["close"],
+            "timestamp": data.get("timestamp", [None] * n),
+        })
+        h["close"] = pd.to_numeric(h["close"], errors="coerce")
+        ts = pd.to_numeric(h["timestamp"], errors="coerce")
+        unit = "ms" if (not ts.dropna().empty and ts.dropna().median() > 10**12) else "s"
+        h["datetime"] = pd.to_datetime(ts, unit=unit, errors="coerce")
+        h = h.dropna(subset=["close"]).sort_values("datetime").reset_index(drop=True)
+
+        if mode == "Intraday":
+            h = h[h["datetime"] < pd.Timestamp.now().floor("min")].copy()
+
+        st.caption(f"Historical candles returned: {len(h)}")
         p = analyze_new_pattern(h, box)
-        st.write(p)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Bias", p["bias"])
+        c2.metric("Pattern", p["pattern"])
+        c3.metric("Entry", f"{p['entry_level']:,.2f}" if pd.notna(p["entry_level"]) else "—")
+        c4.metric("SL", f"{p['sl']:,.2f}" if pd.notna(p["sl"]) else "—")
+
+        if p["dtb"]:
+            st.success("🟢 BUY — DTB confirmed")
+        elif p["dbs"]:
+            st.error("🔴 SELL — DBS confirmed")
+        elif p["prospective"]:
+            st.warning("🟡 PROSPECTIVE — pattern forming")
+        else:
+            st.info(p["reason"])
+
+        st.write(f"**Reason:** {p['reason']}")
+
     except Exception as e:
         st.error(f"MCX data error: {e}")
+        with st.expander("MCX error details"):
+            st.exception(e)
 
 else:
     st.title("Diagnostics")
@@ -849,6 +920,8 @@ else:
         "access_token_present": bool(st.session_state.access_token),
         "master_rows": len(master),
         "nse_futures": len(future_universe(master, "NSE")),
+        "nse_cash_mapped": int(future_universe(master, "NSE")["underlying_security_id"].notna().sum())
+            if not future_universe(master, "NSE").empty and "underlying_security_id" in future_universe(master, "NSE").columns else 0,
         "mcx_futures": len(future_universe(master, "MCX")),
     })
     if st.session_state.api_log:

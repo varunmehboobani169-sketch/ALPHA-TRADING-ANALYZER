@@ -1,14 +1,9 @@
-# ALPHA ANALYZER V10 — No Intraday OI
+# ALPHA ANALYZER V11 — NSE Intraday + MCX Fix
 
-NSE Intraday:
-- Daily 0.25% / 3-box P&F trend filter
-- Intraday 0.15% / 3-box / 1-minute cash P&F
-- Nearest futures contract only
-- NO OI analysis
-- Entry/exit determined by P&F
-
-NSE Positional:
-- 0.25% / 3-box / daily cash P&F
-- Same-contract futures OI confirmation remains available
-
-This change is intentionally limited to removing intraday OI complexity.
+Fixed:
+- NSE Intraday no longer references `fut` before it is created.
+- NSE Intraday retains the daily 0.25% P&F direction filter, 1-minute P&F, nearest contract only, and no intraday OI.
+- MCX has explicit daily/intraday historical requests using `MCX_COMM/FUTCOM`.
+- MCX shows live LTP and returned historical candle count.
+- MCX errors now expose full API details in an expandable panel.
+- No ZIP is required; this is a normal folder with individual files.
