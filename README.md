@@ -1,13 +1,13 @@
-# ALPHA ANALYZER V13 — Last Daily Column Must Be Anchor
+# ALPHA ANALYZER V14 — Intraday 10-SMA Filter
 
 NSE Intraday:
-- First filter every F&O stock using the latest DAILY cash/spot P&F.
-- 0.25% box, 3-box reversal, daily close.
-- The LAST daily P&F column itself must be the Anchor:
-  - X column with >15 boxes = bullish candidate.
-  - O column with >15 boxes = bearish candidate.
-- If the last daily column is not >15 boxes, the stock is excluded.
-- No OI, sector, SMA, or other intraday filters.
-- Then run 0.15% / 3-box / 1-minute cash P&F.
-- BUY only when intraday DTB agrees with daily bullish Anchor.
-- SELL only when intraday DBS agrees with daily bearish Anchor.
+1. Last completed daily P&F column must be an Anchor:
+   X >15 boxes = bullish; O >15 boxes = bearish.
+2. Scan 0.15% / 3-box / 1-minute cash P&F.
+3. BUY only on matching DTB AND Spot LTP > intraday 10-SMA.
+4. SELL only on matching DBS AND Spot LTP < intraday 10-SMA.
+5. No OI.
+6. No sector analysis.
+7. P&F remains the entry trigger; 10-SMA is a filter only.
+
+Display remains: Script | LTP | Bias | Intraday Trade Recommendation.

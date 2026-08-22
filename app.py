@@ -587,6 +587,16 @@ def sector_breadth_star(df, symbol, direction):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+
+def intraday_sma10(df):
+    """Calculate 10-period SMA on completed 1-minute cash closes."""
+    if df is None or df.empty or "close" not in df.columns:
+        return np.nan
+    c = pd.to_numeric(df["close"], errors="coerce").dropna()
+    if len(c) < 10:
+        return np.nan
+    return float(c.rolling(10).mean().iloc[-1])
+
 def daily_direction_filter(sec_id, anchor_min=15):
     """
     Higher-timeframe filter:
@@ -666,9 +676,9 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
         candidates = fut.copy()
     else:
         st.caption(
-            "Intraday P&F only: LAST DAILY COLUMN must be an Anchor "
-            "(X or O >15 boxes) using 0.25%/3-box P&F. "
-            "Only those stocks are scanned on 0.15%/3-box/1-minute P&F. "
+            "Intraday P&F: LAST DAILY COLUMN must be an Anchor (X or O >15 boxes) "
+            "using 0.25%/3-box P&F. Then 0.15%/3-box/1-minute P&F. "
+            "BUY only above the intraday 10-SMA; SELL only below the intraday 10-SMA. "
             "No OI. No sector analysis."
         )
 
@@ -737,14 +747,21 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
                 ip = analyze_new_pattern(h, 0.0015, anchor_min=15, pullback_max=5)
                 daily_bias = daily_df.loc[daily_df["Symbol"] == symbol, "Daily Bias"].iloc[0]
 
-                # Entry is purely P&F: intraday DTB/DBS must agree with daily P&F direction.
-                if ip["dtb"] and daily_bias == "Bullish":
+                # Intraday 10-SMA filter:
+                # BUY only when Spot LTP is above the intraday 10-SMA.
+                # SELL only when Spot LTP is below the intraday 10-SMA.
+                sma10 = intraday_sma10(h)
+                above_sma = pd.notna(spot) and pd.notna(sma10) and float(spot) > float(sma10)
+                below_sma = pd.notna(spot) and pd.notna(sma10) and float(spot) < float(sma10)
+
+                # P&F is still the entry trigger; 10-SMA is only a directional filter.
+                if ip["dtb"] and daily_bias == "Bullish" and above_sma:
                     rec = "🟢 BUY"
-                elif ip["dbs"] and daily_bias == "Bearish":
+                elif ip["dbs"] and daily_bias == "Bearish" and below_sma:
                     rec = "🔴 SELL"
                 elif ip["prospective"] and (
-                    (daily_bias == "Bullish" and ip["bias"] == "Bullish") or
-                    (daily_bias == "Bearish" and ip["bias"] == "Bearish")
+                    (daily_bias == "Bullish" and ip["bias"] == "Bullish" and above_sma) or
+                    (daily_bias == "Bearish" and ip["bias"] == "Bearish" and below_sma)
                 ):
                     rec = "🟡 SETUP"
                 else:
@@ -755,6 +772,7 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
                     "LTP": spot,
                     "Bias": daily_bias,
                     "Intraday Trade Recommendation": rec,
+                    "SMA10": sma10,
                 })
             else:
                 h = cached_cash_daily(sid_cash)
