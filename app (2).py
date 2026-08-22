@@ -1,8 +1,6 @@
 
 import os
-import time
 from datetime import datetime, timedelta
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -11,192 +9,445 @@ import streamlit as st
 
 st.set_page_config(page_title="ALPHA ANALYZER", page_icon="α", layout="wide")
 
-BASE = "https://api.dhan.co/v2"
+API = "https://api.dhan.co/v2"
 
-# ----------------------------
-# Session / credentials
-# ----------------------------
-if "alpha_client_id" not in st.session_state:
-    st.session_state.alpha_client_id = ""
-if "alpha_access_token" not in st.session_state:
-    st.session_state.alpha_access_token = ""
+# -----------------------------
+# Session credentials
+# -----------------------------
+if "client_id" not in st.session_state:
+    st.session_state.client_id = ""
+if "access_token" not in st.session_state:
+    st.session_state.access_token = ""
 if "api_log" not in st.session_state:
     st.session_state.api_log = []
-if "last_error" not in st.session_state:
-    st.session_state.last_error = ""
-
-def secret(name, default=""):
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return os.getenv(name, default)
-
-secret_client = secret("ALPHA_CLIENT_ID", "")
 
 with st.sidebar:
-    st.header("ALPHA ANALYZER")
-    client = st.text_input(
-        "Client code",
-        value=st.session_state.alpha_client_id or secret_client,
-        key="client_input"
-    )
-    if client.strip():
-        st.session_state.alpha_client_id = client.strip()
-
-    token = st.text_input(
-        "Access token",
-        value=st.session_state.alpha_access_token,
+    st.title("ALPHA ANALYZER")
+    st.session_state.client_id = st.text_input(
+        "Client Code",
+        value=st.session_state.client_id,
+    ).strip()
+    st.session_state.access_token = st.text_input(
+        "Access Token",
+        value=st.session_state.access_token,
         type="password",
-        key="token_input"
+    ).strip()
+
+    auto = st.checkbox("Auto Refresh", True)
+    page = st.radio(
+        "Module",
+        [
+            "Market Overview",
+            "NSE Intraday P&F",
+            "NSE Positional P&F",
+            "MCX Intraday",
+            "MCX Positional",
+            "Diagnostics",
+        ],
     )
-    if token.strip():
-        st.session_state.alpha_access_token = token.strip()
 
-    st.divider()
-    auto = st.checkbox("Auto refresh", True)
-    refresh_min = st.selectbox("Refresh interval", [1, 2, 3, 5], index=2)
-    max_scan = st.slider("F&O/MCX scan size", 5, 80, 20, step=5)
-    anchor_boxes = st.number_input("Minimum anchor boxes", 5, 30, 15)
-    sector_threshold = st.slider("Super sector breadth %", 50, 90, 70)
-
-    if st.button("Clear login"):
-        st.session_state.alpha_client_id = ""
-        st.session_state.alpha_access_token = ""
-        st.rerun()
-
-    st.caption("Credentials are kept in this browser session. Do not put the access token in GitHub.")
-
-# ----------------------------
-# API
-# ----------------------------
 def headers():
-    if not st.session_state.alpha_client_id:
-        raise RuntimeError("Enter Client Code.")
-    if not st.session_state.alpha_access_token:
-        raise RuntimeError("Enter Access Token.")
+    if not st.session_state.client_id or not st.session_state.access_token:
+        raise RuntimeError("Enter Client Code and Access Token.")
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "access-token": st.session_state.alpha_access_token,
-        "client-id": st.session_state.alpha_client_id,
+        "access-token": st.session_state.access_token,
+        "client-id": st.session_state.client_id,
     }
 
 def api_post(path, payload, label):
-    r = requests.post(BASE + path, headers=headers(), json=payload, timeout=25)
-    ok = r.ok
+    r = requests.post(API + path, headers=headers(), json=payload, timeout=30)
     try:
         body = r.json()
     except Exception:
         body = {"raw": r.text}
-    st.session_state.api_log.append({
-        "time": datetime.now().strftime("%H:%M:%S"),
-        "endpoint": path,
-        "label": label,
-        "status": r.status_code,
-        "ok": ok,
-    })
-    if not ok:
-        msg = body.get("remarks") if isinstance(body, dict) else None
-        if not msg:
-            msg = body.get("message") if isinstance(body, dict) else None
-        raise RuntimeError(f"{path} HTTP {r.status_code}: {msg or str(body)[:400]}")
+    st.session_state.api_log.append(
+        {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "label": label,
+            "endpoint": path,
+            "status": r.status_code,
+        }
+    )
+    if not r.ok:
+        raise RuntimeError(
+            f"{label}: HTTP {r.status_code}: "
+            f"{body.get('remarks') or body.get('message') or str(body)[:400]}"
+        )
     return body
 
-# ----------------------------
+def parse_data(body):
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        return body["data"]
+    return body if isinstance(body, dict) else {}
+
+# -----------------------------
 # Instrument master
-# ----------------------------
+# -----------------------------
 @st.cache_data(ttl=21600, show_spinner=False)
-def load_instruments():
-    url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+def load_master():
+    # Detailed instrument master: direct underlying-security mapping where available.
+    url = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
     df = pd.read_csv(url, low_memory=False)
     df.columns = [str(c).strip() for c in df.columns]
 
-    aliases = {
-        "SEM_EXM_EXCH_ID": "exchange",
+    rename = {
         "EXCH_ID": "exchange",
-        "SEM_SEGMENT": "segment_code",
-        "SEGMENT": "segment_code",
-        "SEM_SECURITY_ID": "security_id",
-        "SECURITY_ID": "security_id",
-        "SEM_TRADING_SYMBOL": "trading_symbol",
-        "TRADING_SYMBOL": "trading_symbol",
-        "SEM_CUSTOM_SYMBOL": "display_name",
-        "DISPLAY_NAME": "display_name",
-        "SEM_INSTRUMENT_NAME": "instrument",
+        "SEGMENT": "segment",
         "INSTRUMENT": "instrument",
-        "SM_SYMBOL_NAME": "symbol_name",
-        "SYMBOL_NAME": "symbol_name",
-        "UNDERLYING_SYMBOL": "underlying_symbol",
+        "SECURITY_ID": "security_id",
+        "SEM_SMST_SECURITY_ID": "security_id",
         "UNDERLYING_SECURITY_ID": "underlying_security_id",
-        "SEM_EXPIRY_DATE": "expiry_date",
+        "UNDERLYING_SYMBOL": "underlying_symbol",
+        "SYMBOL_NAME": "symbol_name",
+        "SEM_TRADING_SYMBOL": "trading_symbol",
+        "DISPLAY_NAME": "display_name",
         "EXPIRY_DATE": "expiry_date",
     }
-    rename = {}
-    for c in df.columns:
-        rename[c] = aliases.get(c, c)
-    df = df.rename(columns=rename)
+    df = df.rename(columns={c: rename.get(c, c) for c in df.columns})
 
-    if "security_id" in df.columns:
-        df["security_id"] = pd.to_numeric(df["security_id"], errors="coerce")
-    for c in ["exchange", "instrument", "symbol_name", "underlying_symbol"]:
+    # Handle column variants.
+    if "security_id" not in df.columns:
+        for c in ["SM_SECURITY_ID", "SEM_SECURITY_ID"]:
+            if c in df.columns:
+                df["security_id"] = df[c]
+                break
+
+    df["security_id"] = pd.to_numeric(df["security_id"], errors="coerce")
+    if "underlying_security_id" in df.columns:
+        df["underlying_security_id"] = pd.to_numeric(
+            df["underlying_security_id"], errors="coerce"
+        )
+
+    for c in ["exchange", "segment", "instrument", "trading_symbol",
+              "underlying_symbol", "symbol_name", "display_name"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.upper().str.strip()
 
     if "expiry_date" in df.columns:
         df["expiry_date"] = pd.to_datetime(df["expiry_date"], errors="coerce")
-    return df
 
-def nearest_contracts(df, exchange, instrument):
-    x = df.copy()
+    # Remove test symbols.
+    bad = pd.Series(False, index=df.index)
+    for c in ["trading_symbol", "underlying_symbol", "symbol_name", "display_name"]:
+        if c in df.columns:
+            bad |= df[c].str.contains("NSETEST", na=False)
+    return df.loc[~bad].copy()
+
+def future_universe(master, exchange="NSE"):
+    """
+    Return ONE nearest active futures contract per underlying.
+    2nd/3rd expiries are never scanned.
+
+    NSE:
+      exchange=NSE, instrument=FUTSTK
+    MCX:
+      exchange=MCX, instrument=FUTCOM
+
+    If expiry is unavailable, we keep one contract per underlying in
+    deterministic instrument-master order rather than crashing.
+    """
+    if exchange == "NSE":
+        x = master[
+            (master["exchange"] == "NSE") &
+            (master["instrument"] == "FUTSTK")
+        ].copy()
+    else:
+        x = master[
+            (master["exchange"] == "MCX") &
+            (master["instrument"] == "FUTCOM")
+        ].copy()
+
     if x.empty:
         return x
-    x = x[(x["exchange"] == exchange) & (x["instrument"] == instrument)].copy()
-    if x.empty:
-        return x
-    symcol = "underlying_symbol" if "underlying_symbol" in x.columns else "symbol_name"
-    x[symcol] = x[symcol].astype(str).str.upper().str.strip()
-    x = x.dropna(subset=["security_id"])
+
+    # Ensure required fields.
+    x = x.dropna(subset=["security_id"]).copy()
+
     if "expiry_date" in x.columns:
         x["expiry_date"] = pd.to_datetime(x["expiry_date"], errors="coerce")
-        x = x.sort_values("expiry_date")
-    rows = []
-    for sym, g in x.groupby(symcol, dropna=False):
-        g = g.dropna(subset=["expiry_date"]) if "expiry_date" in g.columns else g
-        if not g.empty:
-            rows.append(g.iloc[[0]])
-    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    else:
+        x["expiry_date"] = pd.NaT
 
-# ----------------------------
-# Historical data
-# ----------------------------
-def candles_to_df(data):
-    if not isinstance(data, dict):
-        return pd.DataFrame()
-    keys = ["open", "high", "low", "close", "volume", "timestamp", "open_interest"]
-    lengths = [len(data[k]) for k in keys if isinstance(data.get(k), list)]
-    n = max(lengths or [0])
-    if n == 0:
-        return pd.DataFrame()
+    # Only remove contracts that are definitely expired.
+    now = pd.Timestamp.now()
+    if x["expiry_date"].notna().any():
+        x = x[x["expiry_date"].isna() | (x["expiry_date"] >= now)].copy()
 
-    out = {}
-    for k in keys:
-        v = data.get(k)
-        if isinstance(v, list):
-            out[k] = v + [np.nan] * (n - len(v))
+    # Build underlying symbol if missing.
+    if "underlying_symbol" not in x.columns:
+        if "trading_symbol" in x.columns:
+            x["underlying_symbol"] = (
+                x["trading_symbol"].astype(str)
+                .str.split("-", n=1)
+                .str[0]
+                .str.upper()
+                .str.strip()
+            )
         else:
-            out[k] = [np.nan] * n
-    df = pd.DataFrame(out)
-    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
-    # Dhan documents epoch timestamps for historical response.
-    df["datetime"] = pd.to_datetime(df["timestamp"], unit="s", errors="coerce")
-    # Treat returned timestamps as exchange timestamps for filtering/sorting.
-    df = df.sort_values("datetime").dropna(subset=["close"]).reset_index(drop=True)
-    return df
+            return pd.DataFrame()
+
+    x["underlying_symbol"] = (
+        x["underlying_symbol"].astype(str).str.upper().str.strip()
+    )
+    x = x[~x["underlying_symbol"].isin(["", "NAN", "NONE"])].copy()
+
+    # Sort by expiry first so the first row for each symbol is the nearest contract.
+    # Stable fallback by security_id prevents random selection if expiry is missing.
+    x = x.sort_values(
+        ["underlying_symbol", "expiry_date", "security_id"],
+        ascending=[True, True, True],
+        na_position="last",
+    )
+
+    # ONLY the first/nearest active contract per underlying.
+    x = x.drop_duplicates(subset=["underlying_symbol"], keep="first").reset_index(drop=True)
+
+    return x
+
+# -----------------------------
+# Live LTP
+# -----------------------------
+@st.cache_data(ttl=5, show_spinner=False)
+def batch_ltp(segment, ids):
+    body = api_post(
+        "/marketfeed/ltp",
+        {segment: [int(x) for x in ids]},
+        f"{segment} LTP",
+    )
+    data = parse_data(body).get(segment, {})
+    return {
+        int(k): float(v.get("last_price"))
+        for k, v in data.items()
+        if isinstance(v, dict) and v.get("last_price") is not None
+    }
+
+# -----------------------------
+# Historical cash data
+# -----------------------------
+def historical(sec_id, segment, instrument, mode):
+    if mode == "Positional":
+        payload = {
+            "securityId": str(int(sec_id)),
+            "exchangeSegment": segment,
+            "instrument": instrument,
+            "expiryCode": 0,
+            "oi": False,
+            "fromDate": str(datetime.now().date() - timedelta(days=220)),
+            "toDate": str(datetime.now().date() + timedelta(days=1)),
+        }
+        body = api_post("/charts/historical", payload, "daily history")
+    else:
+        payload = {
+            "securityId": str(int(sec_id)),
+            "exchangeSegment": segment,
+            "instrument": instrument,
+            "interval": "1",
+            "oi": False,
+            "fromDate": (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S"),
+            "toDate": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        body = api_post("/charts/intraday", payload, "1-minute history")
+
+    data = parse_data(body)
+    if not isinstance(data, dict) or "close" not in data:
+        raise RuntimeError(f"No historical close data returned: {str(body)[:350]}")
+
+    n = len(data["close"])
+    out = pd.DataFrame({
+        "close": data["close"],
+        "timestamp": data.get("timestamp", [None] * n),
+    })
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    unit = "ms" if pd.to_numeric(out["timestamp"], errors="coerce").dropna().median() > 10**12 else "s"
+    out["datetime"] = pd.to_datetime(out["timestamp"], unit=unit, errors="coerce")
+    out = out.dropna(subset=["close"]).sort_values("datetime").reset_index(drop=True)
+
+    if mode == "Intraday":
+        out = out[out["datetime"] < pd.Timestamp.now().floor("min")].copy()
+
+    return out
+
 
 @st.cache_data(ttl=180, show_spinner=False)
-def get_daily(sec_id, lookback=180):
+def cached_cash_intraday(sec_id, days=5):
+    return historical(sec_id, "NSE_EQ", "EQUITY", "Intraday")
+
+@st.cache_data(ttl=180, show_spinner=False)
+def cached_cash_daily(sec_id):
+    return historical(sec_id, "NSE_EQ", "EQUITY", "Positional")
+
+# -----------------------------
+# P&F engine
+# -----------------------------
+def build_pnf(closes, box_pct, reversal=3):
+    p = pd.Series(closes).dropna().astype(float).tolist()
+    if len(p) < 3:
+        return []
+
+    direction = None
+    high = low = p[0]
+    boxes = 0
+    cols = []
+
+    def save():
+        if direction and boxes > 0:
+            cols.append({"type": direction, "boxes": boxes, "high": high, "low": low})
+
+    for price in p[1:]:
+        if direction is None:
+            if price >= high * (1 + box_pct):
+                direction = "X"
+                boxes = 0
+                while price >= high * (1 + box_pct):
+                    high *= (1 + box_pct)
+                    boxes += 1
+                low = high / ((1 + box_pct) ** boxes)
+            elif price <= low * (1 - box_pct):
+                direction = "O"
+                boxes = 0
+                while price <= low * (1 - box_pct):
+                    low *= (1 - box_pct)
+                    boxes += 1
+                high = low / ((1 - box_pct) ** boxes)
+            continue
+
+        if direction == "X":
+            while price >= high * (1 + box_pct):
+                high *= (1 + box_pct)
+                boxes += 1
+            if price <= high * ((1 - box_pct) ** reversal):
+                save()
+                direction = "O"
+                low = high
+                boxes = 0
+                while price <= low * (1 - box_pct):
+                    low *= (1 - box_pct)
+                    boxes += 1
+        else:
+            while price <= low * (1 - box_pct):
+                low *= (1 - box_pct)
+                boxes += 1
+            if price >= low * ((1 + box_pct) ** reversal):
+                save()
+                direction = "X"
+                high = low
+                boxes = 0
+                while price >= high * (1 + box_pct):
+                    high *= (1 + box_pct)
+                    boxes += 1
+
+    save()
+    return cols
+
+def analyze_new_pattern(df, box_pct, anchor_min=15, pullback_max=5):
+    base = {
+        "bias": "NO DATA", "pattern": "—", "prospective": False,
+        "dtb": False, "dbs": False, "anchor_boxes": 0,
+        "pullback_boxes": 0, "entry_level": np.nan, "sl": np.nan,
+        "signal": None, "reason": "No data"
+    }
+    if df.empty:
+        return base
+    cols = build_pnf(df["close"], box_pct)
+    if len(cols) < 3:
+        base["bias"] = "NO P&F"
+        base["reason"] = f"Only {len(cols)} columns"
+        return base
+
+    c1, c2, c3 = cols[-3:]
+    base["bias"] = "Bullish" if c3["type"] == "X" else "Bearish"
+
+    if c1["type"] == "X" and c2["type"] == "O" and c3["type"] == "X":
+        base["anchor_boxes"] = c1["boxes"]
+        base["pullback_boxes"] = c2["boxes"]
+        base["entry_level"] = c1["high"]
+        base["anchor_valid"] = c1["boxes"] > anchor_min
+        pull_valid = 1 <= c2["boxes"] <= pullback_max
+        if base["anchor_valid"] and pull_valid:
+            base["prospective"] = True
+            if c3["high"] > c1["high"]:
+                base["dtb"] = True
+                base["signal"] = "LONG"
+                base["pattern"] = "DTB"
+                base["sl"] = c2["low"]
+                base["reason"] = "3-column Anchor + 1–5 pullback + DTB"
+            else:
+                base["pattern"] = "NEW PATTERN"
+                base["reason"] = "3-column bullish setup forming; waiting for DTB"
+        else:
+            base["reason"] = "3-column X-O-X exists but Anchor/pullback limits fail"
+
+    elif c1["type"] == "O" and c2["type"] == "X" and c3["type"] == "O":
+        base["anchor_boxes"] = c1["boxes"]
+        base["pullback_boxes"] = c2["boxes"]
+        base["entry_level"] = c1["low"]
+        base["anchor_valid"] = c1["boxes"] > anchor_min
+        pull_valid = 1 <= c2["boxes"] <= pullback_max
+        if base["anchor_valid"] and pull_valid:
+            base["prospective"] = True
+            if c3["low"] < c1["low"]:
+                base["dbs"] = True
+                base["signal"] = "SHORT"
+                base["pattern"] = "DBS"
+                base["sl"] = c2["high"]
+                base["reason"] = "3-column Anchor + 1–5 pullback + DBS"
+            else:
+                base["pattern"] = "NEW PATTERN"
+                base["reason"] = "3-column bearish setup forming; waiting for DBS"
+        else:
+            base["reason"] = "3-column O-X-O exists but Anchor/pullback limits fail"
+    else:
+        base["reason"] = f"Latest columns {c1['type']}-{c2['type']}-{c3['type']}"
+
+    return base
+
+
+# -----------------------------
+# Optional confirmation modules
+# -----------------------------
+SECTOR_MAP = {
+    "HDFCBANK":"Banking","ICICIBANK":"Banking","SBIN":"Banking","AXISBANK":"Banking","KOTAKBANK":"Banking",
+    "INDUSINDBK":"Banking","BANKBARODA":"Banking","PNB":"Banking","FEDERALBNK":"Banking","IDFCFIRSTB":"Banking",
+    "BAJFINANCE":"Financials","BAJAJFINSV":"Financials","SHRIRAMFIN":"Financials","CHOLAFIN":"Financials","MUTHOOTFIN":"Financials",
+    "RELIANCE":"Energy","ONGC":"Energy","COALINDIA":"Energy","IOC":"Energy","BPCL":"Energy","GAIL":"Energy",
+    "TCS":"IT","INFY":"IT","HCLTECH":"IT","WIPRO":"IT","TECHM":"IT","LTIM":"IT","MPHASIS":"IT","COFORGE":"IT",
+    "MARUTI":"Auto","M&M":"Auto","TATAMOTORS":"Auto","HEROMOTOCO":"Auto","EICHERMOT":"Auto","BAJAJ-AUTO":"Auto","TVSMOTOR":"Auto","ASHOKLEY":"Auto",
+    "SUNPHARMA":"Pharma","CIPLA":"Pharma","DRREDDY":"Pharma","DIVISLAB":"Pharma","APOLLOHOSP":"Pharma","LUPIN":"Pharma","AUROPHARMA":"Pharma","TORNTPHARM":"Pharma",
+    "TATASTEEL":"Metals","JSWSTEEL":"Metals","HINDALCO":"Metals","SAIL":"Metals","JINDALSTEL":"Metals","NATIONALUM":"Metals","VEDL":"Metals",
+    "ITC":"FMCG","HINDUNILVR":"FMCG","NESTLEIND":"FMCG","BRITANNIA":"FMCG","TATACONSUM":"FMCG","DABUR":"FMCG","MARICO":"FMCG","COLPAL":"FMCG",
+    "LT":"Capital Goods","BEL":"Capital Goods","BHEL":"Capital Goods","SIEMENS":"Capital Goods","ABB":"Capital Goods","CUMMINSIND":"Capital Goods",
+    "DLF":"Realty","GODREJPROP":"Realty","OBEROIRLTY":"Realty","LODHA":"Realty","PRESTIGE":"Realty","PHOENIXLTD":"Realty",
+    "BHARTIARTL":"Telecom","INDUSTOWER":"Telecom","IDEA":"Telecom",
+    "TRENT":"Consumer","TITAN":"Consumer","DMART":"Consumer","KALYANKJIL":"Consumer","JUBLFOOD":"Consumer",
+}
+SECTOR_BASKETS = {}
+for _s, _sec in SECTOR_MAP.items():
+    SECTOR_BASKETS.setdefault(_sec, []).append(_s)
+
+def sector_of(symbol):
+    return SECTOR_MAP.get(str(symbol).upper(), "Other")
+
+def future_quote_map(fut):
+    """Current futures LTP/Quote for the exact active contract."""
+    if fut.empty:
+        return {}
+    try:
+        ids = fut["security_id"].dropna().astype(int).tolist()
+        body = api_post("/marketfeed/quote", {"NSE_FNO": ids}, "NSE futures quote")
+        data = parse_data(body).get("NSE_FNO", {})
+        return {int(k): v for k, v in data.items() if isinstance(v, dict)}
+    except Exception:
+        return {}
+
+def futures_oi_history(sec_id, lookback_days=7):
+    """
+    Fetch OI history for the SAME futures contract.
+    This avoids comparing one expiry's OI to another expiry's OI.
+    """
     end = datetime.now().date()
-    start = end - timedelta(days=lookback)
+    start = end - timedelta(days=lookback_days)
     payload = {
         "securityId": str(int(sec_id)),
         "exchangeSegment": "NSE_FNO",
@@ -206,553 +457,772 @@ def get_daily(sec_id, lookback=180):
         "fromDate": str(start),
         "toDate": str(end + timedelta(days=1)),
     }
-    return candles_to_df(api_post("/charts/historical", payload, "daily"))
+    body = api_post("/charts/historical", payload, "same-contract futures OI")
+    data = parse_data(body)
 
-@st.cache_data(ttl=180, show_spinner=False)
-def get_intraday(sec_id, segment, instrument, days=5):
-    now = datetime.now()
-    start = now - timedelta(days=days)
-    payload = {
-        "securityId": str(int(sec_id)),
-        "exchangeSegment": segment,
-        "instrument": instrument,
-        "interval": "1",
-        "oi": True,
-        "fromDate": start.strftime("%Y-%m-%d %H:%M:%S"),
-        "toDate": now.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    return candles_to_df(api_post("/charts/intraday", payload, "intraday"))
+    if not isinstance(data, dict):
+        return pd.DataFrame()
 
-@st.cache_data(ttl=180, show_spinner=False)
-def get_mcx_daily(sec_id):
-    now = datetime.now().date()
-    start = now - timedelta(days=180)
-    payload = {
-        "securityId": str(int(sec_id)),
-        "exchangeSegment": "MCX_COMM",
-        "instrument": "FUTCOM",
-        "expiryCode": 0,
-        "oi": True,
-        "fromDate": str(start),
-        "toDate": str(now + timedelta(days=1)),
-    }
-    return candles_to_df(api_post("/charts/historical", payload, "mcx_daily"))
+    oi = pd.to_numeric(pd.Series(data.get("open_interest", [])), errors="coerce")
+    close = pd.to_numeric(pd.Series(data.get("close", [])), errors="coerce")
+    ts = pd.to_numeric(pd.Series(data.get("timestamp", [])), errors="coerce")
 
-# ----------------------------
-# P&F engine
-# This is a close-only percentage-box implementation.
-# ----------------------------
-def pnf_columns(closes, box_pct=0.0025, reversal=3):
-    prices = pd.Series(closes).dropna().astype(float).tolist()
-    if len(prices) < 3:
-        return []
+    n = min(len(oi), len(close), len(ts))
+    if n == 0:
+        return pd.DataFrame()
 
-    cols = []
-    direction = None
-    anchor_price = prices[0]
-    boxes = 0
-    current_high = anchor_price
-    current_low = anchor_price
+    out = pd.DataFrame({
+        "timestamp": ts.iloc[:n].to_numpy(),
+        "close": close.iloc[:n].to_numpy(),
+        "oi": oi.iloc[:n].to_numpy(),
+    })
 
-    for p in prices[1:]:
-        if direction is None:
-            if p >= anchor_price * (1 + box_pct):
-                direction = "X"
-                boxes = 1
-                current_high = anchor_price * (1 + box_pct)
-                while p >= current_high * (1 + box_pct):
-                    current_high *= (1 + box_pct)
-                    boxes += 1
-                current_low = anchor_price
-            elif p <= anchor_price * (1 - box_pct):
-                direction = "O"
-                boxes = 1
-                current_low = anchor_price * (1 - box_pct)
-                while p <= current_low * (1 - box_pct):
-                    current_low *= (1 - box_pct)
-                    boxes += 1
-                current_high = anchor_price
-            continue
-
-        if direction == "X":
-            while p >= current_high * (1 + box_pct):
-                current_high *= (1 + box_pct)
-                boxes += 1
-            reversal_level = current_high * ((1 - box_pct) ** reversal)
-            if p <= reversal_level:
-                cols.append({"type": "X", "boxes": boxes, "high": current_high, "low": current_low})
-                direction = "O"
-                current_low = current_high * (1 - box_pct)
-                current_high = current_low * (1 + box_pct)
-                boxes = reversal
-        else:
-            while p <= current_low * (1 - box_pct):
-                current_low *= (1 - box_pct)
-                boxes += 1
-            reversal_level = current_low * ((1 + box_pct) ** reversal)
-            if p >= reversal_level:
-                cols.append({"type": "O", "boxes": boxes, "high": current_high, "low": current_low})
-                direction = "X"
-                current_high = current_low * (1 + box_pct)
-                current_low = current_high * (1 - box_pct)
-                boxes = reversal
-
-    if direction:
-        cols.append({
-            "type": direction,
-            "boxes": boxes,
-            "high": current_high,
-            "low": current_low,
-        })
-    return cols
-
-def pnf_analysis(df, box_pct, anchor_min=15):
-    if df.empty or len(df) < 5:
-        return {
-            "bias": "NO DATA",
-            "anchor": False, "dtb": False, "dbs": False,
-            "signal_side": None, "reason": "Insufficient price history",
-            "sl": np.nan, "columns": 0
-        }
-
-    cols = pnf_columns(df["close"], box_pct, 3)
-    out = {
-        "bias": "Neutral", "anchor": False, "dtb": False, "dbs": False,
-        "signal_side": None, "reason": "No fresh setup",
-        "sl": np.nan, "columns": len(cols)
-    }
-    if not cols:
-        out["bias"] = "NO P&F"
-        out["reason"] = "Could not build P&F columns"
-        return out
-
-    cur = cols[-1]
-    out["bias"] = "Bullish" if cur["type"] == "X" else "Bearish"
-
-    if cur["type"] == "X":
-        prev_x = None
-        for c in reversed(cols[:-1]):
-            if c["type"] == "X":
-                prev_x = c
-                break
-        if prev_x is None:
-            out["reason"] = "No previous X-column"
-            return out
-
-        anchor = None
-        for c in cols[:-1]:
-            if c["type"] == "X" and c["boxes"] >= anchor_min:
-                anchor = c
-        out["anchor"] = anchor is not None
-
-        if anchor is None:
-            out["reason"] = f"No X-column anchor >= {anchor_min} boxes"
-        elif cur["high"] > prev_x["high"]:
-            out["dtb"] = True
-            out["signal_side"] = "LONG"
-            out["reason"] = f"Anchor ({anchor['boxes']} boxes) + DTB"
-            # Structural SL = most recent O-column low.
-            last_o = next((c for c in reversed(cols[:-1]) if c["type"] == "O"), None)
-            if last_o:
-                out["sl"] = last_o["low"]
-        else:
-            out["reason"] = "Anchor present; current X-column has no fresh DTB"
-    else:
-        prev_o = None
-        for c in reversed(cols[:-1]):
-            if c["type"] == "O":
-                prev_o = c
-                break
-        if prev_o is None:
-            out["reason"] = "No previous O-column"
-            return out
-
-        anchor = None
-        for c in cols[:-1]:
-            if c["type"] == "O" and c["boxes"] >= anchor_min:
-                anchor = c
-        out["anchor"] = anchor is not None
-
-        if anchor is None:
-            out["reason"] = f"No O-column anchor >= {anchor_min} boxes"
-        elif cur["low"] < prev_o["low"]:
-            out["dbs"] = True
-            out["signal_side"] = "SHORT"
-            out["reason"] = f"Anchor ({anchor['boxes']} boxes) + DBS"
-            last_x = next((c for c in reversed(cols[:-1]) if c["type"] == "X"), None)
-            if last_x:
-                out["sl"] = last_x["high"]
-        else:
-            out["reason"] = "Anchor present; current O-column has no fresh DBS"
-
+    unit = "ms" if out["timestamp"].dropna().median() > 10**12 else "s"
+    out["datetime"] = pd.to_datetime(out["timestamp"], unit=unit, errors="coerce")
+    out = out.dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
     return out
 
-# ----------------------------
-# OI / sector
-# ----------------------------
-def oi_state(df):
-    if df.empty or len(df) < 2 or "open_interest" not in df.columns:
-        return "UNAVAILABLE", np.nan, np.nan
-    x = df.dropna(subset=["close"]).copy()
-    if len(x) < 2:
-        return "UNAVAILABLE", np.nan, np.nan
-    a, b = x.iloc[-2], x.iloc[-1]
-    pchg = (float(b.close) / float(a.close) - 1) * 100 if float(a.close) else np.nan
-    oi_a = pd.to_numeric(a.open_interest, errors="coerce")
-    oi_b = pd.to_numeric(b.open_interest, errors="coerce")
-    if pd.isna(oi_a) or pd.isna(oi_b):
-        return "UNAVAILABLE", pchg, np.nan
-    d_oi = float(oi_b - oi_a)
-    if pchg > 0 and d_oi > 0:
-        return "LONG BUILDUP", pchg, d_oi
-    if pchg < 0 and d_oi > 0:
-        return "SHORT BUILDUP", pchg, d_oi
-    if pchg > 0 and d_oi < 0:
-        return "SHORT COVERING", pchg, d_oi
-    if pchg < 0 and d_oi < 0:
-        return "LONG UNWINDING", pchg, d_oi
-    return "NEUTRAL", pchg, d_oi
+def classify_futures_oi(sec_id, direction):
+    """
+    Same active contract:
+    current OI - previous OI = ΔOI
+    current futures close - previous futures close = price direction
 
-def system_result(pnf, oi):
-    # Both long and short are supported for the scanner.
-    if pnf["signal_side"] == "LONG":
-        if oi == "LONG BUILDUP":
-            return "🟢 BUY", True
-        return "WAIT - OI", False
-    if pnf["signal_side"] == "SHORT":
-        if oi == "SHORT BUILDUP":
-            return "🔴 SELL", True
-        return "WAIT - OI", False
-    if pnf["bias"] == "NO DATA":
-        return "DATA ERROR", False
-    if not pnf["anchor"]:
-        return "WAIT - NO ANCHOR", False
-    if pnf["bias"] == "Bullish" and not pnf["dtb"]:
-        return "WAIT - NO DTB", False
-    if pnf["bias"] == "Bearish" and not pnf["dbs"]:
-        return "WAIT - NO DBS", False
-    return "WAIT", False
-
-SECTOR_MAP = {
-    "RELIANCE":"Energy","ONGC":"Energy","COALINDIA":"Energy","IOC":"Energy","BPCL":"Energy","GAIL":"Energy",
-    "POWERGRID":"Utilities","NTPC":"Utilities",
-    "HDFCBANK":"Banking","ICICIBANK":"Banking","SBIN":"Banking","AXISBANK":"Banking","KOTAKBANK":"Banking",
-    "INDUSINDBK":"Banking","BANKBARODA":"Banking","PNB":"Banking","IDFCFIRSTB":"Banking","FEDERALBNK":"Banking",
-    "BAJFINANCE":"Financials","BAJAJFINSV":"Financials","SHRIRAMFIN":"Financials","CHOLAFIN":"Financials",
-    "MUTHOOTFIN":"Financials","SBICARD":"Financials",
-    "TCS":"IT","INFY":"IT","HCLTECH":"IT","WIPRO":"IT","TECHM":"IT","LTIM":"IT","MPHASIS":"IT","COFORGE":"IT",
-    "MARUTI":"Auto","M&M":"Auto","TATAMOTORS":"Auto","HEROMOTOCO":"Auto","EICHERMOT":"Auto","BAJAJ-AUTO":"Auto","TVSMOTOR":"Auto","ASHOKLEY":"Auto",
-    "TATASTEEL":"Metals","JSWSTEEL":"Metals","HINDALCO":"Metals","SAIL":"Metals","JINDALSTEL":"Metals","NATIONALUM":"Metals","VEDL":"Metals",
-    "SUNPHARMA":"Pharma","CIPLA":"Pharma","DRREDDY":"Pharma","DIVISLAB":"Pharma","APOLLOHOSP":"Pharma","LUPIN":"Pharma","AUROPHARMA":"Pharma","TORNTPHARM":"Pharma",
-    "ITC":"FMCG","HINDUNILVR":"FMCG","NESTLEIND":"FMCG","BRITANNIA":"FMCG","TATACONSUM":"FMCG","DABUR":"FMCG","MARICO":"FMCG","COLPAL":"FMCG",
-    "LT":"Capital Goods","BEL":"Defence/Industrial","HAL":"Defence/Industrial","BHEL":"Capital Goods","SIEMENS":"Capital Goods","ABB":"Capital Goods","CUMMINSIND":"Capital Goods",
-    "DLF":"Realty","GODREJPROP":"Realty","OBEROIRLTY":"Realty","LODHA":"Realty","PRESTIGE":"Realty","PHOENIXLTD":"Realty",
-    "TRENT":"Consumer","TITAN":"Consumer","DMART":"Consumer","KALYANKJIL":"Consumer","JUBLFOOD":"Consumer",
-    "BHARTIARTL":"Telecom","INDUSTOWER":"Telecom","IDEA":"Telecom",
-    "ADANIENT":"Conglomerate","ADANIPORTS":"Infrastructure","IRCTC":"Travel/Infra","INDIGO":"Aviation","DELHIVERY":"Logistics",
-}
-def sector_of(s): return SECTOR_MAP.get(s, "Other/Unmapped")
-
-def sector_breadth(rows):
-    x = pd.DataFrame(rows)
-    if x.empty: return x
-    y = x[x["Sector"] != "Other/Unmapped"].copy()
-    if y.empty: return pd.DataFrame()
-    agg = y.groupby("Sector").agg(
-        stocks=("Symbol","count"),
-        bullish=("Bias", lambda s: (s=="Bullish").sum()),
-        bearish=("Bias", lambda s: (s=="Bearish").sum()),
-        dtb=("DTB", lambda s: (s=="✅").sum()),
-        dbs=("DBS", lambda s: (s=="✅").sum()),
-    ).reset_index()
-    agg["Bullish %"] = 100 * agg["bullish"] / agg["stocks"]
-    agg["Bearish %"] = 100 * agg["bearish"] / agg["stocks"]
-    return agg.sort_values("Bullish %", ascending=False)
-
-def stock_star(sector, breadth, threshold):
-    if breadth.empty or sector == "Other/Unmapped":
-        return ""
-    r = breadth[breadth["Sector"] == sector]
-    if r.empty:
-        return ""
-    r = r.iloc[0]
-    if r["Bullish %"] >= threshold or r["Bearish %"] >= threshold:
-        return "⭐"
-    return ""
-
-# ----------------------------
-# Universe helpers
-# ----------------------------
-def nearest_fno(df, exchange="NSE"):
-    inst = "FUTSTK" if exchange == "NSE" else "FUTCOM"
-    ex = "NSE" if exchange == "NSE" else "MCX"
-    x = df[(df["exchange"]==ex) & (df["instrument"]==inst)].copy()
-    if x.empty: return x
-    sym = "underlying_symbol" if "underlying_symbol" in x.columns else "symbol_name"
-    if sym not in x.columns:
-        return pd.DataFrame()
-    x[sym] = x[sym].astype(str).str.upper().str.strip()
-    x = x.dropna(subset=["security_id"])
-    if "expiry_date" in x.columns:
-        x["expiry_date"] = pd.to_datetime(x["expiry_date"], errors="coerce")
-        x = x.sort_values("expiry_date")
-    out=[]
-    for s,g in x.groupby(sym):
-        g=g.dropna(subset=["expiry_date"]) if "expiry_date" in g.columns else g
-        if not g.empty:
-            out.append(g.iloc[0])
-    return pd.DataFrame(out)
-
-def choose_rows(x, n):
-    if x.empty: return x
-    return x.head(n).reset_index(drop=True)
-
-# ----------------------------
-# Auto refresh
-# ----------------------------
-if auto:
+    Long:  price up + OI up
+    Short: price down + OI up
+    Short covering: price up + OI down
+    Long unwinding: price down + OI down
+    """
     try:
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=refresh_min*60*1000, key="alpha_refresh")
+        h = futures_oi_history(sec_id)
+        if len(h) < 2:
+            return {
+                "state": "UNAVAILABLE",
+                "current_oi": np.nan,
+                "previous_oi": np.nan,
+                "oi_change": np.nan,
+                "oi_change_pct": np.nan,
+                "price_change_pct": np.nan,
+                "star": False,
+            }
+
+        a = h.iloc[-2]
+        b = h.iloc[-1]
+
+        prev_oi = float(a["oi"]) if pd.notna(a["oi"]) else np.nan
+        cur_oi = float(b["oi"]) if pd.notna(b["oi"]) else np.nan
+
+        prev_price = float(a["close"]) if pd.notna(a["close"]) else np.nan
+        cur_price = float(b["close"]) if pd.notna(b["close"]) else np.nan
+
+        if any(pd.isna(x) for x in [prev_oi, cur_oi, prev_price, cur_price]):
+            return {
+                "state": "UNAVAILABLE",
+                "current_oi": cur_oi,
+                "previous_oi": prev_oi,
+                "oi_change": np.nan,
+                "oi_change_pct": np.nan,
+                "price_change_pct": np.nan,
+                "star": False,
+            }
+
+        oi_change = cur_oi - prev_oi
+        oi_change_pct = (oi_change / prev_oi * 100.0) if prev_oi else np.nan
+        price_change_pct = ((cur_price / prev_price) - 1.0) * 100.0 if prev_price else np.nan
+
+        if price_change_pct > 0 and oi_change > 0:
+            state = "LONG BUILDUP"
+            star = direction == "LONG"
+        elif price_change_pct < 0 and oi_change > 0:
+            state = "SHORT BUILDUP"
+            star = direction == "SHORT"
+        elif price_change_pct > 0 and oi_change < 0:
+            state = "SHORT COVERING"
+            star = False
+        elif price_change_pct < 0 and oi_change < 0:
+            state = "LONG UNWINDING"
+            star = False
+        else:
+            state = "NEUTRAL"
+            star = False
+
+        return {
+            "state": state,
+            "current_oi": cur_oi,
+            "previous_oi": prev_oi,
+            "oi_change": oi_change,
+            "oi_change_pct": oi_change_pct,
+            "price_change_pct": price_change_pct,
+            "star": star,
+        }
     except Exception:
-        pass
+        return {
+            "state": "UNAVAILABLE",
+            "current_oi": np.nan,
+            "previous_oi": np.nan,
+            "oi_change": np.nan,
+            "oi_change_pct": np.nan,
+            "price_change_pct": np.nan,
+            "star": False,
+        }
 
-# ----------------------------
-# Main page
-# ----------------------------
-st.title("ALPHA ANALYZER")
-st.caption("P&F + sector breadth + OI confirmation | close-only signals")
 
-if not st.session_state.alpha_client_id or not st.session_state.alpha_access_token:
-    st.warning("Enter Client Code and Access Token in the sidebar to load live data.")
+def sector_breadth_star(df, symbol, direction):
+    """Sector confirmation from the already-scanned P&F universe; no extra API calls."""
+    sec = sector_of(symbol)
+    if sec == "Other":
+        return {"sector": sec, "breadth": np.nan, "star": False}
+    x = df[df["Sector"] == sec].copy()
+    valid = x[x["Bias"].isin(["Bullish", "Bearish"])]
+    if valid.empty:
+        return {"sector": sec, "breadth": np.nan, "star": False}
+    if direction == "LONG":
+        pct = 100.0 * (valid["Bias"] == "Bullish").mean()
+        return {"sector": sec, "breadth": pct, "star": pct >= 50.0}
+    if direction == "SHORT":
+        pct = 100.0 * (valid["Bias"] == "Bearish").mean()
+        return {"sector": sec, "breadth": pct, "star": pct >= 50.0}
+    return {"sector": sec, "breadth": np.nan, "star": False}
+
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+
+def intraday_sma10(df):
+    """Calculate 10-period SMA on completed 1-minute cash closes."""
+    if df is None or df.empty or "close" not in df.columns:
+        return np.nan
+    c = pd.to_numeric(df["close"], errors="coerce").dropna()
+    if len(c) < 10:
+        return np.nan
+    return float(c.rolling(10).mean().iloc[-1])
+
+def daily_direction_filter(sec_id, anchor_min=15):
+    """
+    Higher-timeframe filter:
+    0.25% box, 3-box reversal, daily cash closes.
+    Returns Bullish / Bearish / Sideways.
+    """
+    try:
+        h = cached_cash_daily(sec_id)
+        if h.empty:
+            return "UNAVAILABLE", "No daily data"
+        p = analyze_new_pattern(h, 0.0025, anchor_min=anchor_min, pullback_max=5)
+        if p["bias"] == "Bullish":
+            return "Bullish", p["reason"]
+        if p["bias"] == "Bearish":
+            return "Bearish", p["reason"]
+        return "Sideways", p["reason"]
+    except Exception as e:
+        return "UNAVAILABLE", str(e)[:200]
+
+
+
+# -----------------------------
+# Intraday daily-filter state
+# -----------------------------
+if "intraday_daily_filter" not in st.session_state:
+    st.session_state.intraday_daily_filter = {}
+if "intraday_filter_date" not in st.session_state:
+    st.session_state.intraday_filter_date = None
+
+def build_morning_daily_filter(fut):
+    result = {}
+    prog = st.progress(0, text=f"Building daily filter for {len(fut)} stocks...")
+    for i, (_, r) in enumerate(fut.iterrows(), 1):
+        symbol = str(r["underlying_symbol"])
+        try:
+            h = cached_cash_daily(int(r["underlying_security_id"]))
+            cols = build_pnf(h["close"], 0.0025, 3)
+            if cols:
+                last = cols[-1]
+                if last["type"] == "X" and last["boxes"] > 15:
+                    bias, anchor_ok = "Bullish", True
+                elif last["type"] == "O" and last["boxes"] > 15:
+                    bias, anchor_ok = "Bearish", True
+                else:
+                    bias, anchor_ok = "Sideways", False
+            else:
+                bias, anchor_ok = "Unavailable", False
+        except Exception:
+            bias, anchor_ok = "Unavailable", False
+        result[symbol] = {"bias": bias, "anchor_ok": anchor_ok}
+        prog.progress(i / max(len(fut), 1), text=f"Daily filter {i}/{len(fut)}")
+    prog.empty()
+    return result
+
+def get_morning_daily_filter(fut):
+    today = datetime.now().date().isoformat()
+    if (
+        st.session_state.intraday_filter_date != today
+        or not st.session_state.intraday_daily_filter
+    ):
+        st.session_state.intraday_daily_filter = build_morning_daily_filter(fut)
+        st.session_state.intraday_filter_date = today
+    return st.session_state.intraday_daily_filter
+
+
+
+def positional_new_pattern_flag(df):
+    """
+    True when the latest three completed daily P&F columns form the exact
+    new pattern:
+      Bullish: X Anchor >15 -> 1-5 O pullback -> X breakout/third column
+      Bearish: O Anchor >15 -> 1-5 X pullback -> O breakout/third column
+    This is only a highlight; it does not change entry rules.
+    """
+    try:
+        if df is None or df.empty:
+            return False
+        cols = build_pnf(df["close"], 0.0025, 3)
+        if len(cols) < 3:
+            return False
+        c1, c2, c3 = cols[-3:]
+        bullish = (
+            c1["type"] == "X" and c1["boxes"] > 15 and
+            c2["type"] == "O" and 1 <= c2["boxes"] <= 5 and
+            c3["type"] == "X"
+        )
+        bearish = (
+            c1["type"] == "O" and c1["boxes"] > 15 and
+            c2["type"] == "X" and 1 <= c2["boxes"] <= 5 and
+            c3["type"] == "O"
+        )
+        return bullish or bearish
+    except Exception:
+        return False
+
+
+# -----------------------------
+# Main
+# -----------------------------
+if not st.session_state.client_id or not st.session_state.access_token:
+    st.warning("Enter Client Code and Access Token.")
     st.stop()
 
 try:
-    instruments = load_instruments()
-    st.success(f"Instrument master loaded: {len(instruments):,} rows")
+    master = load_master()
 except Exception as e:
-    st.error(f"Could not load the instrument master: {e}")
+    st.error(f"Instrument master failed: {e}")
     st.stop()
 
-mode = st.radio(
-    "Dashboard",
-    ["NSE P&F", "Sector Breadth", "MCX", "Diagnostics"],
-    horizontal=True
-)
+# Auto refresh is deliberately longer than the initial full-universe scan.
+# The full NSE scan can take longer than 1 minute, so a 1-minute rerun would
+# interrupt the scan and start it again from stock 1.
+if auto:
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        mins = 1 if page == "NSE Intraday P&F" else 1 if page == "MCX Intraday" else 15
+        if page == "Market Overview":
+            mins = 3
+        st_autorefresh(interval=mins * 60 * 1000, key=f"refresh_{page}")
+        if page == "NSE Intraday P&F":
+            st.caption("NSE Intraday auto-refresh: 1 minute. Daily P&F filter reduces the intraday scan universe before 1-minute analysis.")
+    except Exception:
+        pass
 
-# ----------------------------
-# NSE P&F
-# ----------------------------
-if mode == "NSE P&F":
-    st.subheader("NSE P&F Trading System")
-    sys_mode = st.radio("Trading mode", ["Positional", "Intraday"], horizontal=True)
-    box = 0.0025 if sys_mode == "Positional" else 0.0015
-    st.info(
-        f"{sys_mode}: {box*100:.2f}% box | 3-box reversal | "
-        f"{'daily closes' if sys_mode=='Positional' else '1-minute closes'} only."
-    )
+if page == "Market Overview":
+    nse = future_universe(master, "NSE")
+    mcx = future_universe(master, "MCX")
+    st.title("ALPHA ANALYZER")
+    a,b,c = st.columns(3)
+    a.metric("NSE F&O stocks", len(nse))
+    b.metric("MCX futures", len(mcx))
+    c.metric("Instrument rows", len(master))
 
-    uni = nearest_fno(instruments, "NSE")
-    if uni.empty:
-        st.error("No NSE FUTSTK contracts were found in the Dhan instrument master.")
+    if not nse.empty:
+        sample = nse.head(min(20, len(nse)))
+        try:
+            spot = batch_ltp("NSE_EQ", sample["underlying_security_id"].dropna().astype(int).tolist())
+            st.metric("Live NSE cash LTPs returned", f"{len(spot)}/{len(sample)}")
+        except Exception as e:
+            st.error(f"Spot LTP test: {e}")
+
+elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
+    mode = "Intraday" if page == "NSE Intraday P&F" else "Positional"
+    st.title(page)
+
+    fut = future_universe(master, "NSE")
+    if fut.empty:
+        st.error("No NSE FUTSTK universe found.")
         st.stop()
 
-    sym = "underlying_symbol" if "underlying_symbol" in uni.columns else "symbol_name"
-    uni[sym] = uni[sym].astype(str).str.upper().str.strip()
-    selected = choose_rows(uni.sort_values(sym), max_scan)
+    if mode == "Positional":
+        st.caption("Positional P&F: cash/spot | 0.25% box | 3-box reversal | daily close.")
+        candidates = fut.copy()
+    else:
+        st.caption(
+            "Intraday: daily last-column Anchor (>15 boxes) filter once per day → "
+            "0.15% / 3-box / 1-minute P&F + intraday 10-SMA. No OI. No sector analysis."
+        )
+        daily_map = get_morning_daily_filter(fut)
+        daily_df = pd.DataFrame([
+            {"Symbol": sym, "Daily Bias": info["bias"], "Daily Anchor": info["anchor_ok"]}
+            for sym, info in daily_map.items()
+        ])
+        allowed_symbols = set(daily_df.loc[daily_df["Daily Anchor"], "Symbol"])
+        candidates = fut[fut["underlying_symbol"].isin(allowed_symbols)].copy()
 
-    progress = st.progress(0)
+        st.info(
+            f"Morning daily filter retained {len(candidates)} of {len(fut)} F&O stocks. "
+            f"Filter date: {st.session_state.intraday_filter_date}"
+        )
+        if st.button("Rebuild Daily Filter", key="rebuild_daily_filter"):
+            st.session_state.intraday_daily_filter = build_morning_daily_filter(fut)
+            st.session_state.intraday_filter_date = datetime.now().date().isoformat()
+            st.rerun()
+
+    ids = candidates["underlying_security_id"].astype(int).tolist() if not candidates.empty else []
+    spot_map = batch_ltp("NSE_EQ", ids) if ids else {}
+
     rows = []
-    for i, (_, r) in enumerate(selected.iterrows(), 1):
-        symbol = str(r[sym])
+    prog = st.progress(0, text=f"Scanning {len(candidates)} NSE stocks...")
+    for i, (_, r) in enumerate(candidates.iterrows(), 1):
+        symbol = str(r["underlying_symbol"])
+        sid = int(r["underlying_security_id"])
+        ltp = spot_map.get(sid, np.nan)
+
         try:
-            hist = get_daily(r.security_id) if sys_mode == "Positional" else get_intraday(r.security_id, "NSE_FNO", "FUTSTK")
-            # Remove the current incomplete 1-min bar.
-            if sys_mode == "Intraday" and not hist.empty:
-                now = pd.Timestamp.now()
-                hist = hist[hist["datetime"] < now.floor("min")].copy()
-            pnf = pnf_analysis(hist, box, int(anchor_boxes))
-            oi, pchg, doichg = oi_state(hist)
-            status, qualified = system_result(pnf, oi)
+            h = cached_cash_intraday(sid) if mode == "Intraday" else cached_cash_daily(sid)
+            p = analyze_new_pattern(
+                h,
+                0.0015 if mode == "Intraday" else 0.0025,
+                anchor_min=15,
+                pullback_max=5,
+            )
+
+            if mode == "Intraday":
+                daily_bias = daily_df.loc[daily_df["Symbol"] == symbol, "Daily Bias"].iloc[0]
+                sma10 = intraday_sma10(h)
+                above_sma = pd.notna(ltp) and pd.notna(sma10) and float(ltp) > float(sma10)
+                below_sma = pd.notna(ltp) and pd.notna(sma10) and float(ltp) < float(sma10)
+
+                if p["dtb"] and daily_bias == "Bullish" and above_sma:
+                    rec = "🟢 BUY"
+                elif p["dbs"] and daily_bias == "Bearish" and below_sma:
+                    rec = "🔴 SELL"
+                elif p["prospective"] and (
+                    (daily_bias == "Bullish" and p["bias"] == "Bullish" and above_sma) or
+                    (daily_bias == "Bearish" and p["bias"] == "Bearish" and below_sma)
+                ):
+                    rec = "🟡 SETUP"
+                else:
+                    rec = "NO TRADE"
+                bias = daily_bias
+                sl = p.get("sl", np.nan)
+            else:
+                rec = (
+                    "🟢 BUY" if p["dtb"] else
+                    "🔴 SELL" if p["dbs"] else
+                    "🟡 SETUP" if p["prospective"] else
+                    "NO TRADE"
+                )
+                bias = p["bias"]
+                sl = p.get("sl", np.nan)
+                positional_new_pattern = positional_new_pattern_flag(h)
+
+            # Entry is the P&F trigger level:
+            # DTB/SETUP LONG -> Anchor high
+            # DBS/SETUP SHORT -> Anchor low
+            entry = p.get("entry_level", np.nan)
+
+            # Ensure SL is displayed for BUY/SELL/SETUP. If pattern does not
+            # yet have a pullback-based SL, derive a structural fallback from
+            # the last three P&F columns.
+            if pd.isna(sl):
+                try:
+                    cols = build_pnf(h["close"], 0.0015 if mode == "Intraday" else 0.0025, 3)
+                    if len(cols) >= 2:
+                        last = cols[-1]
+                        prev = cols[-2]
+                        if bias == "Bullish" and prev["type"] == "O":
+                            sl = prev["low"]
+                        elif bias == "Bearish" and prev["type"] == "X":
+                            sl = prev["high"]
+                except Exception:
+                    pass
+
             rows.append({
-                "Symbol": symbol,
-                "Sector": sector_of(symbol),
-                "Bias": pnf["bias"],
-                "Anchor": "✅" if pnf["anchor"] else "❌",
-                "DTB": "✅" if pnf["dtb"] else "❌",
-                "DBS": "✅" if pnf["dbs"] else "❌",
-                "OI": oi,
-                "Price Δ%": pchg,
-                "OI Δ": doichg,
-                "System": status,
-                "SL": pnf["sl"],
-                "Reason": pnf["reason"],
+                "Script": symbol,
+                "LTP": ltp,
+                "Bias": bias,
+                "Entry": entry,
+                "SL": sl,
+                "Recommendation": rec,
             })
         except Exception as e:
             rows.append({
-                "Symbol": symbol, "Sector": sector_of(symbol), "Bias":"ERROR",
-                "Anchor":"❌","DTB":"❌","DBS":"❌","OI":"ERROR",
-                "Price Δ%":np.nan,"OI Δ":np.nan,"System":"DATA ERROR","SL":np.nan,
-                "Reason":str(e)[:250]
+                "Script": symbol,
+                "LTP": ltp,
+                "Bias": "UNAVAILABLE",
+                "Entry": np.nan,
+                "SL": np.nan,
+                "New Pattern": False,
+                "Recommendation": "DATA ERROR",
             })
-        progress.progress(i/len(selected))
-    progress.empty()
+
+        prog.progress(i / max(len(candidates), 1), text=f"Scanning {i}/{max(len(candidates), 1)}")
+    prog.empty()
 
     res = pd.DataFrame(rows)
-    breadth = sector_breadth(res)
-    if not breadth.empty:
-        res["⭐"] = res["Sector"].map(lambda s: stock_star(s, breadth, sector_threshold))
+
+    long_df = res[res["Recommendation"] == "🟢 BUY"].copy()
+    short_df = res[res["Recommendation"] == "🔴 SELL"].copy()
+    setup_df = res[res["Recommendation"] == "🟡 SETUP"].copy()
+
+    st.markdown("## 🟢 BULLISH / LONG TRADES")
+    if long_df.empty:
+        st.info("No bullish trades currently.")
     else:
-        res["⭐"] = ""
+        show_long = long_df[["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]].copy()
+        if mode == "Positional" and "New Pattern" in long_df.columns:
+            def hl_long(row):
+                src = long_df.loc[row.name, "New Pattern"]
+                if bool(src):
+                    return ["background-color: #cfe8ff; font-weight: 700"] * len(row)
+                return [""] * len(row)
+            st.dataframe(show_long.style.apply(hl_long, axis=1), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(show_long, use_container_width=True, hide_index=True)
 
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Stocks scanned", len(res))
-    c2.metric("BUY signals", int((res["System"]=="🟢 BUY").sum()))
-    c3.metric("SELL signals", int((res["System"]=="🔴 SELL").sum()))
-    c4.metric("Data errors", int((res["System"]=="DATA ERROR").sum()))
-
-    st.subheader("System Results")
-    st.dataframe(
-        res[["⭐","Symbol","Sector","Bias","Anchor","DTB","DBS","OI","Price Δ%","OI Δ","System","SL","Reason"]],
-        use_container_width=True, hide_index=True
-    )
-
-    buys = res[res["System"]=="🟢 BUY"]
-    sells = res[res["System"]=="🔴 SELL"]
-    a,b = st.columns(2)
-    with a:
-        st.markdown("### 🟢 BUY")
-        st.dataframe(buys[["⭐","Symbol","Sector","System","SL","Reason"]], use_container_width=True, hide_index=True)
-    with b:
-        st.markdown("### 🔴 SELL")
-        st.dataframe(sells[["⭐","Symbol","Sector","System","SL","Reason"]], use_container_width=True, hide_index=True)
-
-# ----------------------------
-# Sector breadth
-# ----------------------------
-elif mode == "Sector Breadth":
-    st.subheader("P&F Sector Breadth")
-    sys_mode = st.radio("Breadth mode", ["Positional", "Intraday"], horizontal=True)
-    box = 0.0025 if sys_mode=="Positional" else 0.0015
-    uni = nearest_fno(instruments, "NSE")
-    sym = "underlying_symbol" if "underlying_symbol" in uni.columns else "symbol_name"
-    selected = choose_rows(uni.sort_values(sym), max_scan)
-    rows=[]
-    for _,r in selected.iterrows():
-        try:
-            h = get_daily(r.security_id) if sys_mode=="Positional" else get_intraday(r.security_id, "NSE_FNO", "FUTSTK")
-            if sys_mode=="Intraday" and not h.empty:
-                h = h[h["datetime"] < pd.Timestamp.now().floor("min")]
-            p = pnf_analysis(h, box, int(anchor_boxes))
-            symbol=str(r[sym])
-            rows.append({"Symbol":symbol,"Sector":sector_of(symbol),"Bias":p["bias"],
-                         "DTB":"✅" if p["dtb"] else "❌","DBS":"✅" if p["dbs"] else "❌"})
-        except Exception:
-            pass
-    br=sector_breadth(pd.DataFrame(rows))
-    if br.empty:
-        st.warning("No sector breadth data returned. Open Diagnostics.")
+    st.markdown("## 🔴 BEARISH / SHORT TRADES")
+    if short_df.empty:
+        st.info("No bearish trades currently.")
     else:
-        br["⭐ Sector"] = np.where((br["Bullish %"]>=sector_threshold)|(br["Bearish %"]>=sector_threshold),"⭐","")
-        st.dataframe(br[["⭐ Sector","Sector","stocks","bullish","Bullish %","bearish","Bearish %","dtb","dbs"]],
-                     use_container_width=True, hide_index=True)
+        show_short = short_df[["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]].copy()
+        if mode == "Positional" and "New Pattern" in short_df.columns:
+            def hl_short(row):
+                src = short_df.loc[row.name, "New Pattern"]
+                if bool(src):
+                    return ["background-color: #cfe8ff; font-weight: 700"] * len(row)
+                return [""] * len(row)
+            st.dataframe(show_short.style.apply(hl_short, axis=1), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(show_short, use_container_width=True, hide_index=True)
 
-# ----------------------------
-# MCX
-# ----------------------------
-elif mode == "MCX":
-    st.subheader("MCX P&F Trading System")
-    st.caption("Daily 0.25% P&F = direction filter | Intraday 0.15% P&F = entry | OI = secondary confirmation")
+    st.markdown("## 🟡 SETUPS FORMING")
+    if setup_df.empty:
+        st.info("No setups forming currently.")
+    else:
+        show_setup = setup_df[["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]].copy()
+        if mode == "Positional" and "New Pattern" in setup_df.columns:
+            def hl_setup(row):
+                src = setup_df.loc[row.name, "New Pattern"]
+                if bool(src):
+                    return ["background-color: #cfe8ff; font-weight: 700"] * len(row)
+                return [""] * len(row)
+            st.dataframe(show_setup.style.apply(hl_setup, axis=1), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(show_setup, use_container_width=True, hide_index=True)
 
-    uni = nearest_fno(instruments, "MCX")
-    if uni.empty:
-        st.error("No MCX FUTCOM contracts were found in the Dhan instrument master.")
+    st.markdown("## All Scanned")
+    all_view = res[["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]].copy()
+    if mode == "Positional" and "New Pattern" in res.columns:
+        def hl_all(row):
+            src = res.loc[row.name, "New Pattern"]
+            if bool(src):
+                return ["background-color: #cfe8ff; font-weight: 700"] * len(row)
+            return [""] * len(row)
+        st.dataframe(all_view.style.apply(hl_all, axis=1), use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(all_view, use_container_width=True, hide_index=True)
+
+elif page in ("MCX Intraday", "MCX Positional"):
+    mode = "Intraday" if page == "MCX Intraday" else "Positional"
+    st.title(page)
+
+    fut = future_universe(master, "MCX")
+    if fut.empty:
+        st.error("No MCX FUTCOM universe found.")
         st.stop()
 
-    sym = "underlying_symbol" if "underlying_symbol" in uni.columns else "symbol_name"
-    names = sorted(uni[sym].astype(str).unique())
-    chosen = st.selectbox("Commodity", names)
+    # MCX intraday uses the daily Anchor filter only once per day.
+    if mode == "Intraday":
+        st.caption(
+            "MCX Intraday: daily 0.25% / 3-box last-column Anchor filter → "
+            "0.15% / 3-box / 1-minute P&F. P&F only."
+        )
 
-    rr = uni[uni[sym].astype(str) == chosen].iloc[0]
-    try:
-        daily = get_mcx_daily(rr.security_id)
-        intra = get_intraday(rr.security_id, "MCX_COMM", "FUTCOM")
-        if not intra.empty:
-            intra = intra[intra["datetime"] < pd.Timestamp.now().floor("min")]
+        if "mcx_daily_filter" not in st.session_state:
+            st.session_state.mcx_daily_filter = {}
+        if "mcx_filter_date" not in st.session_state:
+            st.session_state.mcx_filter_date = None
 
-        dp = pnf_analysis(daily, 0.0025, int(anchor_boxes))
-        ip = pnf_analysis(intra, 0.0015, int(anchor_boxes))
+        today = datetime.now().date().isoformat()
 
-        oi, pchg, doichg = oi_state(intra)
+        if (
+            st.session_state.mcx_filter_date != today
+            or not st.session_state.mcx_daily_filter
+        ):
+            dmap = {}
+            prog = st.progress(
+                0,
+                text=f"Building MCX daily filter for {len(fut)} commodities..."
+            )
 
-        if ip["signal_side"] == "LONG" and dp["bias"] == "Bullish":
-            system = "🟢 LONG"
-        elif ip["signal_side"] == "SHORT" and dp["bias"] == "Bearish":
-            system = "🔴 SHORT"
-        elif ip["signal_side"] in ("LONG","SHORT"):
-            system = "WAIT - DAILY FILTER"
-        else:
-            system = "WAIT - NO INTRADAY SETUP"
+            for i, (_, r) in enumerate(fut.iterrows(), 1):
+                symbol = str(r["underlying_symbol"])
+                try:
+                    h = historical(
+                        int(r["security_id"]),
+                        "MCX_COMM",
+                        "FUTCOM",
+                        "Positional",
+                    )
 
-        c1,c2,c3,c4,c5 = st.columns(5)
-        c1.metric("Daily P&F", dp["bias"])
-        c2.metric("Intraday P&F", ip["bias"])
-        c3.metric("Intraday setup", ip["signal_side"] or "—")
-        c4.metric("System", system)
-        c5.metric("Initial SL", f"{ip['sl']:.2f}" if pd.notna(ip["sl"]) else "—")
+                    cols = build_pnf(h["close"], 0.0025, 3)
 
-        st.write(f"**Daily reason:** {dp['reason']}")
-        st.write(f"**Intraday reason:** {ip['reason']}")
-        st.write(f"**Secondary OI:** {oi} | Price Δ {pchg:.2f}% | OI Δ {doichg:.0f}" if pd.notna(pchg) and pd.notna(doichg) else "**Secondary OI:** unavailable")
+                    if cols:
+                        last = cols[-1]
+                        if last["type"] == "X" and last["boxes"] > 15:
+                            dmap[symbol] = "Bullish"
+                        elif last["type"] == "O" and last["boxes"] > 15:
+                            dmap[symbol] = "Bearish"
+                        else:
+                            dmap[symbol] = "Sideways"
+                    else:
+                        dmap[symbol] = "Unavailable"
 
-        if system.startswith("🟢"):
-            st.success(f"{system} — daily trend agrees with intraday DTB.")
-        elif system.startswith("🔴"):
-            st.error(f"{system} — daily trend agrees with intraday DBS.")
-        else:
-            st.info(system)
+                except Exception:
+                    dmap[symbol] = "Unavailable"
 
-        st.markdown("**Exit:** opposite 0.15% intraday P&F reversal signal.")
-        st.markdown("**Initial SL:** previous confirmed opposite P&F column extreme at entry.")
+                prog.progress(
+                    i / max(len(fut), 1),
+                    text=f"MCX daily filter {i}/{len(fut)}"
+                )
 
-        with st.expander("Raw candle/data counts"):
-            st.write({"daily_rows": len(daily), "intraday_rows": len(intra)})
-            st.dataframe(intra.tail(10), use_container_width=True, hide_index=True)
-    except Exception as e:
-        st.error(f"MCX analysis error: {e}")
+            prog.empty()
+            st.session_state.mcx_daily_filter = dmap
+            st.session_state.mcx_filter_date = today
 
-# ----------------------------
-# Diagnostics
-# ----------------------------
-else:
-    st.subheader("Diagnostics")
-    st.write("Use this page when any scan is empty. It shows exactly where data stops.")
-    st.write({
-        "client_code_present": bool(st.session_state.alpha_client_id),
-        "access_token_present": bool(st.session_state.alpha_access_token),
-        "instrument_rows": len(instruments),
-        "NSE FUTSTK": int(((instruments["exchange"]=="NSE") & (instruments["instrument"]=="FUTSTK")).sum()),
-        "MCX FUTCOM": int(((instruments["exchange"]=="MCX") & (instruments["instrument"]=="FUTCOM")).sum()),
-    })
+        daily_map = st.session_state.mcx_daily_filter
 
-    if not st.session_state.api_log:
-        st.info("No API call logged yet. Open NSE P&F or MCX to run a test.")
+        allowed = {
+            symbol
+            for symbol, bias in daily_map.items()
+            if bias in ("Bullish", "Bearish")
+        }
+
+        candidates = fut[
+            fut["underlying_symbol"].isin(allowed)
+        ].copy()
+
+        st.info(
+            f"Morning MCX filter retained {len(candidates)} of {len(fut)} commodities. "
+            f"Filter date: {st.session_state.mcx_filter_date}"
+        )
+
+        if st.button(
+            "Rebuild MCX Daily Filter",
+            key="rebuild_mcx_daily_filter"
+        ):
+            st.session_state.mcx_daily_filter = {}
+            st.session_state.mcx_filter_date = None
+            st.rerun()
+
     else:
-        st.dataframe(pd.DataFrame(st.session_state.api_log).tail(50), use_container_width=True, hide_index=True)
+        st.caption(
+            "MCX Positional: 0.25% / 3-box / daily close. P&F only."
+        )
+        candidates = fut.copy()
 
-    with st.expander("Instrument master columns"):
-        st.write(list(instruments.columns))
+    ids = (
+        candidates["security_id"].astype(int).tolist()
+        if not candidates.empty
+        else []
+    )
 
-    with st.expander("Sample NSE futures"):
-        nse = nearest_fno(instruments, "NSE")
-        st.dataframe(nse.head(20), use_container_width=True, hide_index=True)
+    ltp_map = (
+        batch_ltp("MCX_COMM", ids)
+        if ids
+        else {}
+    )
 
-    with st.expander("Sample MCX futures"):
-        mcx = nearest_fno(instruments, "MCX")
-        st.dataframe(mcx.head(20), use_container_width=True, hide_index=True)
+    rows = []
+    prog = st.progress(
+        0,
+        text=f"Scanning {len(candidates)} MCX commodities..."
+    )
 
-    if st.session_state.last_error:
-        st.error(st.session_state.last_error)
+    for i, (_, r) in enumerate(candidates.iterrows(), 1):
+        symbol = str(r["underlying_symbol"])
+        sid = int(r["security_id"])
+        ltp = ltp_map.get(sid, np.nan)
 
-st.divider()
-st.caption(f"Page refresh: {datetime.now().strftime('%d-%b-%Y %H:%M:%S')} | API calls in this browser session: {len(st.session_state.api_log)}")
+        try:
+            h = historical(
+                sid,
+                "MCX_COMM",
+                "FUTCOM",
+                "Intraday" if mode == "Intraday" else "Positional",
+            )
+
+            p = analyze_new_pattern(
+                h,
+                0.0015 if mode == "Intraday" else 0.0025,
+                anchor_min=15,
+                pullback_max=5,
+            )
+
+            # Direction for MCX intraday comes from the fixed daily filter.
+            if mode == "Intraday":
+                daily_bias = daily_map.get(symbol, "Unavailable")
+
+                if p["dtb"] and daily_bias == "Bullish":
+                    rec = "🟢 BUY"
+                elif p["dbs"] and daily_bias == "Bearish":
+                    rec = "🔴 SELL"
+                elif (
+                    p["prospective"]
+                    and p["bias"] == daily_bias
+                ):
+                    rec = "🟡 SETUP"
+                else:
+                    rec = "NO TRADE"
+
+                bias = daily_bias
+
+            else:
+                bias = p["bias"]
+
+                if p["dtb"]:
+                    rec = "🟢 BUY"
+                elif p["dbs"]:
+                    rec = "🔴 SELL"
+                elif p["prospective"]:
+                    rec = "🟡 SETUP"
+                else:
+                    rec = "NO TRADE"
+
+            # Explicit Entry: NEVER use an undefined variable.
+            entry = p.get("entry_level", np.nan)
+
+            # Structural P&F SL.
+            sl = p.get("sl", np.nan)
+
+            # Fallback SL from previous opposite column if needed.
+            if pd.isna(sl):
+                try:
+                    cols = build_pnf(
+                        h["close"],
+                        0.0015 if mode == "Intraday" else 0.0025,
+                        3,
+                    )
+
+                    if len(cols) >= 2:
+                        prev = cols[-2]
+
+                        if bias == "Bullish" and prev["type"] == "O":
+                            sl = prev["low"]
+
+                        elif bias == "Bearish" and prev["type"] == "X":
+                            sl = prev["high"]
+
+                except Exception:
+                    pass
+
+            rows.append({
+                "Script": symbol,
+                "LTP": ltp,
+                "Bias": bias,
+                "Entry": entry,
+                "SL": sl,
+                "Recommendation": rec,
+            })
+
+        except Exception:
+            rows.append({
+                "Script": symbol,
+                "LTP": ltp,
+                "Bias": "UNAVAILABLE",
+                "Entry": np.nan,
+                "SL": np.nan,
+                "Recommendation": "DATA ERROR",
+            })
+
+        prog.progress(
+            i / max(len(candidates), 1),
+            text=f"MCX scan {i}/{max(len(candidates), 1)}"
+        )
+
+    prog.empty()
+
+    res = pd.DataFrame(rows)
+
+    long_df = res[
+        res["Recommendation"] == "🟢 BUY"
+    ].copy()
+
+    short_df = res[
+        res["Recommendation"] == "🔴 SELL"
+    ].copy()
+
+    setup_df = res[
+        res["Recommendation"] == "🟡 SETUP"
+    ].copy()
+
+    st.markdown("## 🟢 BULLISH / LONG TRADES")
+
+    if long_df.empty:
+        st.info("No bullish trades currently.")
+    else:
+        st.dataframe(
+            long_df[
+                ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("## 🔴 BEARISH / SHORT TRADES")
+
+    if short_df.empty:
+        st.info("No bearish trades currently.")
+    else:
+        st.dataframe(
+            short_df[
+                ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("## 🟡 SETUPS FORMING")
+
+    if setup_df.empty:
+        st.info("No setups forming currently.")
+    else:
+        st.dataframe(
+            setup_df[
+                ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("## All Scanned")
+
+    st.dataframe(
+        res[
+            ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+else:
+    st.title("Diagnostics")
+    st.json({
+        "client_code_present": bool(st.session_state.client_id),
+        "access_token_present": bool(st.session_state.access_token),
+        "master_rows": len(master),
+        "nse_futures": len(future_universe(master, "NSE")),
+        "mcx_futures": len(future_universe(master, "MCX")),
+    })
+    if st.session_state.api_log:
+        st.dataframe(pd.DataFrame(st.session_state.api_log).tail(50),
+                     use_container_width=True, hide_index=True)
+    else:
+        st.info("No API calls yet.")
+
+st.caption(f"Last refresh: {datetime.now().strftime('%d-%b-%Y %H:%M:%S')}")
