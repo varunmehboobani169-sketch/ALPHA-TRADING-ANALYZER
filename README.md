@@ -1,20 +1,29 @@
-# ALPHA ANALYZER FINAL V14
+# ALPHA ANALYZER V15
 
-NSE architecture:
-- P&F is built from NSE cash/spot EQUITY price only.
-- Only stocks that have an active NSE FUTSTK are included.
+Functional architecture before visual redesign.
+
+Pages:
+- Market Overview — 3 minute refresh
+- NSE Intraday P&F — 1 minute refresh
+- NSE Positional P&F — 15 minute refresh
+- Bullish Stocks — 3 minute refresh (select Intraday/Positional)
+- Bearish Stocks — 3 minute refresh (select Intraday/Positional)
+- Sector Breadth — 15 minute refresh
+- MCX Intraday — 1 minute refresh
+- MCX Positional — 15 minute refresh
+- Diagnostics — manual
+
+NSE:
+- P&F uses CASH/EQUITY price only.
+- Universe = stocks that have active NSE FUTSTK contracts.
 - Futures are used only for OI confirmation.
 - All unique F&O stocks are scanned.
-- Positional: 0.25% box, 3-box reversal, daily cash closes.
-- Intraday: 0.15% box, 3-box reversal, completed 1-minute cash closes.
-- Anchor -> retracement -> DTB/DBS is explicit.
-- Initial SL uses the latest completed opposite P&F column extreme.
-- Futures OI is obtained in a batched Market Quote call and compared with a once-per-day cached previous OI baseline.
-- Historical cash intraday data is cached for 3 minutes to align with the current auto-refresh while avoiding duplicate calls inside a rerun.
-- Sector breadth uses cash P&F.
-- MCX remains a separate futures-based engine.
-- Client code/access token remain in Streamlit session state.
 
-Important:
-- This version is signal-only; it does not place orders.
-- Use Diagnostics to verify the unique NSE F&O cash mapping before live use.
+MCX:
+- Positional: 0.25% / 3 box / daily close.
+- Intraday: daily 0.25% direction filter + 0.15% / 3 box / 1-minute entry.
+- OI is secondary.
+
+Credentials:
+- Client code and access token persist in Streamlit session state.
+- Do not put access token in GitHub.

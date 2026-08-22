@@ -54,9 +54,6 @@ with st.sidebar:
 
     st.divider()
     auto = st.checkbox("Auto refresh", True)
-    refresh_min = st.selectbox("Refresh interval", [1, 2, 3, 5], index=2)
-    scan_all_fno = st.checkbox("Scan ALL NSE F&O stocks", True)
-    max_scan = st.slider("F&O/MCX scan size (when ALL is off)", 20, 640, 100, step=20)
     anchor_boxes = st.number_input("Minimum anchor boxes", 5, 30, 15)
     sector_threshold = st.slider("Super sector breadth %", 50, 90, 70)
     require_oi = st.checkbox("Require OI confirmation", True)
@@ -811,16 +808,6 @@ def futures_confirmation(symbols_df, require_oi=True):
     return result
 
 # ----------------------------
-# Auto refresh
-# ----------------------------
-if auto:
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        st_autorefresh(interval=refresh_min*60*1000, key="alpha_refresh")
-    except Exception:
-        pass
-
-# ----------------------------
 # Main page
 # ----------------------------
 st.title("ALPHA ANALYZER")
@@ -843,42 +830,71 @@ st.caption(f"Active futures found: NSE {nse_count} | MCX {mcx_count} | Last app 
 
 mode = st.radio(
     "Dashboard",
-    ["NSE P&F", "Sector Breadth", "MCX", "Diagnostics"],
-    horizontal=True
+    [
+        "Market Overview",
+        "NSE Intraday P&F",
+        "NSE Positional P&F",
+        "Bullish Stocks",
+        "Bearish Stocks",
+        "Sector Breadth",
+        "MCX Intraday",
+        "MCX Positional",
+        "Diagnostics",
+    ],
+    horizontal=True,
+    key="dashboard_mode",
 )
 
-# ----------------------------
-# NSE P&F
-# ----------------------------
-if mode == "NSE P&F":
-    st.subheader("NSE P&F Trading System")
-    sys_mode = st.radio("Trading mode", ["Positional", "Intraday"], horizontal=True)
-    box = 0.0025 if sys_mode == "Positional" else 0.0015
-    st.info(
-        f"{sys_mode}: CASH/SPOT price | {box*100:.2f}% box | 3-box reversal | "
-        f"Anchor ≥ {anchor_boxes} boxes | "
-        f"{'daily closes' if sys_mode=='Positional' else '1-minute closes'} only. "
-        f"Futures are used only for OI confirmation."
-    )
+# Module-specific refresh:
+# Intraday P&F = 1 minute
+# Positional / Sector = 15 minutes
+# Diagnostics = manual
+# Market Overview / Bullish / Bearish = 3 minutes
+refresh_minutes = {
+    "Market Overview": 3,
+    "NSE Intraday P&F": 1,
+    "NSE Positional P&F": 15,
+    "Bullish Stocks": 3,
+    "Bearish Stocks": 3,
+    "Sector Breadth": 15,
+    "MCX Intraday": 1,
+    "MCX Positional": 15,
+    "Diagnostics": 0,
+}[mode]
 
+if auto and refresh_minutes:
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(
+            interval=refresh_minutes * 60 * 1000,
+            key=f"alpha_refresh_{mode.replace(' ', '_')}"
+        )
+    except Exception:
+        pass
+
+st.caption(
+    f"Auto refresh: {'ON' if auto else 'OFF'} | "
+    f"{'Every ' + str(refresh_minutes) + ' min' if refresh_minutes else 'Manual'}"
+)
+
+
+# ----------------------------
+# Shared NSE P&F scanner
+# ----------------------------
+@st.cache_data(ttl=55, show_spinner=False)
+def run_nse_pnf_scan(sys_mode, anchor_min, require_oi, universe_signature):
     universe = nse_fno_stock_universe(instruments)
     if universe.empty:
-        st.error("Could not map NSE F&O underlyings to NSE cash/spot instruments.")
-        st.stop()
+        return pd.DataFrame()
 
-    # Scan all unique F&O stocks, not every expiry contract.
+    box = 0.0025 if sys_mode == "Positional" else 0.0015
     selected = universe.sort_values("Symbol").reset_index(drop=True)
 
-    st.caption(f"Unique NSE F&O stocks with cash mapping: {len(selected)}")
+    # One batched futures quote call per cache interval.
+    oi_map = futures_confirmation(selected, require_oi=require_oi)
 
-    # One batched futures quote call + cached previous OI baseline.
-    with st.spinner("Loading futures OI confirmation..."):
-        oi_map = futures_confirmation(selected, require_oi=require_oi)
-
-    progress = st.progress(0, text=f"Scanning {len(selected)} NSE cash stocks...")
     rows = []
-
-    for i, (_, r) in enumerate(selected.iterrows(), 1):
+    for _, r in selected.iterrows():
         symbol = str(r["Symbol"])
         try:
             if sys_mode == "Positional":
@@ -886,32 +902,29 @@ if mode == "NSE P&F":
             else:
                 hist = get_cash_intraday(r["cash_security_id"], days=5)
                 if not hist.empty:
-                    # Exclude the currently forming minute; use completed closes only.
                     hist = hist[hist["datetime"] < pd.Timestamp.now().floor("min")].copy()
 
-            pnf = pnf_analysis(hist, box, int(anchor_boxes))
+            pnf = pnf_analysis(hist, box, int(anchor_min))
             oi_info = oi_map.get(symbol, {})
             oi_state_text = oi_info.get("state", "UNAVAILABLE")
 
-            # For the NSE strategy, OI confirmation is directional by P&F side.
             if require_oi and pnf["signal_side"]:
-                if oi_state_text != "OI BUILDUP":
-                    oi_for_system = "NO CONFIRMATION"
-                else:
-                    oi_for_system = "BUILDUP"
+                oi_ok = oi_state_text == "OI BUILDUP"
             else:
-                oi_for_system = oi_state_text
+                oi_ok = True
 
-            status, qualified = system_result(
-                pnf,
-                "LONG BUILDUP" if (oi_for_system == "BUILDUP" and pnf["signal_side"] == "LONG") else
-                "SHORT BUILDUP" if (oi_for_system == "BUILDUP" and pnf["signal_side"] == "SHORT") else
-                "WAIT"
-                if require_oi else
-                "LONG BUILDUP" if pnf["signal_side"] == "LONG" else
-                "SHORT BUILDUP" if pnf["signal_side"] == "SHORT" else "WAIT",
-                require_oi=require_oi
-            )
+            if pnf["signal_side"] == "LONG":
+                status = "🟢 BUY" if oi_ok else "WAIT - OI"
+            elif pnf["signal_side"] == "SHORT":
+                status = "🔴 SELL" if oi_ok else "WAIT - OI"
+            elif not pnf["anchor"]:
+                status = "WAIT - NO ANCHOR"
+            elif pnf["bias"] == "Bullish":
+                status = "WAIT - NO DTB"
+            elif pnf["bias"] == "Bearish":
+                status = "WAIT - NO DBS"
+            else:
+                status = "WAIT"
 
             rows.append({
                 "Symbol": symbol,
@@ -944,72 +957,101 @@ if mode == "NSE P&F":
                 "SL": np.nan,
                 "Reason": str(e)[:300],
             })
-        progress.progress(i/len(selected), text=f"Scanning NSE cash: {i}/{len(selected)}")
-    progress.empty()
-
     res = pd.DataFrame(rows)
+    if res.empty:
+        return res
     breadth = sector_breadth(res)
     if not breadth.empty:
         res["⭐"] = res["Sector"].map(lambda s: stock_star(s, breadth, sector_threshold))
     else:
         res["⭐"] = ""
+    return res
 
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("F&O stocks scanned", len(res))
-    c2.metric("Bullish P&F", int((res["Bias"]=="Bullish").sum()))
-    c3.metric("Bearish P&F", int((res["Bias"]=="Bearish").sum()))
-    c4.metric("Trade-ready", int(res["System"].isin(["🟢 BUY","🔴 SELL"]).sum()))
-
-    bullish = res[res["Bias"]=="Bullish"].copy()
-    bearish = res[res["Bias"]=="Bearish"].copy()
-
-    bullish = bullish.sort_values(
-        by=["DTB","Anchor Boxes","⭐","Symbol"],
-        ascending=[False, False, False, True]
-    )
-    bearish = bearish.sort_values(
-        by=["DBS","Anchor Boxes","⭐","Symbol"],
-        ascending=[False, False, False, True]
+# ----------------------------
+# Market Overview
+# ----------------------------
+if mode == "Market Overview":
+    st.subheader("Market Overview")
+    universe = nse_fno_stock_universe(instruments)
+    st.metric("NSE F&O stocks mapped to cash", len(universe))
+    st.metric("MCX futures discovered", len(nearest_fno(instruments, "MCX")))
+    st.info(
+        "Intraday P&F refreshes every 1 minute; positional and sector views every 15 minutes. "
+        "The main engine uses CASH/spot price for NSE P&F and futures OI only for confirmation."
     )
 
-    left, right = st.columns(2)
-    with left:
-        st.markdown("### 🟢 BULLISH STOCKS")
-        if bullish.empty:
-            st.info("No bullish P&F stocks currently detected.")
-        else:
-            st.dataframe(
-                bullish[["⭐","Symbol","Sector","Pattern","Anchor Boxes","Anchor","DTB","Futures OI","System","SL","Reason"]],
-                use_container_width=True, hide_index=True
-            )
-    with right:
-        st.markdown("### 🔴 BEARISH STOCKS")
-        if bearish.empty:
-            st.info("No bearish P&F stocks currently detected.")
-        else:
-            st.dataframe(
-                bearish[["⭐","Symbol","Sector","Pattern","Anchor Boxes","Anchor","DBS","Futures OI","System","SL","Reason"]],
-                use_container_width=True, hide_index=True
-            )
+    recent_logs = pd.DataFrame(st.session_state.api_log).tail(20)
+    if not recent_logs.empty:
+        st.markdown("### Recent API activity")
+        st.dataframe(recent_logs, use_container_width=True, hide_index=True)
 
-    st.markdown("#### Trade-ready setups")
-    a,b = st.columns(2)
-    with a:
-        buys = bullish[bullish["System"]=="🟢 BUY"]
-        st.metric("🟢 BUY", len(buys))
-        if not buys.empty:
-            st.dataframe(
-                buys[["⭐","Symbol","Sector","Pattern","Anchor Boxes","Futures OI","System","SL"]],
-                use_container_width=True, hide_index=True
-            )
-    with b:
-        sells = bearish[bearish["System"]=="🔴 SELL"]
-        st.metric("🔴 SELL", len(sells))
-        if not sells.empty:
-            st.dataframe(
-                sells[["⭐","Symbol","Sector","Pattern","Anchor Boxes","Futures OI","System","SL"]],
-                use_container_width=True, hide_index=True
-            )
+# ----------------------------
+# NSE Intraday / Positional
+# ----------------------------
+elif mode in ("NSE Intraday P&F", "NSE Positional P&F"):
+    sys_mode = "Intraday" if mode == "NSE Intraday P&F" else "Positional"
+    st.subheader(f"NSE {sys_mode} P&F")
+    st.info(
+        f"{sys_mode}: CASH/SPOT price | "
+        f"{'0.15% box' if sys_mode == 'Intraday' else '0.25% box'} | "
+        "3-box reversal | "
+        f"{'1-minute completed closes' if sys_mode == 'Intraday' else 'daily closes'} | "
+        "Futures OI confirmation"
+    )
+
+    res = run_nse_pnf_scan(
+        sys_mode,
+        int(anchor_boxes),
+        require_oi,
+        tuple(nse_fno_stock_universe(instruments)["Symbol"].tolist())
+    )
+
+    if res.empty:
+        st.warning("No NSE F&O data returned.")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Stocks scanned", len(res))
+        c2.metric("Bullish", int((res["Bias"] == "Bullish").sum()))
+        c3.metric("Bearish", int((res["Bias"] == "Bearish").sum()))
+        c4.metric("Trade-ready", int(res["System"].isin(["🟢 BUY","🔴 SELL"]).sum()))
+
+        cols = ["⭐","Symbol","Sector","Pattern","Anchor Boxes","Anchor","DTB","DBS",
+                "Futures OI","OI Δ","System","SL","Reason"]
+        st.dataframe(res[cols], use_container_width=True, hide_index=True)
+
+# ----------------------------
+# Bullish / Bearish dedicated pages
+# ----------------------------
+elif mode in ("Bullish Stocks", "Bearish Stocks"):
+    sys_mode = st.radio("P&F timeframe", ["Intraday", "Positional"], horizontal=True)
+    res = run_nse_pnf_scan(
+        sys_mode,
+        int(anchor_boxes),
+        require_oi,
+        tuple(nse_fno_stock_universe(instruments)["Symbol"].tolist())
+    )
+
+    bullish = res[res["Bias"] == "Bullish"].copy() if not res.empty else pd.DataFrame()
+    bearish = res[res["Bias"] == "Bearish"].copy() if not res.empty else pd.DataFrame()
+    target = bullish if mode == "Bullish Stocks" else bearish
+    pattern_col = "DTB" if mode == "Bullish Stocks" else "DBS"
+
+    if target.empty:
+        st.info(f"No {mode.lower()} currently detected.")
+    else:
+        target = target.sort_values(
+            by=[pattern_col, "Anchor Boxes", "⭐", "Symbol"],
+            ascending=[False, False, False, True]
+        )
+        st.subheader(f"{'🟢' if mode == 'Bullish Stocks' else '🔴'} {mode}")
+        st.dataframe(
+            target[["⭐","Symbol","Sector","Pattern","Anchor Boxes","Anchor",
+                    pattern_col,"Futures OI","System","SL","Reason"]],
+            use_container_width=True, hide_index=True
+        )
+
+        ready = target[target["System"].isin(["🟢 BUY","🔴 SELL"])]
+        st.metric("Trade-ready setups", len(ready))
 
 # ----------------------------
 # Sector breadth
@@ -1058,23 +1100,28 @@ elif mode == "Sector Breadth":
             use_container_width=True, hide_index=True
         )
 
+
 # ----------------------------
 # MCX
 # ----------------------------
-elif mode == "MCX":
-    st.subheader("MCX P&F Trading System")
-    st.caption("Daily 0.25% P&F = direction filter | Intraday 0.15% P&F = entry | OI = secondary confirmation")
+elif mode in ("MCX Intraday", "MCX Positional"):
+    sys_mode = "Intraday" if mode == "MCX Intraday" else "Positional"
+    st.subheader(f"MCX {sys_mode} P&F Trading System")
+    st.caption(
+        "MCX: daily 0.25% P&F provides the higher-timeframe direction; "
+        "intraday 0.15% P&F provides the entry. OI is secondary confirmation."
+    )
 
     uni = nearest_fno(instruments, "MCX")
     if uni.empty:
-        st.error("No MCX FUTCOM contracts were found in the Dhan instrument master.")
+        st.error("No MCX FUTCOM contracts were found.")
         st.stop()
 
     sym = "underlying_symbol"
     names = sorted(uni[sym].astype(str).unique())
-    chosen = st.selectbox("Commodity", names)
-
+    chosen = st.selectbox("Commodity", names, key=f"mcx_{sys_mode}_commodity")
     rr = uni[uni[sym].astype(str) == chosen].iloc[0]
+
     try:
         daily = get_mcx_daily(rr.security_id)
         intra = get_intraday(rr.security_id, "MCX_COMM", "FUTCOM")
@@ -1083,45 +1130,44 @@ elif mode == "MCX":
 
         dp = pnf_analysis(daily, 0.0025, int(anchor_boxes))
         ip = pnf_analysis(intra, 0.0015, int(anchor_boxes))
-
         oi, pchg, doichg = oi_state(intra)
 
-        if ip["signal_side"] == "LONG" and dp["bias"] == "Bullish":
-            system = "🟢 LONG"
-        elif ip["signal_side"] == "SHORT" and dp["bias"] == "Bearish":
-            system = "🔴 SHORT"
-        elif ip["signal_side"] in ("LONG","SHORT"):
-            system = "WAIT - DAILY FILTER"
+        if sys_mode == "Positional":
+            system = (
+                "🟢 LONG" if dp["signal_side"] == "LONG"
+                else "🔴 SHORT" if dp["signal_side"] == "SHORT"
+                else "WAIT"
+            )
+            signal = dp
+            st.info("Positional MCX: 0.25% / 3-box / daily close. Exit on opposite daily P&F reversal.")
         else:
-            system = "WAIT - NO INTRADAY SETUP"
+            if dp["bias"] == "Bullish" and ip["signal_side"] == "LONG":
+                system = "🟢 LONG"
+            elif dp["bias"] == "Bearish" and ip["signal_side"] == "SHORT":
+                system = "🔴 SHORT"
+            elif ip["signal_side"] in ("LONG","SHORT"):
+                system = "WAIT - DAILY FILTER"
+            else:
+                system = "WAIT - NO INTRADAY SETUP"
+            signal = ip
+            st.info("Intraday MCX: 0.15% / 3-box / 1-minute close, filtered by the 0.25% daily trend.")
 
         c1,c2,c3,c4,c5 = st.columns(5)
         c1.metric("Daily P&F", dp["bias"])
         c2.metric("Intraday P&F", ip["bias"])
-        c3.metric("Intraday setup", ip["signal_side"] or "—")
+        c3.metric("Setup", signal["pattern"])
         c4.metric("System", system)
-        c5.metric("Initial SL", f"{ip['sl']:.2f}" if pd.notna(ip["sl"]) else "—")
+        c5.metric("Initial SL", f"{signal['sl']:.2f}" if pd.notna(signal["sl"]) else "—")
 
-        st.write(f"**Daily reason:** {dp['reason']}")
-        st.write(f"**Intraday reason:** {ip['reason']}")
-        st.write(f"**Secondary OI:** {oi} | Price Δ {pchg:.2f}% | OI Δ {doichg:.0f}" if pd.notna(pchg) and pd.notna(doichg) else "**Secondary OI:** unavailable")
-
-        if system.startswith("🟢"):
-            st.success(f"{system} — daily trend agrees with intraday DTB.")
-        elif system.startswith("🔴"):
-            st.error(f"{system} — daily trend agrees with intraday DBS.")
+        st.write(f"**Daily:** {dp['reason']}")
+        st.write(f"**Intraday:** {ip['reason']}")
+        if pd.notna(pchg) and pd.notna(doichg):
+            st.write(f"**OI:** {oi} | Price Δ {pchg:.2f}% | OI Δ {doichg:.0f}")
         else:
-            st.info(system)
-
-        st.markdown("**Exit:** opposite 0.15% intraday P&F reversal signal.")
-        st.markdown("**Initial SL:** previous confirmed opposite P&F column extreme at entry.")
-
-        with st.expander("Raw candle/data counts"):
-            st.write({"daily_rows": len(daily), "intraday_rows": len(intra)})
-            st.dataframe(intra.tail(10), use_container_width=True, hide_index=True)
+            st.write("**OI:** unavailable")
+        st.markdown("**Exit:** opposite P&F reversal signal.")
     except Exception as e:
         st.error(f"MCX analysis error: {e}")
-
 # ----------------------------
 # Diagnostics
 # ----------------------------
@@ -1189,8 +1235,4 @@ else:
         st.error(st.session_state.last_error)
 
 st.divider()
-st.caption(
-    f"Page refresh: {datetime.now().strftime('%d-%b-%Y %H:%M:%S')} | "
-    f"API calls in this browser session: {len(st.session_state.api_log)} | "
-    f"NSE P&F: CASH + Futures OI confirmation"
-)
+st.caption(f"Page refresh: {datetime.now().strftime('%d-%b-%Y %H:%M:%S')} | API calls this session: {len(st.session_state.api_log)}")
