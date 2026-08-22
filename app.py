@@ -617,6 +617,51 @@ def daily_direction_filter(sec_id, anchor_min=15):
         return "UNAVAILABLE", str(e)[:200]
 
 
+
+# -----------------------------
+# Intraday daily-filter state
+# -----------------------------
+if "intraday_daily_filter" not in st.session_state:
+    st.session_state.intraday_daily_filter = {}
+if "intraday_filter_date" not in st.session_state:
+    st.session_state.intraday_filter_date = None
+
+def build_morning_daily_filter(fut):
+    result = {}
+    prog = st.progress(0, text=f"Building daily filter for {len(fut)} stocks...")
+    for i, (_, r) in enumerate(fut.iterrows(), 1):
+        symbol = str(r["underlying_symbol"])
+        try:
+            h = cached_cash_daily(int(r["underlying_security_id"]))
+            cols = build_pnf(h["close"], 0.0025, 3)
+            if cols:
+                last = cols[-1]
+                if last["type"] == "X" and last["boxes"] > 15:
+                    bias, anchor_ok = "Bullish", True
+                elif last["type"] == "O" and last["boxes"] > 15:
+                    bias, anchor_ok = "Bearish", True
+                else:
+                    bias, anchor_ok = "Sideways", False
+            else:
+                bias, anchor_ok = "Unavailable", False
+        except Exception:
+            bias, anchor_ok = "Unavailable", False
+        result[symbol] = {"bias": bias, "anchor_ok": anchor_ok}
+        prog.progress(i / max(len(fut), 1), text=f"Daily filter {i}/{len(fut)}")
+    prog.empty()
+    return result
+
+def get_morning_daily_filter(fut):
+    today = datetime.now().date().isoformat()
+    if (
+        st.session_state.intraday_filter_date != today
+        or not st.session_state.intraday_daily_filter
+    ):
+        st.session_state.intraday_daily_filter = build_morning_daily_filter(fut)
+        st.session_state.intraday_filter_date = today
+    return st.session_state.intraday_daily_filter
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -676,57 +721,31 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
         candidates = fut.copy()
     else:
         st.caption(
-            "Intraday P&F: LAST DAILY COLUMN must be an Anchor (X or O >15 boxes) "
-            "using 0.25%/3-box P&F. Then 0.15%/3-box/1-minute P&F. "
+            "Morning filter: LAST DAILY COLUMN must be an Anchor (X or O >15 boxes) "
+            "using 0.25%/3-box P&F. This filter is calculated once per trading day. "
+            "Only retained stocks are rescanned every minute on 0.15%/3-box P&F. "
             "BUY only above the intraday 10-SMA; SELL only below the intraday 10-SMA. "
             "No OI. No sector analysis."
         )
 
-        # Higher-timeframe P&F filter:
-        # THE LAST DAILY COLUMN ITSELF must be the Anchor:
-        # X-column >15 boxes for bullish, or O-column >15 boxes for bearish.
-        drows = []
-        prog = st.progress(0, text=f"Daily P&F Anchor filter: {len(fut)} stocks...")
-        for i, (_, r) in enumerate(fut.iterrows(), 1):
-            try:
-                h = cached_cash_daily(int(r["underlying_security_id"]))
-                cols = build_pnf(h["close"], 0.0025, 3)
-                if cols:
-                    last = cols[-1]
-                    if last["type"] == "X" and last["boxes"] > 15:
-                        daily_bias = "Bullish"
-                        daily_anchor = True
-                    elif last["type"] == "O" and last["boxes"] > 15:
-                        daily_bias = "Bearish"
-                        daily_anchor = True
-                    else:
-                        daily_bias = "Sideways"
-                        daily_anchor = False
-                else:
-                    daily_bias = "Unavailable"
-                    daily_anchor = False
-            except Exception:
-                daily_bias = "Unavailable"
-                daily_anchor = False
-
-            drows.append({
-                "Symbol": str(r["underlying_symbol"]),
-                "Daily Bias": daily_bias,
-                "Daily Anchor": daily_anchor,
-            })
-            prog.progress(i / len(fut), text=f"Daily Anchor filter: {i}/{len(fut)}")
-        prog.empty()
-
-        daily_df = pd.DataFrame(drows)
-        allowed_symbols = set(
-            daily_df[daily_df["Daily Anchor"]]["Symbol"]
-        )
+        # The 0.25% daily filter is calculated once per trading day and reused
+        # across every 1-minute refresh.
+        daily_map = get_morning_daily_filter(fut)
+        daily_df = pd.DataFrame([
+            {"Symbol": sym, "Daily Bias": info["bias"], "Daily Anchor": info["anchor_ok"]}
+            for sym, info in daily_map.items()
+        ])
+        allowed_symbols = set(daily_df.loc[daily_df["Daily Anchor"], "Symbol"])
         candidates = fut[fut["underlying_symbol"].isin(allowed_symbols)].copy()
 
         st.info(
-            f"Daily P&F filter: {len(candidates)} directional stocks retained "
-            f"from {len(fut)} NSE F&O stocks. Sideways stocks are excluded."
+            f"Morning daily filter retained {len(candidates)} of {len(fut)} F&O stocks. "
+            f"Filter date: {st.session_state.intraday_filter_date}"
         )
+        if st.button("Rebuild Daily Filter", key="rebuild_daily_filter"):
+            st.session_state.intraday_daily_filter = build_morning_daily_filter(fut)
+            st.session_state.intraday_filter_date = datetime.now().date().isoformat()
+            st.rerun()
 
     # Only live cash price is displayed; it is not used as an additional entry filter.
     spot_map = batch_ltp(
@@ -807,8 +826,18 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
         st.info("No stocks available.")
     else:
         # Keep the display intentionally minimal as requested.
+        display_df = res[["Script", "LTP", "Bias", "Intraday Trade Recommendation"]].copy()
+
+        def highlight_trade(row):
+            rec = str(row["Intraday Trade Recommendation"])
+            if rec == "🟢 BUY":
+                return ["background-color: #d9f2d9; color: #0b5d1e; font-weight: 700"] * len(row)
+            if rec == "🔴 SELL":
+                return ["background-color: #f8d7da; color: #8a1c1c; font-weight: 700"] * len(row)
+            return [""] * len(row)
+
         st.dataframe(
-            res[["Script", "LTP", "Bias", "Intraday Trade Recommendation"]],
+            display_df.style.apply(highlight_trade, axis=1),
             use_container_width=True,
             hide_index=True,
         )

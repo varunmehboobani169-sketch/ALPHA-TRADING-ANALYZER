@@ -1,13 +1,13 @@
-# ALPHA ANALYZER V14 — Intraday 10-SMA Filter
+# ALPHA ANALYZER V15
 
 NSE Intraday:
-1. Last completed daily P&F column must be an Anchor:
-   X >15 boxes = bullish; O >15 boxes = bearish.
-2. Scan 0.15% / 3-box / 1-minute cash P&F.
-3. BUY only on matching DTB AND Spot LTP > intraday 10-SMA.
-4. SELL only on matching DBS AND Spot LTP < intraday 10-SMA.
-5. No OI.
-6. No sector analysis.
-7. P&F remains the entry trigger; 10-SMA is a filter only.
+- The daily 0.25% / 3-box P&F Anchor filter is built once per trading day and stored in Streamlit session state.
+- It is NOT recalculated on every 1-minute refresh.
+- Only stocks whose last daily P&F column is an Anchor (>15 X boxes or >15 O boxes) are retained.
+- Retained stocks are rescanned every minute using 0.15% / 3-box cash P&F.
+- Existing intraday 10-SMA filter remains: BUY above SMA10, SELL below SMA10.
+- P&F DTB/DBS remains the entry trigger.
+- BUY rows are highlighted green; SELL rows are highlighted red.
+- A manual Rebuild Daily Filter button is provided.
 
-Display remains: Script | LTP | Bias | Intraday Trade Recommendation.
+No intraday OI or sector analysis.
