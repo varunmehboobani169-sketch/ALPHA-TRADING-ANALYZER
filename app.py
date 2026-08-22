@@ -844,7 +844,6 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
 
 elif page in ("MCX Intraday", "MCX Positional"):
     mode = "Intraday" if page == "MCX Intraday" else "Positional"
-    box = 0.0015 if mode == "Intraday" else 0.0025
     st.title(page)
 
     fut = future_universe(master, "MCX")
@@ -852,21 +851,136 @@ elif page in ("MCX Intraday", "MCX Positional"):
         st.error("No MCX FUTCOM universe found.")
         st.stop()
 
-    names = sorted(fut["underlying_symbol"].astype(str).unique())
-    symbol = st.selectbox("Commodity", names)
-    r = fut[fut["underlying_symbol"] == symbol].iloc[0]
-
-    try:
-        h = historical(
-            r["security_id"],
-            "MCX_COMM",
-            "FUTCOM",
-            mode,
+    if mode == "Intraday":
+        st.caption(
+            "MCX Intraday P&F: 0.25% daily P&F direction filter → "
+            "0.15% / 3-box / 1-minute P&F. P&F only."
         )
-        p = analyze_new_pattern(h, box)
-        st.write(p)
-    except Exception as e:
-        st.error(f"MCX data error: {e}")
+    else:
+        st.caption(
+            "MCX Positional P&F: 0.25% / 3-box / daily close. P&F only."
+        )
+
+    if mode == "Intraday":
+        if "mcx_daily_filter" not in st.session_state:
+            st.session_state.mcx_daily_filter = {}
+        if "mcx_filter_date" not in st.session_state:
+            st.session_state.mcx_filter_date = None
+
+        today = datetime.now().date().isoformat()
+        if st.session_state.mcx_filter_date != today or not st.session_state.mcx_daily_filter:
+            dmap = {}
+            prog = st.progress(0, text=f"Building MCX daily filter for {len(fut)} commodities...")
+            for i, (_, r) in enumerate(fut.iterrows(), 1):
+                try:
+                    h = historical(r["security_id"], "MCX_COMM", "FUTCOM", "Positional")
+                    cols = build_pnf(h["close"], 0.0025, 3)
+                    if cols:
+                        last = cols[-1]
+                        if last["type"] == "X" and last["boxes"] > 15:
+                            dmap[str(r["underlying_symbol"])] = "Bullish"
+                        elif last["type"] == "O" and last["boxes"] > 15:
+                            dmap[str(r["underlying_symbol"])] = "Bearish"
+                        else:
+                            dmap[str(r["underlying_symbol"])] = "Sideways"
+                    else:
+                        dmap[str(r["underlying_symbol"])] = "Unavailable"
+                except Exception:
+                    dmap[str(r["underlying_symbol"])] = "Unavailable"
+                prog.progress(i / max(len(fut), 1), text=f"MCX daily filter {i}/{len(fut)}")
+            prog.empty()
+            st.session_state.mcx_daily_filter = dmap
+            st.session_state.mcx_filter_date = today
+
+        daily_map = st.session_state.mcx_daily_filter
+        allowed = {s for s, b in daily_map.items() if b in ("Bullish", "Bearish")}
+        candidates = fut[fut["underlying_symbol"].isin(allowed)].copy()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("MCX commodities", len(fut))
+        c2.metric("Daily Bullish", sum(b == "Bullish" for b in daily_map.values()))
+        c3.metric("Daily Bearish", sum(b == "Bearish" for b in daily_map.values()))
+    else:
+        candidates = fut.copy()
+
+    ids = candidates["security_id"].astype(int).tolist() if not candidates.empty else []
+    ltp_map = batch_ltp("MCX_COMM", ids) if ids else {}
+
+    rows = []
+    prog = st.progress(0, text=f"Scanning {len(candidates)} MCX commodities...")
+    for i, (_, r) in enumerate(candidates.iterrows(), 1):
+        symbol = str(r["underlying_symbol"])
+        sid = int(r["security_id"])
+        ltp = ltp_map.get(sid, np.nan)
+        try:
+            h = historical(
+                sid,
+                "MCX_COMM",
+                "FUTCOM",
+                "Intraday" if mode == "Intraday" else "Positional",
+            )
+            p = analyze_new_pattern(
+                h,
+                0.0015 if mode == "Intraday" else 0.0025,
+                anchor_min=15,
+                pullback_max=5,
+            )
+
+            if mode == "Intraday":
+                daily_bias = daily_map.get(symbol, "Unavailable")
+                if p["dtb"] and daily_bias == "Bullish":
+                    rec = "🟢 BUY"
+                elif p["dbs"] and daily_bias == "Bearish":
+                    rec = "🔴 SELL"
+                elif p["prospective"] and p["bias"] == daily_bias:
+                    rec = "🟡 SETUP"
+                else:
+                    rec = "NO TRADE"
+                bias = daily_bias
+            else:
+                rec = (
+                    "🟢 BUY" if p["dtb"] else
+                    "🔴 SELL" if p["dbs"] else
+                    "🟡 SETUP" if p["prospective"] else
+                    "NO TRADE"
+                )
+                bias = p["bias"]
+
+            rows.append({
+                "Script": symbol,
+                "LTP": ltp,
+                "Bias": bias,
+                "Trade Recommendation": rec,
+            })
+        except Exception:
+            rows.append({
+                "Script": symbol,
+                "LTP": ltp,
+                "Bias": "UNAVAILABLE",
+                "Trade Recommendation": "DATA ERROR",
+            })
+        prog.progress(i / max(len(candidates), 1), text=f"MCX scan {i}/{len(candidates)}")
+    prog.empty()
+
+    res = pd.DataFrame(rows)
+    st.subheader("Trade Recommendations")
+
+    if res.empty:
+        st.info("No MCX data available.")
+    else:
+        def highlight_trade(row):
+            rec = str(row["Trade Recommendation"])
+            if rec == "🟢 BUY":
+                return ["background-color: #d9f2d9; color: #0b5d1e; font-weight: 700"] * len(row)
+            if rec == "🔴 SELL":
+                return ["background-color: #f8d7da; color: #8a1c1c; font-weight: 700"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            res.style.apply(highlight_trade, axis=1),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 else:
     st.title("Diagnostics")
