@@ -825,31 +825,68 @@ def stock_star(sector, breadth, threshold):
 # Universe helpers
 # ----------------------------
 def nearest_fno(df, exchange="NSE"):
+    """
+    Return one nearest usable futures contract per underlying.
+    Robust to detailed instrument-master variants where expiry_date is absent
+    or named differently.
+    """
     inst = "FUTSTK" if exchange == "NSE" else "FUTCOM"
     ex = "NSE" if exchange == "NSE" else "MCX"
-    x = df[(df["exchange"] == ex) & (df["instrument"] == inst)].copy()
+
+    x = df[
+        (df["exchange"].astype(str).str.upper() == ex) &
+        (df["instrument"].astype(str).str.upper() == inst)
+    ].copy()
+
     if x.empty:
         return x
 
-    x = x.dropna(subset=["security_id"])
-    if "expiry_date" in x.columns:
-        now = pd.Timestamp.now()
-        x = x[(x["expiry_date"].isna()) | (x["expiry_date"] >= now)]
+    x = x.dropna(subset=["security_id"]).copy()
+
+    # Ensure expiry_date exists before sorting/filtering.
+    if "expiry_date" not in x.columns:
+        # Try alternate detailed-master names, if present.
+        alt = next(
+            (c for c in ["EXPIRY_DATE", "SEM_EXPIRY_DATE", "SM_EXPIRY_DATE"] if c in x.columns),
+            None
+        )
+        if alt:
+            x["expiry_date"] = pd.to_datetime(x[alt], errors="coerce")
+        else:
+            x["expiry_date"] = pd.NaT
+    else:
         x["expiry_date"] = pd.to_datetime(x["expiry_date"], errors="coerce")
+
+    # Only reject contracts that are definitely expired.
+    now = pd.Timestamp.now()
+    if x["expiry_date"].notna().any():
+        x = x[(x["expiry_date"].isna()) | (x["expiry_date"] >= now)]
 
     sym = "underlying_symbol"
     if sym not in x.columns:
-        return pd.DataFrame()
+        # Detailed master fallback from trading symbol, e.g.
+        # RELIANCE-Aug2026-FUT -> RELIANCE.
+        if "trading_symbol" in x.columns:
+            x[sym] = (
+                x["trading_symbol"].astype(str)
+                .str.split("-", n=1).str[0]
+                .str.upper().str.strip()
+            )
+        else:
+            return pd.DataFrame()
 
-    # Keep nearest active contract per underlying.
     x[sym] = x[sym].astype(str).str.upper().str.strip()
+
     rows = []
     for symbol, g in x.groupby(sym, dropna=False):
         if symbol in ("", "NAN", "NONE"):
             continue
+        # Prefer dated contracts; if expiry isn't available, keep the first row.
         g = g.sort_values("expiry_date", na_position="last")
         rows.append(g.iloc[0])
+
     return pd.DataFrame(rows).reset_index(drop=True) if rows else pd.DataFrame()
+
 
 def choose_rows(x, n):
     if x.empty: return x

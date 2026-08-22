@@ -1,13 +1,11 @@
-# ALPHA ANALYZER V26 — NSE CASH DATA FIX
+# ALPHA ANALYZER V27 — Futures Universe Error Fix
 
-The screenshot showed DATA ERROR for every NSE stock. The likely root cause was
-mapping the futures symbol to the wrong NSE cash security ID.
+The screenshot showed a KeyError on `expiry_date` inside `nearest_fno`.
+V27 fixes this by:
+- Always creating an `expiry_date` column even if the detailed master omits it.
+- Accepting alternate expiry field names.
+- Parsing expiry before filtering/sorting.
+- Falling back to the futures trading symbol when underlying_symbol is unavailable.
+- Keeping the V26 underlying-security-ID cash mapping and all trading logic unchanged.
 
-V26 fixes this by:
-- Loading Dhan's detailed instrument master.
-- Using FUTSTK `UNDERLYING_SECURITY_ID` directly as the NSE cash security ID.
-- Falling back to exact cash-symbol matching only when the underlying ID is absent.
-- Keeping NSETEST instruments excluded.
-- Retaining the existing P&F, OI, sector and star logic.
-
-Diagnostics now reports how many NSE FUTSTK rows have an underlying_security_id.
+This is a data/universe bug fix only.
