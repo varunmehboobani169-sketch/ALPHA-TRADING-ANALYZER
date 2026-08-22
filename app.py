@@ -31,7 +31,11 @@ def secret(name, default=''):
 
 # Client ID/code is stored once in Streamlit Secrets.
 # The access token is intentionally entered by the user each session.
-CLIENT_ID = secret('ALPHA_CLIENT_ID')
+CLIENT_ID_DEFAULT = secret('ALPHA_CLIENT_ID')
+
+
+def get_client_id():
+    return st.session_state.get('alpha_client_id', CLIENT_ID_DEFAULT).strip()
 
 
 def get_access_token():
@@ -40,18 +44,19 @@ def get_access_token():
 
 def api_headers():
     token = get_access_token()
+    client_id = get_client_id()
     return {
         'Accept': 'application/json',
         'Content-Type': 'application/json',
         'access-token': token,
-        'client-id': CLIENT_ID,
+        'client-id': client_id,
     }
 
 
 def api_post(path, payload, kind='data'):
     token = get_access_token()
-    if not CLIENT_ID:
-        raise RuntimeError('Client code is not configured in Streamlit Secrets.')
+    if not get_client_id():
+        raise RuntimeError('Please enter your client code in the sidebar.')
     if not token:
         raise RuntimeError('Please enter your current access token in the sidebar.')
     if kind == 'quote':
@@ -439,6 +444,9 @@ def mcx_intraday_trade_state(daily_res, intraday_res):
 with st.sidebar:
     st.header('ALPHA ANALYZER')
     st.caption('Live P&F + OI market intelligence')
+    client_input = st.text_input('Client code', value=st.session_state.get('alpha_client_id', CLIENT_ID_DEFAULT), type='default', placeholder='Enter client code')
+    if client_input:
+        st.session_state['alpha_client_id'] = client_input.strip()
     token_input = st.text_input('Access token', value=st.session_state.get('alpha_access_token',''), type='password', placeholder='Enter current token')
     if token_input:
         st.session_state['alpha_access_token'] = token_input.strip()
@@ -450,7 +458,7 @@ with st.sidebar:
         st.cache_data.clear(); st.rerun()
     st.divider()
     st.metric('Historical/data API calls this session', today_request_count())
-    st.caption('Client code is fixed in app secrets; enter the current token above each session.')
+    st.caption('Client code can be entered here or prefilled from Streamlit Secrets. Access token is entered each session.')
 
 # Browser-side rerun without heavy extra package
 if auto:
@@ -465,8 +473,8 @@ except Exception as e:
     st.error(f'Could not load the market instrument master: {e}')
     st.stop()
 
-if not CLIENT_ID:
-    st.error('Client code is not configured. Add ALPHA_CLIENT_ID to Streamlit Secrets.')
+if not get_client_id():
+    st.error('Enter your client code in the sidebar (or add ALPHA_CLIENT_ID to Streamlit Secrets).')
     st.stop()
 
 if not get_access_token():
