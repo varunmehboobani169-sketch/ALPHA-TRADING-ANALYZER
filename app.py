@@ -999,6 +999,15 @@ def previous_daily_oi_map(future_ids):
     return result
 
 
+def cash_spot_quotes(symbols_df):
+    """Bulk live NSE cash quotes for mapped F&O stocks."""
+    if symbols_df.empty:
+        return {}
+    ids = symbols_df["cash_security_id"].astype(int).tolist()
+    body = market_quote_bulk({"NSE_EQ": ids}, "NSE cash quote")
+    return parse_quote_response(body, "NSE_EQ")
+
+
 def futures_confirmation(symbols_df, require_oi=True):
     """Get current futures OI in bulk and compare against cached previous OI."""
     if symbols_df.empty:
@@ -1166,8 +1175,9 @@ def run_nse_pnf_scan(sys_mode, anchor_min, require_oi, universe_signature):
     box = 0.0025 if sys_mode == "Positional" else 0.0015
     selected = universe.sort_values("Symbol").reset_index(drop=True)
 
-    # One batched futures quote call per cache interval.
+    # One batched futures quote + one batched NSE cash quote.
     oi_map = futures_confirmation(selected, require_oi=require_oi)
+    spot_map = cash_spot_quotes(selected)
 
     rows = []
     for _, r in selected.iterrows():
@@ -1183,6 +1193,16 @@ def run_nse_pnf_scan(sys_mode, anchor_min, require_oi, universe_signature):
             pnf = pnf_analysis(hist, box, int(anchor_min))
             oi_info = oi_map.get(symbol, {})
             oi_state_text = oi_info.get("state", "UNAVAILABLE")
+
+            spot_info = spot_map.get(int(r["cash_security_id"]), {})
+            spot_ltp = pd.to_numeric(spot_info.get("last_price"), errors="coerce")
+            spot_ohlc = spot_info.get("ohlc") or {}
+            spot_close = pd.to_numeric(spot_ohlc.get("close"), errors="coerce")
+            spot_day_change = (
+                ((spot_ltp / spot_close) - 1.0) * 100.0
+                if not pd.isna(spot_ltp) and not pd.isna(spot_close) and float(spot_close) != 0
+                else np.nan
+            )
 
             if require_oi and pnf["signal_side"]:
                 oi_ok = oi_state_text == "OI BUILDUP"
@@ -1207,6 +1227,9 @@ def run_nse_pnf_scan(sys_mode, anchor_min, require_oi, universe_signature):
             rows.append({
                 "Symbol": symbol,
                 "Sector": sector_of(symbol),
+                "Spot LTP": float(spot_ltp) if not pd.isna(spot_ltp) else np.nan,
+                "Spot Day %": float(spot_day_change) if not pd.isna(spot_day_change) else np.nan,
+                "Futures LTP": oi_info.get("future_ltp", np.nan),
                 "Bias": pnf["bias"],
                 "Pattern": pnf.get("pattern", "—"),
                 "Anchor Boxes": pnf.get("anchor_boxes", 0),
@@ -1238,6 +1261,9 @@ def run_nse_pnf_scan(sys_mode, anchor_min, require_oi, universe_signature):
             rows.append({
                 "Symbol": symbol,
                 "Sector": sector_of(symbol),
+                "Spot LTP": np.nan,
+                "Spot Day %": np.nan,
+                "Futures LTP": np.nan,
                 "Bias": "ERROR",
                 "Pattern": "—",
                 "Anchor Boxes": 0,
@@ -1279,6 +1305,17 @@ if mode == "Market Overview":
     universe = nse_fno_stock_universe(instruments)
     st.metric("NSE F&O stocks mapped to cash", len(universe))
     st.metric("MCX futures discovered", len(nearest_fno(instruments, "MCX")))
+    if not universe.empty:
+        try:
+            sample = universe.head(min(50, len(universe)))
+            q = cash_spot_quotes(sample)
+            populated = sum(
+                1 for v in q.values()
+                if pd.notna(pd.to_numeric(v.get("last_price"), errors="coerce"))
+            )
+            st.metric("Live cash LTPs returned (sample)", f"{populated}/{len(sample)}")
+        except Exception as e:
+            st.warning(f"Cash quote check failed: {e}")
     st.info(
         "Intraday P&F refreshes every 1 minute; positional and sector views every 15 minutes. "
         "The main engine uses CASH/spot price for NSE P&F and futures OI only for confirmation."
@@ -1318,8 +1355,9 @@ elif mode == "Trade Ranking":
         )
         st.dataframe(
             ranked[[
-                "Stars","Symbol","Sector","Bias","Pattern","Anchor Boxes","Pullback Boxes",
-                "Sector Ratio","Futures OI","System","Entry Level","SL","Reason"
+                "Stars","Symbol","Sector","Spot LTP","Spot Day %","Futures LTP","Futures OI",
+                "Bias","Pattern","Anchor Boxes","Pullback Boxes","Sector Ratio",
+                "System","Entry Level","SL","Reason"
             ]],
             use_container_width=True, hide_index=True
         )
@@ -1330,8 +1368,9 @@ elif mode == "Trade Ranking":
         else:
             st.dataframe(
                 strongest[[
-                    "Stars","Symbol","Sector","Bias","Pattern","Anchor Boxes","Pullback Boxes",
-                    "Sector Ratio","System","Entry Level","SL"
+                    "Stars","Symbol","Sector","Spot LTP","Spot Day %","Futures LTP",
+                    "Bias","Pattern","Anchor Boxes","Pullback Boxes","Sector Ratio",
+                    "System","Entry Level","SL"
                 ]],
                 use_container_width=True, hide_index=True
             )
@@ -1374,8 +1413,9 @@ elif mode in ("NSE Intraday P&F", "NSE Positional P&F"):
         cols = ["⭐","Symbol","Sector","Pattern","Anchor Boxes","Anchor","DTB","DBS",
                 "Futures OI","OI Δ","System","SL","Reason"]
         cols = [
-            "Stars","Symbol","Sector","Pattern","Prospective","Anchor Boxes","Pullback Boxes",
-            "Sector Ratio","Anchor","DTB","DBS","Futures OI","OI Δ","System","Entry Level","SL","Reason"
+            "Stars","Symbol","Sector","Spot LTP","Spot Day %","Futures LTP","Futures OI",
+            "Pattern","Prospective","Anchor Boxes","Pullback Boxes","Sector Ratio",
+            "Anchor","DTB","DBS","OI Δ","System","Entry Level","SL","Reason"
         ]
         available = [c for c in cols if c in res.columns]
         st.dataframe(res[available], use_container_width=True, hide_index=True)

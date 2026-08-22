@@ -1,11 +1,17 @@
-# ALPHA ANALYZER V27 — Futures Universe Error Fix
+# ALPHA ANALYZER V28 — LIVE SPOT LTP CHECK
 
-The screenshot showed a KeyError on `expiry_date` inside `nearest_fno`.
-V27 fixes this by:
-- Always creating an `expiry_date` column even if the detailed master omits it.
-- Accepting alternate expiry field names.
-- Parsing expiry before filtering/sorting.
-- Falling back to the futures trading symbol when underlying_symbol is unavailable.
-- Keeping the V26 underlying-security-ID cash mapping and all trading logic unchanged.
+Adds live NSE cash data diagnostics to the scanner:
+- Spot LTP
+- Spot Day %
+- Futures LTP
+- Futures OI
 
-This is a data/universe bug fix only.
+The cash LTP is fetched in one batched Market Quote request for the mapped
+NSE cash securities.
+
+Purpose:
+- Confirm whether cash/spot data is actually reaching the app.
+- If Spot LTP is populated, the live cash mapping is working and we can focus on historical/P&F logic.
+- If Spot LTP is missing, the issue is upstream of the P&F engine.
+
+No P&F trading rules were changed.
