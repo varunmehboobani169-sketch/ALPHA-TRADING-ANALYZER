@@ -523,6 +523,183 @@ def pnf_analysis(df, box_pct, anchor_min=15, reversal=3):
     )
     return out
 
+
+# ----------------------------
+# Sector relative-strength / ratio engine
+# ----------------------------
+SECTOR_PROXY = {
+    # Practical sector proxy baskets made from liquid NSE F&O stocks.
+    # The ratio is the equally-weighted sector basket price divided by NIFTY proxy.
+    "Banking": ["HDFCBANK","ICICIBANK","SBIN","AXISBANK","KOTAKBANK","INDUSINDBK","BANKBARODA","PNB","FEDERALBNK","IDFCFIRSTB"],
+    "IT": ["TCS","INFY","HCLTECH","WIPRO","TECHM","LTIM","MPHASIS","COFORGE"],
+    "Auto": ["MARUTI","M&M","TATAMOTORS","HEROMOTOCO","EICHERMOT","BAJAJ-AUTO","TVSMOTOR","ASHOKLEY"],
+    "Pharma": ["SUNPHARMA","CIPLA","DRREDDY","DIVISLAB","APOLLOHOSP","LUPIN","AUROPHARMA","TORNTPHARM"],
+    "Metals": ["TATASTEEL","JSWSTEEL","HINDALCO","SAIL","JINDALSTEL","NATIONALUM","VEDL"],
+    "FMCG": ["ITC","HINDUNILVR","NESTLEIND","BRITANNIA","TATACONSUM","DABUR","MARICO","COLPAL"],
+    "Energy": ["RELIANCE","ONGC","COALINDIA","IOC","BPCL","GAIL"],
+    "Financials": ["BAJFINANCE","BAJAJFINSV","SHRIRAMFIN","CHOLAFIN","MUTHOOTFIN","SBICARD"],
+    "Realty": ["DLF","GODREJPROP","OBEROIRLTY","LODHA","PRESTIGE","PHOENIXLTD"],
+    "Telecom": ["BHARTIARTL","INDUSTOWER","IDEA"],
+    "Capital Goods": ["LT","BEL","BHEL","SIEMENS","ABB","CUMMINSIND"],
+    "Consumer": ["TRENT","TITAN","DMART","KALYANKJIL","JUBLFOOD"],
+    "Infrastructure": ["ADANIPORTS","IRCTC","DELHIVERY"],
+}
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_nifty_cash_daily(days=260):
+    # NIFTY 50 index is typically available in the instrument master as INDEX.
+    candidates = instruments[
+        (instruments["exchange"] == "NSE") &
+        (instruments["instrument"].astype(str).str.upper().isin(["INDEX","IDX_I"]))
+    ].copy()
+    if candidates.empty:
+        return pd.DataFrame()
+    symcols = [c for c in ["trading_symbol","custom_symbol","symbol_name","underlying_symbol"] if c in candidates.columns]
+    if not symcols:
+        return pd.DataFrame()
+    candidates["_name"] = candidates[symcols[0]].astype(str).str.upper()
+    hit = candidates[candidates["_name"].str.contains("NIFTY 50|NIFTY", regex=True, na=False)]
+    if hit.empty:
+        hit = candidates
+    sid = int(hit.iloc[0]["security_id"])
+    end = datetime.now().date()
+    start = end - timedelta(days=days)
+    payload = {
+        "securityId": str(sid),
+        "exchangeSegment": "IDX_I",
+        "instrument": "INDEX",
+        "expiryCode": 0,
+        "oi": False,
+        "fromDate": str(start),
+        "toDate": str(end + timedelta(days=1)),
+    }
+    try:
+        return candles_to_df(api_post("/charts/historical", payload, "nifty_index_daily"))
+    except Exception:
+        # Some account/instrument masters expose NIFTY index under NSE_EQ.
+        payload["exchangeSegment"] = "NSE_EQ"
+        payload["instrument"] = "INDEX"
+        try:
+            return candles_to_df(api_post("/charts/historical", payload, "nifty_index_daily_fallback"))
+        except Exception:
+            return pd.DataFrame()
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_nifty_cash_intraday(days=5):
+    candidates = instruments[
+        (instruments["instrument"].astype(str).str.upper().isin(["INDEX","IDX_I"])) &
+        (instruments["exchange"].isin(["NSE","IDX_I"]))
+    ].copy()
+    if candidates.empty:
+        return pd.DataFrame()
+    symcols = [c for c in ["trading_symbol","custom_symbol","symbol_name","underlying_symbol"] if c in candidates.columns]
+    candidates["_name"] = candidates[symcols[0]].astype(str).str.upper()
+    hit = candidates[candidates["_name"].str.contains("NIFTY 50|NIFTY", regex=True, na=False)]
+    if hit.empty:
+        hit = candidates
+    sid = int(hit.iloc[0]["security_id"])
+    now = datetime.now()
+    start = now - timedelta(days=days)
+    payload = {
+        "securityId": str(sid),
+        "exchangeSegment": "IDX_I",
+        "instrument": "INDEX",
+        "interval": "1",
+        "oi": False,
+        "fromDate": start.strftime("%Y-%m-%d %H:%M:%S"),
+        "toDate": now.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        return candles_to_df(api_post("/charts/intraday", payload, "nifty_index_intraday"))
+    except Exception:
+        return pd.DataFrame()
+
+def normalized_price_series(df, date_col="datetime"):
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    x = df[["datetime","close"]].copy()
+    x["datetime"] = pd.to_datetime(x["datetime"], errors="coerce")
+    x["close"] = pd.to_numeric(x["close"], errors="coerce")
+    x = x.dropna().sort_values("datetime")
+    return x.drop_duplicates("datetime").set_index("datetime")["close"]
+
+def build_sector_ratio_from_cash(sector, mode):
+    """
+    Build an equally-weighted sector basket divided by NIFTY.
+    We deliberately use cash/spot prices on both sides.
+    The output is a synthetic ratio series used only for relative-strength P&F.
+    """
+    names = [x.upper() for x in SECTOR_PROXY.get(sector, [])]
+    if not names:
+        return pd.DataFrame()
+
+    series = []
+    if mode == "Positional":
+        nifty = get_nifty_cash_daily()
+    else:
+        nifty = get_nifty_cash_intraday()
+    n = normalized_price_series(nifty)
+    if n.empty:
+        return pd.DataFrame()
+
+    for symbol in names:
+        match = instruments[
+            (instruments["exchange"] == "NSE") &
+            (instruments["instrument"] == "EQUITY") &
+            (instruments["trading_symbol"].astype(str).str.upper() == symbol)
+        ] if "trading_symbol" in instruments.columns else pd.DataFrame()
+
+        if match.empty:
+            continue
+        sid = int(match.iloc[0]["security_id"])
+        try:
+            if mode == "Positional":
+                h = get_cash_daily(sid)
+            else:
+                h = get_cash_intraday(sid, days=5)
+                if not h.empty:
+                    h = h[h["datetime"] < pd.Timestamp.now().floor("min")]
+            s = normalized_price_series(h)
+            if not s.empty:
+                series.append(s.rename(symbol))
+        except Exception:
+            continue
+
+    if not series:
+        return pd.DataFrame()
+
+    basket = pd.concat(series, axis=1).ffill()
+    basket = basket.mean(axis=1, skipna=True)
+    n = n.reindex(basket.index).ffill()
+    ratio = basket / n
+    ratio = ratio.replace([np.inf, -np.inf], np.nan).dropna()
+    return pd.DataFrame({"close": ratio.values, "datetime": ratio.index})
+
+def sector_ratio_pattern(sector, mode, anchor_min=15):
+    ratio_df = build_sector_ratio_from_cash(sector, mode)
+    if ratio_df.empty:
+        return {
+            "bias": "UNAVAILABLE",
+            "pattern": "—",
+            "star": False,
+            "reason": "No sector/NIFTY ratio data"
+        }
+    box = 0.0025 if mode == "Positional" else 0.0015
+    p = pnf_analysis(ratio_df, box, anchor_min)
+    bullish = p.get("signal_side") == "LONG" or (
+        p.get("bias") == "Bullish" and not p.get("signal_side")
+    )
+    bearish = p.get("signal_side") == "SHORT" or (
+        p.get("bias") == "Bearish" and not p.get("signal_side")
+    )
+    return {
+        "bias": "Bullish" if bullish else "Bearish" if bearish else p.get("bias", "Neutral"),
+        "pattern": p.get("pattern", "—"),
+        "star": bool(p.get("dtb") if bullish else p.get("dbs") if bearish else False),
+        "reason": p.get("reason", "")
+    }
+
+
 # ----------------------------
 # OI / sector
 # ----------------------------
@@ -835,6 +1012,7 @@ mode = st.radio(
 # Market Overview / Bullish / Bearish = 3 minutes
 refresh_minutes = {
     "Market Overview": 3,
+    "Trade Ranking": 3,
     "NSE Intraday P&F": 1,
     "NSE Positional P&F": 15,
     "Bullish Stocks": 3,
@@ -860,6 +1038,26 @@ st.caption(
     f"{'Every ' + str(refresh_minutes) + ' min' if refresh_minutes else 'Manual'}"
 )
 
+
+
+def evaluate_three_stars(pnf, oi_state_text, sector_info, direction):
+    # Star 1: stock P&F pattern is confirmed.
+    pnf_star = bool(
+        (direction == "LONG" and pnf.get("dtb")) or
+        (direction == "SHORT" and pnf.get("dbs"))
+    )
+
+    # Star 2: meaningful futures OI buildup in the same direction.
+    oi_star = oi_state_text == "OI BUILDUP"
+
+    # Star 3: sector/NIFTY ratio P&F has the same directional pattern.
+    if direction == "LONG":
+        sector_star = sector_info.get("bias") == "Bullish" and sector_info.get("star", False)
+    else:
+        sector_star = sector_info.get("bias") == "Bearish" and sector_info.get("star", False)
+
+    stars = int(pnf_star) + int(oi_star) + int(sector_star)
+    return stars, pnf_star, oi_star, sector_star
 
 # ----------------------------
 # Shared NSE P&F scanner
@@ -923,6 +1121,13 @@ def run_nse_pnf_scan(sys_mode, anchor_min, require_oi, universe_signature):
                 "Futures OI": oi_state_text,
                 "OI Δ": oi_info.get("oi_change", np.nan),
                 "System": status,
+                "Stars": "⭐" * stars if stars else "—",
+                "Star Count": stars,
+                "P&F ⭐": "⭐" if pnf_star else "—",
+                "OI ⭐": "⭐" if oi_star else "—",
+                "Sector ⭐": "⭐" if sector_star else "—",
+                "Sector Ratio": sector_info.get("bias", "—"),
+                "Sector Pattern": sector_info.get("pattern", "—"),
                 "SL": pnf["sl"],
                 "Reason": pnf["reason"],
             })
@@ -941,6 +1146,13 @@ def run_nse_pnf_scan(sys_mode, anchor_min, require_oi, universe_signature):
                 "Futures OI": "ERROR",
                 "OI Δ": np.nan,
                 "System": "DATA ERROR",
+                "Stars": "—",
+                "Star Count": 0,
+                "P&F ⭐": "—",
+                "OI ⭐": "—",
+                "Sector ⭐": "—",
+                "Sector Ratio": "ERROR",
+                "Sector Pattern": "—",
                 "SL": np.nan,
                 "Reason": str(e)[:300],
             })
@@ -971,6 +1183,54 @@ if mode == "Market Overview":
     if not recent_logs.empty:
         st.markdown("### Recent API activity")
         st.dataframe(recent_logs, use_container_width=True, hide_index=True)
+
+
+# ----------------------------
+# Trade Ranking
+# ----------------------------
+elif mode == "Trade Ranking":
+    st.subheader("Trade Ranking — 3-Star Model")
+    st.caption(
+        "⭐ P&F = exact 3-column stock pattern | "
+        "⭐ OI = futures price/ΔOI buildup confirmation | "
+        "⭐ Sector = sector/NIFTY ratio P&F confirmation"
+    )
+    sys_mode = st.radio("P&F timeframe", ["Intraday", "Positional"], horizontal=True)
+    res = run_nse_pnf_scan(
+        sys_mode,
+        int(anchor_boxes),
+        require_oi,
+        tuple(nse_fno_stock_universe(instruments)["Symbol"].tolist())
+    )
+
+    if res.empty:
+        st.info("No ranking data returned.")
+    else:
+        ranked = res[res["Bias"].isin(["Bullish","Bearish"])].copy()
+        ranked = ranked.sort_values(
+            by=["Star Count","Anchor Boxes","Pullback Boxes","Symbol"],
+            ascending=[False, False, True, True]
+        )
+        st.dataframe(
+            ranked[[
+                "Stars","Symbol","Sector","Bias","Pattern","Anchor Boxes","Pullback Boxes",
+                "P&F ⭐","OI ⭐","Sector ⭐","Sector Ratio","Futures OI","System","Entry Level","SL","Reason"
+            ]],
+            use_container_width=True, hide_index=True
+        )
+        st.markdown("### ⭐⭐⭐ Strongest")
+        strongest = ranked[ranked["Star Count"] == 3]
+        if strongest.empty:
+            st.info("No 3-star setups currently.")
+        else:
+            st.dataframe(
+                strongest[[
+                    "Symbol","Sector","Bias","Pattern","Anchor Boxes","Pullback Boxes",
+                    "P&F ⭐","OI ⭐","Sector ⭐","System","Entry Level","SL"
+                ]],
+                use_container_width=True, hide_index=True
+            )
+
 
 # ----------------------------
 # NSE Intraday / Positional
@@ -1004,7 +1264,13 @@ elif mode in ("NSE Intraday P&F", "NSE Positional P&F"):
 
         cols = ["⭐","Symbol","Sector","Pattern","Anchor Boxes","Anchor","DTB","DBS",
                 "Futures OI","OI Δ","System","SL","Reason"]
-        st.dataframe(res[cols], use_container_width=True, hide_index=True)
+        cols = [
+            "Stars","Symbol","Sector","Pattern","Prospective","Anchor Boxes","Pullback Boxes",
+            "P&F ⭐","OI ⭐","Sector ⭐","Sector Ratio","Anchor","DTB","DBS",
+            "Futures OI","OI Δ","System","Entry Level","SL","Reason"
+        ]
+        available = [c for c in cols if c in res.columns]
+        st.dataframe(res[available], use_container_width=True, hide_index=True)
 
 # ----------------------------
 # Bullish / Bearish dedicated pages
