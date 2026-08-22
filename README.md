@@ -1,9 +1,20 @@
-# ALPHA ANALYZER V13
+# ALPHA ANALYZER FINAL V14
 
-NSE P&F Scanner changes:
-- Scans ALL NSE F&O futures by default (discovered from the Dhan instrument master).
-- Optional scan-size control if the user turns ALL off.
-- Displays only Bullish and Bearish P&F stocks in two side-by-side columns.
-- Neutral / no-signal / data-error rows are omitted from the main scanner but remain countable in the header/Diagnostics.
-- Bullish and Bearish lists are sorted to surface DTB/DBS and larger Anchor structures first.
-- Trade-ready BUY and SELL setups are shown separately underneath.
+NSE architecture:
+- P&F is built from NSE cash/spot EQUITY price only.
+- Only stocks that have an active NSE FUTSTK are included.
+- Futures are used only for OI confirmation.
+- All unique F&O stocks are scanned.
+- Positional: 0.25% box, 3-box reversal, daily cash closes.
+- Intraday: 0.15% box, 3-box reversal, completed 1-minute cash closes.
+- Anchor -> retracement -> DTB/DBS is explicit.
+- Initial SL uses the latest completed opposite P&F column extreme.
+- Futures OI is obtained in a batched Market Quote call and compared with a once-per-day cached previous OI baseline.
+- Historical cash intraday data is cached for 3 minutes to align with the current auto-refresh while avoiding duplicate calls inside a rerun.
+- Sector breadth uses cash P&F.
+- MCX remains a separate futures-based engine.
+- Client code/access token remain in Streamlit session state.
+
+Important:
+- This version is signal-only; it does not place orders.
+- Use Diagnostics to verify the unique NSE F&O cash mapping before live use.

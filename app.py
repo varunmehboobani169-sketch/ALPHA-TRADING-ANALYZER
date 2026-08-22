@@ -215,6 +215,38 @@ def get_daily(sec_id, lookback=180):
     }
     return candles_to_df(api_post("/charts/historical", payload, "daily"))
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_cash_daily(sec_id, lookback=220):
+    end = datetime.now().date()
+    start = end - timedelta(days=lookback)
+    payload = {
+        "securityId": str(int(sec_id)),
+        "exchangeSegment": "NSE_EQ",
+        "instrument": "EQUITY",
+        "expiryCode": 0,
+        "oi": False,
+        "fromDate": str(start),
+        "toDate": str(end + timedelta(days=1)),
+    }
+    return candles_to_df(api_post("/charts/historical", payload, "cash_daily"))
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def get_cash_intraday(sec_id, days=5):
+    now = datetime.now()
+    start = now - timedelta(days=days)
+    payload = {
+        "securityId": str(int(sec_id)),
+        "exchangeSegment": "NSE_EQ",
+        "instrument": "EQUITY",
+        "interval": "1",
+        "oi": False,
+        "fromDate": start.strftime("%Y-%m-%d %H:%M:%S"),
+        "toDate": now.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return candles_to_df(api_post("/charts/intraday", payload, "cash_intraday"))
+
+
 @st.cache_data(ttl=180, show_spinner=False)
 def get_intraday(sec_id, segment, instrument, days=5):
     now = datetime.now()
@@ -642,6 +674,142 @@ def choose_rows(x, n):
     if x.empty: return x
     return x.head(n).reset_index(drop=True)
 
+def nse_fno_stock_universe(instruments):
+    """Return one nearest active FUTSTK + one NSE_EQ mapping per F&O underlying."""
+    fut = nearest_fno(instruments, "NSE")
+    if fut.empty:
+        return pd.DataFrame()
+
+    fut = fut.copy()
+    fut["underlying_symbol"] = fut["underlying_symbol"].astype(str).str.upper().str.strip()
+    fut = fut.drop_duplicates("underlying_symbol")
+
+    eq = instruments[
+        (instruments["exchange"] == "NSE") &
+        (instruments["instrument"] == "EQUITY")
+    ].copy()
+    if eq.empty:
+        return pd.DataFrame()
+
+    eq = eq.dropna(subset=["security_id"]).copy()
+    if "trading_symbol" in eq.columns:
+        eq["equity_symbol"] = eq["trading_symbol"].astype(str).str.upper().str.strip()
+    elif "symbol_name" in eq.columns:
+        eq["equity_symbol"] = eq["symbol_name"].astype(str).str.upper().str.strip()
+    else:
+        eq["equity_symbol"] = eq["underlying_symbol"].astype(str).str.upper().str.strip()
+
+    eq = eq.drop_duplicates("equity_symbol")
+
+    # Prefer an exact trading-symbol match. Some master rows have custom symbols;
+    # use a second normalized map as fallback.
+    eq_map = eq.set_index("equity_symbol")
+    rows = []
+    for _, f in fut.iterrows():
+        s = f["underlying_symbol"]
+        match = None
+        if s in eq_map.index:
+            match = eq_map.loc[s]
+        else:
+            candidates = eq[eq["equity_symbol"].str.replace("-", "", regex=False) == s.replace("-", "")]
+            if not candidates.empty:
+                match = candidates.iloc[0]
+        if match is None:
+            continue
+
+        rows.append({
+            "Symbol": s,
+            "cash_security_id": int(match["security_id"]),
+            "future_security_id": int(f["security_id"]),
+            "future_expiry": match.get("expiry_date", pd.NaT),
+        })
+    return pd.DataFrame(rows).drop_duplicates("Symbol").reset_index(drop=True) if rows else pd.DataFrame()
+
+
+def market_quote_bulk(payload, label="quote"):
+    """One batched Market Quote call. Dhan permits up to 1000 instruments/request."""
+    if not payload:
+        return {}
+    return api_post("/marketfeed/quote", payload, label)
+
+
+def parse_quote_response(body, segment):
+    out = {}
+    data = body.get("data", {}) if isinstance(body, dict) else {}
+    seg = data.get(segment, {}) if isinstance(data, dict) else {}
+    if isinstance(seg, dict):
+        for sid, item in seg.items():
+            if isinstance(item, dict):
+                out[int(sid)] = item
+    return out
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def previous_daily_oi_map(future_ids):
+    """Fetch previous daily OI once per future per day, not every 3-minute refresh."""
+    result = {}
+    yday = (datetime.now().date() - timedelta(days=5))
+    today = datetime.now().date()
+    ids = list(future_ids)
+    for sid in ids:
+        try:
+            payload = {
+                "securityId": str(int(sid)),
+                "exchangeSegment": "NSE_FNO",
+                "instrument": "FUTSTK",
+                "expiryCode": 0,
+                "oi": True,
+                "fromDate": str(yday),
+                "toDate": str(today + timedelta(days=1)),
+            }
+            body = api_post("/charts/historical", payload, "previous_oi")
+            df = candles_to_df(body)
+            if not df.empty and "open_interest" in df.columns:
+                s = pd.to_numeric(df["open_interest"], errors="coerce").dropna()
+                result[int(sid)] = float(s.iloc[-1]) if not s.empty else np.nan
+            else:
+                result[int(sid)] = np.nan
+        except Exception:
+            result[int(sid)] = np.nan
+    return result
+
+
+def futures_confirmation(symbols_df, require_oi=True):
+    """Get current futures OI in bulk and compare against cached previous OI."""
+    if symbols_df.empty:
+        return {}
+    ids = symbols_df["future_security_id"].astype(int).tolist()
+    # One Market Quote request for all futures (normally < 1000).
+    q = market_quote_bulk({"NSE_FNO": ids}, "NSE futures quote")
+    current = parse_quote_response(q, "NSE_FNO")
+    prev = previous_daily_oi_map(tuple(ids))
+    result = {}
+    for _, r in symbols_df.iterrows():
+        sid = int(r["future_security_id"])
+        item = current.get(sid, {})
+        oi = pd.to_numeric(item.get("oi"), errors="coerce")
+        last_price = pd.to_numeric(item.get("last_price"), errors="coerce")
+        day_close = pd.to_numeric((item.get("ohlc") or {}).get("close"), errors="coerce")
+        prev_oi = prev.get(sid, np.nan)
+
+        if pd.isna(oi) or pd.isna(prev_oi):
+            state = "UNAVAILABLE"
+        elif oi > prev_oi:
+            # Direction comes from the cash P&F signal; positive OI change
+            # is the confirmation for fresh positioning.
+            state = "OI BUILDUP"
+        else:
+            state = "OI NOT BUILDING"
+        result[r["Symbol"]] = {
+            "oi": float(oi) if not pd.isna(oi) else np.nan,
+            "prev_oi": float(prev_oi) if not pd.isna(prev_oi) else np.nan,
+            "oi_change": float(oi - prev_oi) if not (pd.isna(oi) or pd.isna(prev_oi)) else np.nan,
+            "state": state,
+            "future_ltp": float(last_price) if not pd.isna(last_price) else np.nan,
+            "future_close": float(day_close) if not pd.isna(day_close) else np.nan,
+        }
+    return result
+
 # ----------------------------
 # Auto refresh
 # ----------------------------
@@ -687,56 +855,96 @@ if mode == "NSE P&F":
     sys_mode = st.radio("Trading mode", ["Positional", "Intraday"], horizontal=True)
     box = 0.0025 if sys_mode == "Positional" else 0.0015
     st.info(
-        f"{sys_mode}: {box*100:.2f}% box | 3-box reversal | Anchor ≥ {anchor_boxes} boxes | "
-        f"{'daily closes' if sys_mode=='Positional' else '1-minute closes'} only."
+        f"{sys_mode}: CASH/SPOT price | {box*100:.2f}% box | 3-box reversal | "
+        f"Anchor ≥ {anchor_boxes} boxes | "
+        f"{'daily closes' if sys_mode=='Positional' else '1-minute closes'} only. "
+        f"Futures are used only for OI confirmation."
     )
 
-    uni = nearest_fno(instruments, "NSE")
-    if uni.empty:
-        st.error("No NSE FUTSTK contracts were found in the Dhan instrument master.")
+    universe = nse_fno_stock_universe(instruments)
+    if universe.empty:
+        st.error("Could not map NSE F&O underlyings to NSE cash/spot instruments.")
         st.stop()
 
-    sym = "underlying_symbol"
-    uni[sym] = uni[sym].astype(str).str.upper().str.strip()
-    selected = uni.sort_values(sym).reset_index(drop=True) if scan_all_fno else choose_rows(uni.sort_values(sym), max_scan)
+    # Scan all unique F&O stocks, not every expiry contract.
+    selected = universe.sort_values("Symbol").reset_index(drop=True)
 
-    progress = st.progress(0, text=f"Scanning {len(selected)} NSE F&O stocks...")
+    st.caption(f"Unique NSE F&O stocks with cash mapping: {len(selected)}")
+
+    # One batched futures quote call + cached previous OI baseline.
+    with st.spinner("Loading futures OI confirmation..."):
+        oi_map = futures_confirmation(selected, require_oi=require_oi)
+
+    progress = st.progress(0, text=f"Scanning {len(selected)} NSE cash stocks...")
     rows = []
+
     for i, (_, r) in enumerate(selected.iterrows(), 1):
-        symbol = str(r[sym])
+        symbol = str(r["Symbol"])
         try:
-            hist = get_daily(r.security_id) if sys_mode == "Positional" else get_intraday(r.security_id, "NSE_FNO", "FUTSTK")
-            # Remove the current incomplete 1-min bar.
-            if sys_mode == "Intraday" and not hist.empty:
-                now = pd.Timestamp.now()
-                hist = hist[hist["datetime"] < now.floor("min")].copy()
+            if sys_mode == "Positional":
+                hist = get_cash_daily(r["cash_security_id"])
+            else:
+                hist = get_cash_intraday(r["cash_security_id"], days=5)
+                if not hist.empty:
+                    # Exclude the currently forming minute; use completed closes only.
+                    hist = hist[hist["datetime"] < pd.Timestamp.now().floor("min")].copy()
+
             pnf = pnf_analysis(hist, box, int(anchor_boxes))
-            oi, pchg, doichg = oi_state(hist)
-            status, qualified = system_result(pnf, oi, require_oi=require_oi)
+            oi_info = oi_map.get(symbol, {})
+            oi_state_text = oi_info.get("state", "UNAVAILABLE")
+
+            # For the NSE strategy, OI confirmation is directional by P&F side.
+            if require_oi and pnf["signal_side"]:
+                if oi_state_text != "OI BUILDUP":
+                    oi_for_system = "NO CONFIRMATION"
+                else:
+                    oi_for_system = "BUILDUP"
+            else:
+                oi_for_system = oi_state_text
+
+            status, qualified = system_result(
+                pnf,
+                "LONG BUILDUP" if (oi_for_system == "BUILDUP" and pnf["signal_side"] == "LONG") else
+                "SHORT BUILDUP" if (oi_for_system == "BUILDUP" and pnf["signal_side"] == "SHORT") else
+                "WAIT"
+                if require_oi else
+                "LONG BUILDUP" if pnf["signal_side"] == "LONG" else
+                "SHORT BUILDUP" if pnf["signal_side"] == "SHORT" else "WAIT",
+                require_oi=require_oi
+            )
+
             rows.append({
                 "Symbol": symbol,
                 "Sector": sector_of(symbol),
                 "Bias": pnf["bias"],
+                "Pattern": pnf.get("pattern", "—"),
+                "Anchor Boxes": pnf.get("anchor_boxes", 0),
                 "Anchor": "✅" if pnf["anchor"] else "❌",
                 "DTB": "✅" if pnf["dtb"] else "❌",
                 "DBS": "✅" if pnf["dbs"] else "❌",
-                "OI": oi,
-                "Price Δ%": pchg,
-                "OI Δ": doichg,
+                "Futures OI": oi_state_text,
+                "OI Δ": oi_info.get("oi_change", np.nan),
                 "System": status,
-                "Pattern": pnf.get("pattern", "—"),
-                "Anchor Boxes": pnf.get("anchor_boxes", 0),
                 "SL": pnf["sl"],
                 "Reason": pnf["reason"],
             })
         except Exception as e:
             rows.append({
-                "Symbol": symbol, "Sector": sector_of(symbol), "Bias":"ERROR",
-                "Anchor":"❌","DTB":"❌","DBS":"❌","OI":"ERROR",
-                "Price Δ%":np.nan,"OI Δ":np.nan,"System":"DATA ERROR","Pattern":"—","Anchor Boxes":0,"SL":np.nan,
-                "Reason":str(e)[:250]
+                "Symbol": symbol,
+                "Sector": sector_of(symbol),
+                "Bias": "ERROR",
+                "Pattern": "—",
+                "Anchor Boxes": 0,
+                "Anchor": "❌",
+                "DTB": "❌",
+                "DBS": "❌",
+                "Futures OI": "ERROR",
+                "OI Δ": np.nan,
+                "System": "DATA ERROR",
+                "SL": np.nan,
+                "Reason": str(e)[:300],
             })
-        progress.progress(i/len(selected), text=f"Scanning NSE F&O: {i}/{len(selected)}")
+        progress.progress(i/len(selected), text=f"Scanning NSE cash: {i}/{len(selected)}")
     progress.empty()
 
     res = pd.DataFrame(rows)
@@ -750,13 +958,11 @@ if mode == "NSE P&F":
     c1.metric("F&O stocks scanned", len(res))
     c2.metric("Bullish P&F", int((res["Bias"]=="Bullish").sum()))
     c3.metric("Bearish P&F", int((res["Bias"]=="Bearish").sum()))
-    c4.metric("Data errors", int((res["System"]=="DATA ERROR").sum()))
+    c4.metric("Trade-ready", int(res["System"].isin(["🟢 BUY","🔴 SELL"]).sum()))
 
     bullish = res[res["Bias"]=="Bullish"].copy()
     bearish = res[res["Bias"]=="Bearish"].copy()
 
-    # Only bullish and bearish names are shown in the scanner.
-    # Neutral / no-P&F / data-error rows remain available through Diagnostics.
     bullish = bullish.sort_values(
         by=["DTB","Anchor Boxes","⭐","Symbol"],
         ascending=[False, False, False, True]
@@ -766,9 +972,6 @@ if mode == "NSE P&F":
         ascending=[False, False, False, True]
     )
 
-    st.subheader("NSE F&O P&F Scanner")
-    st.caption("ALL available NSE F&O futures are scanned. Only bullish and bearish P&F stocks are displayed below.")
-
     left, right = st.columns(2)
     with left:
         st.markdown("### 🟢 BULLISH STOCKS")
@@ -776,36 +979,35 @@ if mode == "NSE P&F":
             st.info("No bullish P&F stocks currently detected.")
         else:
             st.dataframe(
-                bullish[["⭐","Symbol","Sector","Pattern","Anchor Boxes","Anchor","DTB","OI","System","SL","Reason"]],
+                bullish[["⭐","Symbol","Sector","Pattern","Anchor Boxes","Anchor","DTB","Futures OI","System","SL","Reason"]],
                 use_container_width=True, hide_index=True
             )
-
     with right:
         st.markdown("### 🔴 BEARISH STOCKS")
         if bearish.empty:
             st.info("No bearish P&F stocks currently detected.")
         else:
             st.dataframe(
-                bearish[["⭐","Symbol","Sector","Pattern","Anchor Boxes","Anchor","DBS","OI","System","SL","Reason"]],
+                bearish[["⭐","Symbol","Sector","Pattern","Anchor Boxes","Anchor","DBS","Futures OI","System","SL","Reason"]],
                 use_container_width=True, hide_index=True
             )
 
     st.markdown("#### Trade-ready setups")
-    ready_left, ready_right = st.columns(2)
-    with ready_left:
+    a,b = st.columns(2)
+    with a:
         buys = bullish[bullish["System"]=="🟢 BUY"]
-        st.metric("🟢 BUY setups", len(buys))
+        st.metric("🟢 BUY", len(buys))
         if not buys.empty:
             st.dataframe(
-                buys[["⭐","Symbol","Sector","Pattern","Anchor Boxes","OI","System","SL"]],
+                buys[["⭐","Symbol","Sector","Pattern","Anchor Boxes","Futures OI","System","SL"]],
                 use_container_width=True, hide_index=True
             )
-    with ready_right:
+    with b:
         sells = bearish[bearish["System"]=="🔴 SELL"]
-        st.metric("🔴 SELL setups", len(sells))
+        st.metric("🔴 SELL", len(sells))
         if not sells.empty:
             st.dataframe(
-                sells[["⭐","Symbol","Sector","Pattern","Anchor Boxes","OI","System","SL"]],
+                sells[["⭐","Symbol","Sector","Pattern","Anchor Boxes","Futures OI","System","SL"]],
                 use_container_width=True, hide_index=True
             )
 
@@ -816,28 +1018,45 @@ elif mode == "Sector Breadth":
     st.subheader("P&F Sector Breadth")
     sys_mode = st.radio("Breadth mode", ["Positional", "Intraday"], horizontal=True)
     box = 0.0025 if sys_mode=="Positional" else 0.0015
-    uni = nearest_fno(instruments, "NSE")
-    sym = "underlying_symbol" if "underlying_symbol" in uni.columns else "symbol_name"
-    selected = choose_rows(uni.sort_values(sym), max_scan)
+
+    universe = nse_fno_stock_universe(instruments)
+    if universe.empty:
+        st.warning("No NSE F&O cash mappings found.")
+        st.stop()
+
+    progress = st.progress(0, text=f"Calculating sector breadth for {len(universe)} stocks...")
     rows=[]
-    for _,r in selected.iterrows():
+    for i, (_, r) in enumerate(universe.iterrows(), 1):
         try:
-            h = get_daily(r.security_id) if sys_mode=="Positional" else get_intraday(r.security_id, "NSE_FNO", "FUTSTK")
+            h = get_cash_daily(r["cash_security_id"]) if sys_mode=="Positional" else get_cash_intraday(r["cash_security_id"], days=5)
             if sys_mode=="Intraday" and not h.empty:
                 h = h[h["datetime"] < pd.Timestamp.now().floor("min")]
             p = pnf_analysis(h, box, int(anchor_boxes))
-            symbol=str(r[sym])
-            rows.append({"Symbol":symbol,"Sector":sector_of(symbol),"Bias":p["bias"],
-                         "DTB":"✅" if p["dtb"] else "❌","DBS":"✅" if p["dbs"] else "❌"})
+            symbol=str(r["Symbol"])
+            rows.append({
+                "Symbol":symbol,
+                "Sector":sector_of(symbol),
+                "Bias":p["bias"],
+                "DTB":"✅" if p["dtb"] else "❌",
+                "DBS":"✅" if p["dbs"] else "❌",
+            })
         except Exception:
             pass
+        progress.progress(i/len(universe), text=f"Sector breadth: {i}/{len(universe)}")
+    progress.empty()
+
     br=sector_breadth(pd.DataFrame(rows))
     if br.empty:
-        st.warning("No sector breadth data returned. Open Diagnostics.")
+        st.warning("No sector breadth data returned.")
     else:
-        br["⭐ Sector"] = np.where((br["Bullish %"]>=sector_threshold)|(br["Bearish %"]>=sector_threshold),"⭐","")
-        st.dataframe(br[["⭐ Sector","Sector","stocks","bullish","Bullish %","bearish","Bearish %","dtb","dbs"]],
-                     use_container_width=True, hide_index=True)
+        br["⭐ Sector"] = np.where(
+            (br["Bullish %"]>=sector_threshold)|(br["Bearish %"]>=sector_threshold),
+            "⭐",""
+        )
+        st.dataframe(
+            br[["⭐ Sector","Sector","stocks","bullish","Bullish %","bearish","Bearish %","dtb","dbs"]],
+            use_container_width=True, hide_index=True
+        )
 
 # ----------------------------
 # MCX
@@ -913,8 +1132,9 @@ else:
         "client_code_present": bool(st.session_state.alpha_client_id),
         "access_token_present": bool(st.session_state.alpha_access_token),
         "instrument_rows": len(instruments),
-        "NSE FUTSTK": int(((instruments["exchange"]=="NSE") & (instruments["instrument"]=="FUTSTK")).sum()),
-        "MCX FUTCOM": int(((instruments["exchange"]=="MCX") & (instruments["instrument"]=="FUTCOM")).sum()),
+        "NSE FUTSTK contracts": int(((instruments["exchange"]=="NSE") & (instruments["instrument"]=="FUTSTK")).sum()),
+        "NSE unique F&O stocks mapped to cash": len(nse_fno_stock_universe(instruments)),
+        "MCX FUTCOM contracts": int(((instruments["exchange"]=="MCX") & (instruments["instrument"]=="FUTCOM")).sum()),
     })
 
     if not st.session_state.api_log:
@@ -972,5 +1192,5 @@ st.divider()
 st.caption(
     f"Page refresh: {datetime.now().strftime('%d-%b-%Y %H:%M:%S')} | "
     f"API calls in this browser session: {len(st.session_state.api_log)} | "
-    f"NSE scan mode: {'ALL F&O' if scan_all_fno else f'{max_scan} stocks'}"
+    f"NSE P&F: CASH + Futures OI confirmation"
 )
