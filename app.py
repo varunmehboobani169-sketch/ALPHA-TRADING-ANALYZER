@@ -136,6 +136,18 @@ def load_master():
     return df.loc[~bad].copy()
 
 def future_universe(master, exchange="NSE"):
+    """
+    Return ONE nearest active futures contract per underlying.
+    2nd/3rd expiries are never scanned.
+
+    NSE:
+      exchange=NSE, instrument=FUTSTK
+    MCX:
+      exchange=MCX, instrument=FUTCOM
+
+    If expiry is unavailable, we keep one contract per underlying in
+    deterministic instrument-master order rather than crashing.
+    """
     if exchange == "NSE":
         x = master[
             (master["exchange"] == "NSE") &
@@ -150,27 +162,49 @@ def future_universe(master, exchange="NSE"):
     if x.empty:
         return x
 
-    x["expiry_date"] = (
-        pd.to_datetime(x["expiry_date"], errors="coerce")
-        if "expiry_date" in x.columns
-        else pd.NaT
-    )
+    # Ensure required fields.
+    x = x.dropna(subset=["security_id"]).copy()
+
+    if "expiry_date" in x.columns:
+        x["expiry_date"] = pd.to_datetime(x["expiry_date"], errors="coerce")
+    else:
+        x["expiry_date"] = pd.NaT
+
+    # Only remove contracts that are definitely expired.
     now = pd.Timestamp.now()
     if x["expiry_date"].notna().any():
-        x = x[x["expiry_date"].isna() | (x["expiry_date"] >= now)]
+        x = x[x["expiry_date"].isna() | (x["expiry_date"] >= now)].copy()
 
+    # Build underlying symbol if missing.
     if "underlying_symbol" not in x.columns:
-        x["underlying_symbol"] = (
-            x["trading_symbol"].astype(str).str.split("-", n=1).str[0].str.upper()
-        )
+        if "trading_symbol" in x.columns:
+            x["underlying_symbol"] = (
+                x["trading_symbol"].astype(str)
+                .str.split("-", n=1)
+                .str[0]
+                .str.upper()
+                .str.strip()
+            )
+        else:
+            return pd.DataFrame()
 
-    x = x.dropna(subset=["security_id"])
-    rows = []
-    for sym, g in x.groupby("underlying_symbol"):
-        g = g.sort_values("expiry_date", na_position="last")
-        rows.append(g.iloc[0])
+    x["underlying_symbol"] = (
+        x["underlying_symbol"].astype(str).str.upper().str.strip()
+    )
+    x = x[~x["underlying_symbol"].isin(["", "NAN", "NONE"])].copy()
 
-    return pd.DataFrame(rows).reset_index(drop=True)
+    # Sort by expiry first so the first row for each symbol is the nearest contract.
+    # Stable fallback by security_id prevents random selection if expiry is missing.
+    x = x.sort_values(
+        ["underlying_symbol", "expiry_date", "security_id"],
+        ascending=[True, True, True],
+        na_position="last",
+    )
+
+    # ONLY the first/nearest active contract per underlying.
+    x = x.drop_duplicates(subset=["underlying_symbol"], keep="first").reset_index(drop=True)
+
+    return x
 
 # -----------------------------
 # Live LTP
@@ -234,6 +268,15 @@ def historical(sec_id, segment, instrument, mode):
         out = out[out["datetime"] < pd.Timestamp.now().floor("min")].copy()
 
     return out
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def cached_cash_intraday(sec_id, days=5):
+    return historical(sec_id, "NSE_EQ", "EQUITY", "Intraday")
+
+@st.cache_data(ttl=180, show_spinner=False)
+def cached_cash_daily(sec_id):
+    return historical(sec_id, "NSE_EQ", "EQUITY", "Positional")
 
 # -----------------------------
 # P&F engine
@@ -542,6 +585,28 @@ def sector_breadth_star(df, symbol, direction):
     return {"sector": sec, "breadth": np.nan, "star": False}
 
 
+
+@st.cache_data(ttl=900, show_spinner=False)
+def daily_direction_filter(sec_id, anchor_min=15):
+    """
+    Higher-timeframe filter:
+    0.25% box, 3-box reversal, daily cash closes.
+    Returns Bullish / Bearish / Sideways.
+    """
+    try:
+        h = cached_cash_daily(sec_id)
+        if h.empty:
+            return "UNAVAILABLE", "No daily data"
+        p = analyze_new_pattern(h, 0.0025, anchor_min=anchor_min, pullback_max=5)
+        if p["bias"] == "Bullish":
+            return "Bullish", p["reason"]
+        if p["bias"] == "Bearish":
+            return "Bearish", p["reason"]
+        return "Sideways", p["reason"]
+    except Exception as e:
+        return "UNAVAILABLE", str(e)[:200]
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -555,13 +620,18 @@ except Exception as e:
     st.error(f"Instrument master failed: {e}")
     st.stop()
 
+# Auto refresh is deliberately longer than the initial full-universe scan.
+# The full NSE scan can take longer than 1 minute, so a 1-minute rerun would
+# interrupt the scan and start it again from stock 1.
 if auto:
     try:
         from streamlit_autorefresh import st_autorefresh
-        mins = 1 if page in ("NSE Intraday P&F", "MCX Intraday") else 15
+        mins = 1 if page == "NSE Intraday P&F" else 1 if page == "MCX Intraday" else 15
         if page == "Market Overview":
             mins = 3
         st_autorefresh(interval=mins * 60 * 1000, key=f"refresh_{page}")
+        if page == "NSE Intraday P&F":
+            st.caption("NSE Intraday auto-refresh: 1 minute. Daily P&F filter reduces the intraday scan universe before 1-minute analysis.")
     except Exception:
         pass
 
@@ -586,11 +656,19 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
     mode = "Intraday" if page == "NSE Intraday P&F" else "Positional"
     box = 0.0015 if mode == "Intraday" else 0.0025
     st.title(page)
-    st.caption(
-        "Core = cash/spot P&F. OI is calculated from the SAME active futures contract: "
-        "Current OI − Previous OI, combined with futures price direction. "
-        "A failure in OI will NOT create DATA ERROR in the P&F scan."
-    )
+
+    if mode == "Intraday":
+        st.info(f"Nearest-contract universe: {len(fut)} stocks. Only the 1st active future per stock is used.")
+        st.caption(
+            "Intraday logic: 0.15% / 3-box / 1-minute P&F. "
+            "Daily 0.25% / 3-box P&F is the direction filter. "
+            "Only the nearest active futures contract is used for each stock; "
+            "2nd/3rd expiries are not scanned."
+        )
+    else:
+        st.caption(
+            "Positional logic: 0.25% / 3-box / daily-close P&F."
+        )
 
     fut = future_universe(master, "NSE")
     if fut.empty:
@@ -598,31 +676,86 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
         st.stop()
 
     fut = fut.dropna(subset=["underlying_security_id"]).copy()
-    spot_map = batch_ltp("NSE_EQ", fut["underlying_security_id"].astype(int).tolist())
 
-    # PASS 1: core P&F only. This should always remain independent.
+    # -----------------------
+    # POSITIONAL: all stocks
+    # -----------------------
+    if mode == "Positional":
+        candidates = fut.copy()
+        st.info(f"Scanning all {len(candidates)} NSE F&O stocks on the daily 0.25% P&F.")
+
+    # -----------------------
+    # INTRADAY: daily P&F filter first
+    # -----------------------
+    else:
+        daily_rows = []
+        dprog = st.progress(0, text=f"Building daily 0.25% P&F filter for {len(fut)} stocks...")
+
+        for i, (_, r) in enumerate(fut.iterrows(), 1):
+            bias, reason = daily_direction_filter(int(r["underlying_security_id"]))
+            daily_rows.append({
+                "Symbol": r["underlying_symbol"],
+                "Future ID": int(r["security_id"]),
+                "Cash ID": int(r["underlying_security_id"]),
+                "Daily Bias": bias,
+                "Daily Reason": reason,
+            })
+            dprog.progress(i / len(fut), text=f"Daily filter {i}/{len(fut)}")
+
+        dprog.empty()
+        daily_df = pd.DataFrame(daily_rows)
+
+        bullish = daily_df[daily_df["Daily Bias"] == "Bullish"]
+        bearish = daily_df[daily_df["Daily Bias"] == "Bearish"]
+        candidates_symbols = set(pd.concat([bullish, bearish])["Symbol"].tolist())
+
+        candidates = fut[fut["underlying_symbol"].isin(candidates_symbols)].copy()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total F&O stocks", len(fut))
+        c2.metric("Daily Bullish", len(bullish))
+        c3.metric("Daily Bearish", len(bearish))
+        st.caption(f"Intraday P&F scan reduced to {len(candidates)} stocks; sideways daily stocks are excluded.")
+
+    # Live spot quote only for remaining candidates.
+    spot_map = batch_ltp(
+        "NSE_EQ",
+        candidates["underlying_security_id"].astype(int).tolist()
+    )
+
     rows = []
-    progress = st.progress(0, text=f"Scanning P&F for {len(fut)} stocks...")
-    for i, (_, r) in enumerate(fut.iterrows(), 1):
+    progress = st.progress(0, text=f"Scanning intraday/positional P&F for {len(candidates)} stocks...")
+
+    for i, (_, r) in enumerate(candidates.iterrows(), 1):
         symbol = str(r["underlying_symbol"])
         sid_cash = int(r["underlying_security_id"])
         try:
-            h = historical(sid_cash, "NSE_EQ", "EQUITY", mode)
+            h = (
+                cached_cash_intraday(sid_cash)
+                if mode == "Intraday"
+                else cached_cash_daily(sid_cash)
+            )
             p = analyze_new_pattern(h, box)
+
+            if mode == "Intraday":
+                db = daily_df[daily_df["Symbol"] == symbol].iloc[0]
+                daily_bias = db["Daily Bias"]
+            else:
+                daily_bias = p["bias"]
+
             rows.append({
                 "Symbol": symbol,
-                "Sector": sector_of(symbol),
+                "Daily Bias": daily_bias,
                 "Spot LTP": spot_map.get(sid_cash, np.nan),
-                "Future ID": int(r["security_id"]),
                 "Bias": p["bias"],
                 "Pattern": p["pattern"],
                 "Anchor": p["anchor_boxes"],
                 "Pullback": p["pullback_boxes"],
                 "System": (
-                    "🟢 BUY" if p["dtb"] else
-                    "🔴 SELL" if p["dbs"] else
-                    "🟡 PROSPECTIVE" if p["prospective"] else
-                    "WAIT"
+                    "🟢 BUY" if p["dtb"] and (mode == "Positional" or daily_bias == "Bullish")
+                    else "🔴 SELL" if p["dbs"] and (mode == "Positional" or daily_bias == "Bearish")
+                    else "🟡 PROSPECTIVE" if p["prospective"]
+                    else "WAIT"
                 ),
                 "Entry": p["entry_level"],
                 "SL": p["sl"],
@@ -631,9 +764,8 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
         except Exception as e:
             rows.append({
                 "Symbol": symbol,
-                "Sector": sector_of(symbol),
+                "Daily Bias": daily_bias if mode == "Intraday" else "—",
                 "Spot LTP": spot_map.get(sid_cash, np.nan),
-                "Future ID": int(r["security_id"]),
                 "Bias": "ERROR",
                 "Pattern": "DATA ERROR",
                 "Anchor": 0,
@@ -643,113 +775,46 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
                 "SL": np.nan,
                 "Reason": str(e)[:250],
             })
-        progress.progress(i / len(fut), text=f"P&F {i}/{len(fut)}")
+
+        progress.progress(i / len(candidates), text=f"P&F scan {i}/{len(candidates)}")
     progress.empty()
 
     res = pd.DataFrame(rows)
 
-    # PASS 2: OI from the exact SAME active futures contract.
-    oi_enabled = st.checkbox("Enable OI confirmation", True, key=f"oi_{mode}")
-    res["OI State"] = "OFF"
-    res["Current OI"] = np.nan
-    res["Previous OI"] = np.nan
-    res["OI Δ"] = np.nan
-    res["OI Δ %"] = np.nan
-    res["OI Price Δ %"] = np.nan
-    res["OI ⭐"] = False
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Scanned", len(res))
+    c2.metric("Bullish P&F", int((res["Bias"] == "Bullish").sum()))
+    c3.metric("Bearish P&F", int((res["Bias"] == "Bearish").sum()))
+    c4.metric("Confirmed Entries", int(res["System"].isin(["🟢 BUY", "🔴 SELL"]).sum()))
 
-    if oi_enabled and not res.empty:
-        directional = res[res["Bias"].isin(["Bullish", "Bearish"])].copy()
-        oi_bar = st.progress(0, text=f"Calculating same-contract futures OI for {len(directional)} directional stocks...")
-        for j, (_, row) in enumerate(directional.iterrows(), 1):
-            direction = "LONG" if row["Bias"] == "Bullish" else "SHORT"
-            conf = classify_futures_oi(int(row["Future ID"]), direction)
-            mask = res["Symbol"] == row["Symbol"]
-            res.loc[mask, "OI State"] = conf["state"]
-            res.loc[mask, "Current OI"] = conf["current_oi"]
-            res.loc[mask, "Previous OI"] = conf["previous_oi"]
-            res.loc[mask, "OI Δ"] = conf["oi_change"]
-            res.loc[mask, "OI Δ %"] = conf["oi_change_pct"]
-            res.loc[mask, "OI Price Δ %"] = conf["price_change_pct"]
-            res.loc[mask, "OI ⭐"] = conf["star"]
-            oi_bar.progress(j / len(directional))
-        oi_bar.empty()
-
-    # PASS 3: sector breadth from the completed P&F scan.
-    res["Sector Breadth %"] = np.nan
-    res["Sector ⭐"] = False
-    for symbol in res["Symbol"].tolist():
-        row = res[res["Symbol"] == symbol].iloc[0]
-        direction = "LONG" if row["Bias"] == "Bullish" else "SHORT" if row["Bias"] == "Bearish" else None
-        s = sector_breadth_star(res, symbol, direction)
-        res.loc[res["Symbol"] == symbol, "Sector Breadth %"] = s["breadth"]
-        res.loc[res["Symbol"] == symbol, "Sector ⭐"] = s["star"]
-
-    # 3 normal stars + green additional star for the exact new 3-column setup.
-    res["P&F ⭐"] = res["Bias"].isin(["Bullish", "Bearish"])
-    res["Green ⭐"] = res["Pattern"].isin(["NEW PATTERN", "DTB", "DBS"])
-    res["Star Count"] = (
-        res["P&F ⭐"].astype(int)
-        + res["OI ⭐"].astype(int)
-        + res["Sector ⭐"].astype(int)
-    )
-    res["Stars"] = (
-        res["P&F ⭐"].map(lambda x: "⭐" if x else "☆")
-        + res["OI ⭐"].map(lambda x: "⭐" if x else "☆")
-        + res["Sector ⭐"].map(lambda x: "⭐" if x else "☆")
-        + res["Green ⭐"].map(lambda x: "🟢★" if x else "☆")
-    )
-
-    # Keep P&F entry independent from confirmations.
-    res["System"] = np.where(
-        res["Pattern"].eq("DTB"), "🟢 BUY",
-        np.where(
-            res["Pattern"].eq("DBS"), "🔴 SELL",
-            np.where(res["Pattern"].eq("NEW PATTERN"), "🟡 PROSPECTIVE", res["System"])
-        )
-    )
-
-    bullish = res[res["Bias"] == "Bullish"].sort_values(
-        ["Star Count", "Green ⭐", "Anchor", "Pullback"],
-        ascending=[False, False, False, True]
-    )
-    bearish = res[res["Bias"] == "Bearish"].sort_values(
-        ["Star Count", "Green ⭐", "Anchor", "Pullback"],
-        ascending=[False, False, False, True]
-    )
-
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Stocks", len(res))
-    c2.metric("Bullish", len(bullish))
-    c3.metric("Bearish", len(bearish))
-    c4.metric("⭐3", int((res["Star Count"] == 3).sum()))
-
-    left,right = st.columns(2)
+    left, right = st.columns(2)
     with left:
         st.markdown("### 🟢 BULLISH")
-        st.dataframe(
-            bullish[
-                ["Stars","Symbol","Sector","Spot LTP","Pattern","Anchor","Pullback",
-                 "OI State","Current OI","Previous OI","OI Δ","OI Δ %","OI Price Δ %",
-                 "Sector Breadth %","System","Entry","SL"]
-            ],
-            use_container_width=True, hide_index=True
-        )
+        bullish_view = res[res["Bias"] == "Bullish"].copy()
+        if bullish_view.empty:
+            st.info("No bullish setups.")
+        else:
+            st.dataframe(
+                bullish_view[
+                    ["Symbol","Daily Bias","Spot LTP","Pattern","Anchor","Pullback",
+                     "System","Entry","SL","Reason"]
+                ],
+                use_container_width=True, hide_index=True
+            )
+
     with right:
         st.markdown("### 🔴 BEARISH")
-        st.dataframe(
-            bearish[
-                ["Stars","Symbol","Sector","Spot LTP","Pattern","Anchor","Pullback",
-                 "OI State","Current OI","Previous OI","OI Δ","OI Δ %","OI Price Δ %",
-                 "Sector Breadth %","System","Entry","SL"]
-            ],
-            use_container_width=True, hide_index=True
-        )
-
-    st.caption(
-        "Stars: ⭐ P&F | ⭐ OI confirmation | ⭐ Sector breadth | 🟢★ New 3-column pattern. "
-        "P&F DTB/DBS remains the actual entry trigger."
-    )
+        bearish_view = res[res["Bias"] == "Bearish"].copy()
+        if bearish_view.empty:
+            st.info("No bearish setups.")
+        else:
+            st.dataframe(
+                bearish_view[
+                    ["Symbol","Daily Bias","Spot LTP","Pattern","Anchor","Pullback",
+                     "System","Entry","SL","Reason"]
+                ],
+                use_container_width=True, hide_index=True
+            )
 
 elif page in ("MCX Intraday", "MCX Positional"):
     mode = "Intraday" if page == "MCX Intraday" else "Positional"

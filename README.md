@@ -1,21 +1,12 @@
-# ALPHA ANALYZER V6 — Same-Contract Futures OI
+# ALPHA ANALYZER V9 — Nearest Futures Only
 
-OI is now calculated directly from the exact active futures contract selected for each stock.
+NSE rules:
+- Cash/spot price is used for all P&F calculations.
+- Daily 0.25%/3-box P&F filters the intraday universe.
+- Intraday 0.15%/3-box/1-minute P&F is run only on daily-direction stocks.
+- For each stock, ONLY the nearest active futures contract is retained.
+- 2nd and 3rd futures expiries are never scanned.
+- Futures OI confirmation uses that same nearest contract.
 
-For the same contract:
-- Current OI
-- Previous OI
-- Change in OI
-- Change in OI %
-- Futures price change %
-- OI interpretation
-
-Classification:
-- Price up + OI up = LONG BUILDUP
-- Price down + OI up = SHORT BUILDUP
-- Price up + OI down = SHORT COVERING
-- Price down + OI down = LONG UNWINDING
-
-OI can award the OI star when it confirms the P&F direction.
-P&F remains the actual entry trigger.
-If OI retrieval fails, P&F still works and the row shows OI UNAVAILABLE.
+The contract-selection function is robust to missing expiry_date fields and
+never crashes the entire scan because of a missing expiry column.
