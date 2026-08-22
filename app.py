@@ -54,7 +54,8 @@ with st.sidebar:
 
     st.divider()
     auto = st.checkbox("Auto refresh", True)
-    anchor_boxes = st.number_input("Minimum anchor boxes", 5, 30, 15)
+    anchor_boxes = st.number_input("Anchor minimum", 5, 30, 15, help="New pattern requires strictly MORE than this many boxes; default = >15.")
+    max_pullback_boxes = 5
     sector_threshold = st.slider("Super sector breadth %", 50, 90, 70)
     require_oi = st.checkbox("Require OI confirmation", True)
 
@@ -395,149 +396,131 @@ def pnf_build_columns(closes, box_pct=0.0025, reversal=3):
 
 def pnf_analysis(df, box_pct, anchor_min=15, reversal=3):
     """
-    Improved P&F signal definition:
+    EXACT NEW 3-COLUMN P&F PATTERN.
 
-    LONG:
-      1. An earlier X-column is an Anchor (>= anchor_min boxes).
-      2. That anchor is followed by at least one O-column.
-      3. The current X-column breaks above the immediately prior X-column high.
-      4. The current signal must be the latest completed X column.
-      5. Structural SL = latest completed O-column low.
+    Bullish:
+      Column 1 = X Anchor with >15 boxes (default anchor_min=15 means >15).
+      Column 2 = O Pullback with 1 to 5 boxes only.
+      Column 3 = X breakout column.
+      BUY only when Column 3 breaks the high of Column 1 (DTB).
 
-    SHORT:
-      1. An earlier O-column is an Anchor (>= anchor_min boxes).
-      2. That anchor is followed by at least one X-column.
-      3. The current O-column breaks below the immediately prior O-column low.
-      4. The current signal must be the latest completed O column.
-      5. Structural SL = latest completed X-column high.
+    Bearish mirror:
+      Column 1 = O Anchor with >15 boxes.
+      Column 2 = X Pullback with 1 to 5 boxes.
+      Column 3 = O breakdown column.
+      SELL only when Column 3 breaks the low of Column 1 (DBS).
 
-    This prevents a generic "bullish column" from being treated as a DTB.
+    No trade/entry is generated in Column 2.
+    The setup is invalid if the pullback is >5 boxes or if extra columns
+    appear between Anchor, Pullback and Breakout.
     """
-    empty = {
-        "bias": "NO DATA", "anchor": False, "dtb": False, "dbs": False,
-        "signal_side": None, "reason": "Insufficient price history",
-        "sl": np.nan, "columns": 0, "anchor_boxes": 0,
-        "signal_price": np.nan, "pattern": "—"
+    out = {
+        "bias": "NO DATA",
+        "anchor": False,
+        "dtb": False,
+        "dbs": False,
+        "signal_side": None,
+        "reason": "Insufficient price history",
+        "sl": np.nan,
+        "columns": 0,
+        "anchor_boxes": 0,
+        "pullback_boxes": 0,
+        "pattern": "—",
+        "signal_price": np.nan,
+        "entry_level": np.nan,
     }
 
     if df is None or df.empty or "close" not in df.columns:
-        return empty.copy()
+        return out
 
     closes = pd.to_numeric(df["close"], errors="coerce").dropna()
     if len(closes) < 10:
-        return empty.copy()
+        return out
 
     cols = pnf_build_columns(closes, box_pct, reversal)
-    out = empty.copy()
     out["columns"] = len(cols)
-    if not cols:
+    if len(cols) < 3:
         out["bias"] = "NO P&F"
-        out["reason"] = "Could not build P&F columns"
+        out["reason"] = f"Only {len(cols)} P&F columns; need at least 3"
         return out
 
     cur = cols[-1]
     out["bias"] = "Bullish" if cur["type"] == "X" else "Bearish"
     out["signal_price"] = float(closes.iloc[-1])
 
-    # Need at least 4 columns for a clean anchor -> opposite -> signal structure.
-    if len(cols) < 3:
-        out["reason"] = f"P&F built ({len(cols)} columns); waiting for anchor/retest structure"
-        return out
+    # Search ONLY the immediate last 3 columns:
+    # [Anchor, Pullback, Breakout]
+    c1, c2, c3 = cols[-3], cols[-2], cols[-1]
 
-    if cur["type"] == "X":
-        # The previous completed X column immediately before the retracement.
-        prev_x_idx = None
-        for i in range(len(cols) - 2, -1, -1):
-            if cols[i]["type"] == "X":
-                prev_x_idx = i
-                break
+    # ---------------- Bullish new pattern ----------------
+    if c1["type"] == "X" and c2["type"] == "O" and c3["type"] == "X":
+        out["anchor"] = c1["boxes"] > anchor_min
+        out["anchor_boxes"] = c1["boxes"]
+        out["pullback_boxes"] = c2["boxes"]
+        out["entry_level"] = c1["high"]
 
-        if prev_x_idx is None:
-            out["reason"] = "No previous X-column"
+        if not out["anchor"]:
+            out["reason"] = f"3-column sequence found, but Anchor is {c1['boxes']} X's (must be > {anchor_min})"
             return out
 
-        # Anchor must be earlier than the previous X column.
-        anchor_idx = None
-        for i in range(0, prev_x_idx):
-            if cols[i]["type"] == "X" and cols[i]["boxes"] >= anchor_min:
-                anchor_idx = i
-        if anchor_idx is None:
-            out["reason"] = f"No earlier X Anchor >= {anchor_min} boxes"
+        if not (1 <= c2["boxes"] <= 5):
+            out["reason"] = f"Invalid pullback: {c2['boxes']} O's (must be 1–5)"
             return out
 
-        # There must have been an O-column after the anchor.
-        has_retrace = any(cols[j]["type"] == "O" for j in range(anchor_idx + 1, len(cols) - 1))
-        out["anchor"] = True
-        out["anchor_boxes"] = cols[anchor_idx]["boxes"]
-
-        if not has_retrace:
-            out["reason"] = f"Anchor found ({cols[anchor_idx]['boxes']} boxes); no O retracement yet"
-            return out
-
-        if cur["high"] > cols[prev_x_idx]["high"]:
+        # Third X column must break the Anchor high.
+        if c3["high"] > c1["high"]:
             out["dtb"] = True
             out["signal_side"] = "LONG"
-            out["pattern"] = "DTB"
+            out["pattern"] = "NEW 3-COLUMN DTB"
             out["reason"] = (
-                f"DTB after {cols[anchor_idx]['boxes']}-box X Anchor; "
-                f"breaks prior X high"
+                f"VALID: {c1['boxes']}X Anchor → {c2['boxes']}O Pullback → "
+                f"3rd X breaks Anchor high (DTB)"
             )
-            # SL = latest completed O column before current X.
-            latest_o = next((cols[j] for j in range(len(cols)-2, -1, -1)
-                             if cols[j]["type"] == "O"), None)
-            if latest_o:
-                out["sl"] = latest_o["low"]
+            # Structural SL below the pullback O column.
+            out["sl"] = c2["low"]
         else:
             out["reason"] = (
-                f"Anchor {cols[anchor_idx]['boxes']} boxes; "
-                f"current X has not broken prior X high"
+                f"Valid 3-column structure ({c1['boxes']}X → {c2['boxes']}O → X), "
+                f"but 3rd X has not broken Anchor high"
             )
+        return out
 
-    else:
-        prev_o_idx = None
-        for i in range(len(cols) - 2, -1, -1):
-            if cols[i]["type"] == "O":
-                prev_o_idx = i
-                break
+    # ---------------- Bearish mirror pattern ----------------
+    if c1["type"] == "O" and c2["type"] == "X" and c3["type"] == "O":
+        out["anchor"] = c1["boxes"] > anchor_min
+        out["anchor_boxes"] = c1["boxes"]
+        out["pullback_boxes"] = c2["boxes"]
+        out["entry_level"] = c1["low"]
 
-        if prev_o_idx is None:
-            out["reason"] = "No previous O-column"
+        if not out["anchor"]:
+            out["reason"] = f"3-column sequence found, but Anchor is {c1['boxes']} O's (must be > {anchor_min})"
             return out
 
-        anchor_idx = None
-        for i in range(0, prev_o_idx):
-            if cols[i]["type"] == "O" and cols[i]["boxes"] >= anchor_min:
-                anchor_idx = i
-        if anchor_idx is None:
-            out["reason"] = f"No earlier O Anchor >= {anchor_min} boxes"
+        if not (1 <= c2["boxes"] <= 5):
+            out["reason"] = f"Invalid pullback: {c2['boxes']} X's (must be 1–5)"
             return out
 
-        has_retrace = any(cols[j]["type"] == "X" for j in range(anchor_idx + 1, len(cols) - 1))
-        out["anchor"] = True
-        out["anchor_boxes"] = cols[anchor_idx]["boxes"]
-
-        if not has_retrace:
-            out["reason"] = f"Anchor found ({cols[anchor_idx]['boxes']} boxes); no X retracement yet"
-            return out
-
-        if cur["low"] < cols[prev_o_idx]["low"]:
+        if c3["low"] < c1["low"]:
             out["dbs"] = True
             out["signal_side"] = "SHORT"
-            out["pattern"] = "DBS"
+            out["pattern"] = "NEW 3-COLUMN DBS"
             out["reason"] = (
-                f"DBS after {cols[anchor_idx]['boxes']}-box O Anchor; "
-                f"breaks prior O low"
+                f"VALID: {c1['boxes']}O Anchor → {c2['boxes']}X Pullback → "
+                f"3rd O breaks Anchor low (DBS)"
             )
-            latest_x = next((cols[j] for j in range(len(cols)-2, -1, -1)
-                             if cols[j]["type"] == "X"), None)
-            if latest_x:
-                out["sl"] = latest_x["high"]
+            out["sl"] = c2["high"]
         else:
             out["reason"] = (
-                f"Anchor {cols[anchor_idx]['boxes']} boxes; "
-                f"current O has not broken prior O low"
+                f"Valid 3-column structure ({c1['boxes']}O → {c2['boxes']}X → O), "
+                f"but 3rd O has not broken Anchor low"
             )
+        return out
 
+    # If latest 3 columns are not exactly the new pattern:
+    out["reason"] = (
+        f"Latest P&F columns are {c1['type']}{c2['type']}{c3['type']}; "
+        "new setup requires X-O-X bullish or O-X-O bearish"
+    )
     return out
 
 # ----------------------------
@@ -932,6 +915,8 @@ def run_nse_pnf_scan(sys_mode, anchor_min, require_oi, universe_signature):
                 "Bias": pnf["bias"],
                 "Pattern": pnf.get("pattern", "—"),
                 "Anchor Boxes": pnf.get("anchor_boxes", 0),
+                "Pullback Boxes": pnf.get("pullback_boxes", 0),
+                "Entry Level": pnf.get("entry_level", np.nan),
                 "Anchor": "✅" if pnf["anchor"] else "❌",
                 "DTB": "✅" if pnf["dtb"] else "❌",
                 "DBS": "✅" if pnf["dbs"] else "❌",
@@ -948,6 +933,8 @@ def run_nse_pnf_scan(sys_mode, anchor_min, require_oi, universe_signature):
                 "Bias": "ERROR",
                 "Pattern": "—",
                 "Anchor Boxes": 0,
+                "Pullback Boxes": 0,
+                "Entry Level": np.nan,
                 "Anchor": "❌",
                 "DTB": "❌",
                 "DBS": "❌",

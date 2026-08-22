@@ -1,29 +1,19 @@
-# ALPHA ANALYZER V15
+# ALPHA ANALYZER V16 — NEW 3-COLUMN P&F PATTERN
 
-Functional architecture before visual redesign.
+Exact bullish positional pattern:
+1. Column 1 = X Anchor with MORE THAN 15 boxes (default >15).
+2. Column 2 = O Pullback with 1 to 5 boxes. Any 1–5 is valid; 0 is not a pullback.
+3. Column 3 = X.
+4. Entry only when Column 3 breaks the high of Column 1 and creates DTB.
+5. No entry is allowed anywhere inside Column 2.
+6. Any pullback larger than 5 boxes invalidates the setup.
+7. Extra columns between Anchor/Pullback/Breakout invalidate the setup because only the latest three columns define the pattern.
 
-Pages:
-- Market Overview — 3 minute refresh
-- NSE Intraday P&F — 1 minute refresh
-- NSE Positional P&F — 15 minute refresh
-- Bullish Stocks — 3 minute refresh (select Intraday/Positional)
-- Bearish Stocks — 3 minute refresh (select Intraday/Positional)
-- Sector Breadth — 15 minute refresh
-- MCX Intraday — 1 minute refresh
-- MCX Positional — 15 minute refresh
-- Diagnostics — manual
+Bearish mirror:
+O Anchor >15 -> X Pullback 1–5 -> O breaks Anchor low -> DBS -> SELL.
 
-NSE:
-- P&F uses CASH/EQUITY price only.
-- Universe = stocks that have active NSE FUTSTK contracts.
-- Futures are used only for OI confirmation.
-- All unique F&O stocks are scanned.
+Structural stop:
+Long = pullback O-column low.
+Short = pullback X-column high.
 
-MCX:
-- Positional: 0.25% / 3 box / daily close.
-- Intraday: daily 0.25% direction filter + 0.15% / 3 box / 1-minute entry.
-- OI is secondary.
-
-Credentials:
-- Client code and access token persist in Streamlit session state.
-- Do not put access token in GitHub.
+This replaces the previous generic Anchor/DTB logic.
