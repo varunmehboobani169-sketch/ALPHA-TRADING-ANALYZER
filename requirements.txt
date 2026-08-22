@@ -1,4 +1,5 @@
-streamlit>=1.43
-pandas>=2.2
-numpy>=1.26
-requests>=2.31
+streamlit
+pandas
+numpy
+requests
+streamlit-autorefresh

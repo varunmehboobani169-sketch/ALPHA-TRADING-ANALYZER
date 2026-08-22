@@ -1,24 +1,12 @@
-# Dhan NIFTY Streamlit Dashboard
+# ALPHA ANALYZER V11
 
-## 1. Install
-```bash
-pip install -r requirements.txt
-```
+Critical data-pipeline fixes:
+- Correctly maps Dhan's compact instrument master `SEM_SMST_SECURITY_ID`.
+- Builds the underlying symbol from `SEM_TRADING_SYMBOL` (e.g. RELIANCE-Aug2026-FUT -> RELIANCE).
+- Filters to active/future contracts and chooses the nearest expiry per underlying.
+- Handles historical timestamps defensively.
+- Adds visible NSE/MCX active-futures counts.
+- Adds Diagnostics quick-test buttons for one NSE future and one MCX future.
+- Shows actual API exceptions instead of silently hiding them.
 
-## 2. Credentials
-Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and enter your Dhan Client ID and Access Token.
-
-Do not commit or share `secrets.toml`.
-
-## 3. Run
-```bash
-streamlit run app.py
-```
-
-## What it does
-- Loads active NIFTY option expiries from DhanHQ V2.
-- Pulls the selected expiry's option chain.
-- Shows spot, ATM, PCR, ATM IV, max Call/Put OI and an initial directional interpretation.
-- Displays CE/PE LTP, OI, change in OI, volume, IV and delta.
-- Shows OI and IV charts.
-- Uses a 3-second cache for option-chain data to respect the documented Dhan request limit.
+Replace app.py and requirements.txt in GitHub. Keep the access token out of GitHub.
