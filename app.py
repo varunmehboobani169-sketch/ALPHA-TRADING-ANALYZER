@@ -809,6 +809,7 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
                 "Script": symbol,
                 "LTP": ltp,
                 "Bias": bias,
+                "Entry": p.get("entry_level", np.nan),
                 "SL": sl,
                 "Recommendation": rec,
             })
@@ -817,6 +818,7 @@ elif page in ("NSE Intraday P&F", "NSE Positional P&F"):
                 "Script": symbol,
                 "LTP": ltp,
                 "Bias": "UNAVAILABLE",
+                "Entry": np.nan,
                 "SL": np.nan,
                 "Recommendation": "DATA ERROR",
             })
@@ -976,6 +978,7 @@ elif page in ("MCX Intraday", "MCX Positional"):
                 "Script": symbol,
                 "LTP": ltp,
                 "Bias": bias,
+                "Entry": p.get("entry_level", np.nan),
                 "SL": sl,
                 "Recommendation": rec,
             })
@@ -984,6 +987,7 @@ elif page in ("MCX Intraday", "MCX Positional"):
                 "Script": symbol,
                 "LTP": ltp,
                 "Bias": "UNAVAILABLE",
+                "Entry": np.nan,
                 "SL": np.nan,
                 "Recommendation": "DATA ERROR",
             })
