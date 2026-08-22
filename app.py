@@ -107,54 +107,63 @@ def api_post(path, payload, label):
 # ----------------------------
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_instruments():
-    url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+    # Use Dhan's detailed master so derivative rows carry UNDERLYING_SECURITY_ID.
+    url = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
     df = pd.read_csv(url, low_memory=False)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Dhan compact master column names.
     aliases = {
-        "SEM_EXM_EXCH_ID": "exchange",
-        "SEM_SEGMENT": "segment_code",
+        "EXCH_ID": "exchange",
+        "SEGMENT": "segment_code",
+        "ISIN": "isin",
+        "INSTRUMENT": "instrument",
+        "UNDERLYING_SECURITY_ID": "underlying_security_id",
+        "UNDERLYING_SYMBOL": "underlying_symbol",
+        "SYMBOL_NAME": "symbol_name",
+        "DISPLAY_NAME": "custom_symbol",
+        "SEM_TRADING_SYMBOL": "trading_symbol",
+        "EXPIRY_DATE": "expiry_date",
+        "SECURITY_ID": "security_id",
         "SEM_SMST_SECURITY_ID": "security_id",
         "SEM_SECURITY_ID": "security_id",
-        "SEM_INSTRUMENT_NAME": "instrument",
-        "SEM_EXPIRY_DATE": "expiry_date",
-        "SEM_TRADING_SYMBOL": "trading_symbol",
-        "SEM_CUSTOM_SYMBOL": "custom_symbol",
-        "SM_SYMBOL_NAME": "symbol_name",
-        "SEM_STRIKE_PRICE": "strike",
-        "SEM_OPTION_TYPE": "option_type",
+        "INSTRUMENT_TYPE": "instrument_type",
+        "SEM_EXCH_INSTRUMENT_TYPE": "instrument_type",
     }
+
+    # Some detailed-master versions still expose compact-style names.
     df = df.rename(columns={c: aliases.get(c, c) for c in df.columns})
 
+    if "security_id" not in df.columns and "SM_SECURITY_ID" in df.columns:
+        df["security_id"] = df["SM_SECURITY_ID"]
+
     df["security_id"] = pd.to_numeric(df["security_id"], errors="coerce")
-    for c in ["exchange", "instrument", "trading_symbol", "custom_symbol", "symbol_name"]:
+    if "underlying_security_id" in df.columns:
+        df["underlying_security_id"] = pd.to_numeric(
+            df["underlying_security_id"], errors="coerce"
+        )
+
+    for c in [
+        "exchange", "segment_code", "instrument", "trading_symbol",
+        "custom_symbol", "symbol_name", "underlying_symbol", "instrument_type"
+    ]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.upper().str.strip()
 
     if "expiry_date" in df.columns:
         df["expiry_date"] = pd.to_datetime(df["expiry_date"], errors="coerce")
 
-    # Exclude Dhan/test symbols such as 011NSETEST, 021NSETEST, ... from every scanner.
-    text_cols = [c for c in ["trading_symbol", "custom_symbol", "symbol_name", "underlying_symbol"] if c in df.columns]
+    # Remove Dhan test instruments everywhere.
+    text_cols = [
+        c for c in [
+            "trading_symbol", "custom_symbol", "symbol_name",
+            "underlying_symbol"
+        ] if c in df.columns
+    ]
     if text_cols:
         test_mask = pd.Series(False, index=df.index)
         for c in text_cols:
-            test_mask = test_mask | df[c].astype(str).str.upper().str.contains("NSETEST", na=False)
+            test_mask |= df[c].astype(str).str.upper().str.contains("NSETEST", na=False)
         df = df.loc[~test_mask].copy()
-
-    # Reliable underlying symbol:
-    # RELIANCE-Aug2026-FUT -> RELIANCE
-    # SILVER-04Sep2026-FUT -> SILVER
-    if "trading_symbol" in df.columns:
-        df["underlying_symbol"] = (
-            df["trading_symbol"]
-            .astype(str)
-            .str.split("-", n=1)
-            .str[0]
-            .str.upper()
-            .str.strip()
-        )
 
     return df
 
@@ -847,56 +856,63 @@ def choose_rows(x, n):
     return x.head(n).reset_index(drop=True)
 
 def nse_fno_stock_universe(instruments):
-    """Return one nearest active FUTSTK + one NSE_EQ mapping per F&O underlying."""
+    """
+    Map each active NSE stock future directly to its underlying CASH security ID
+    where Dhan's detailed instrument master provides UNDERLYING_SECURITY_ID.
+    This avoids symbol-text mismatches that can cause historical cash requests
+    to fail for every stock.
+    """
     fut = nearest_fno(instruments, "NSE")
     if fut.empty:
         return pd.DataFrame()
 
     fut = fut.copy()
-    fut["underlying_symbol"] = fut["underlying_symbol"].astype(str).str.upper().str.strip()
-    fut = fut.drop_duplicates("underlying_symbol")
-
-    eq = instruments[
-        (instruments["exchange"] == "NSE") &
-        (instruments["instrument"] == "EQUITY")
-    ].copy()
-    if eq.empty:
+    if "underlying_symbol" not in fut.columns:
         return pd.DataFrame()
 
-    eq = eq.dropna(subset=["security_id"]).copy()
-    if "trading_symbol" in eq.columns:
-        eq["equity_symbol"] = eq["trading_symbol"].astype(str).str.upper().str.strip()
-    elif "symbol_name" in eq.columns:
-        eq["equity_symbol"] = eq["symbol_name"].astype(str).str.upper().str.strip()
-    else:
-        eq["equity_symbol"] = eq["underlying_symbol"].astype(str).str.upper().str.strip()
+    fut["underlying_symbol"] = fut["underlying_symbol"].astype(str).str.upper().str.strip()
+    fut = fut.dropna(subset=["security_id"]).drop_duplicates("underlying_symbol")
 
-    eq = eq.drop_duplicates("equity_symbol")
-
-    # Prefer an exact trading-symbol match. Some master rows have custom symbols;
-    # use a second normalized map as fallback.
-    eq_map = eq.set_index("equity_symbol")
     rows = []
     for _, f in fut.iterrows():
-        s = f["underlying_symbol"]
-        match = None
-        if s in eq_map.index:
-            match = eq_map.loc[s]
-        else:
-            candidates = eq[eq["equity_symbol"].str.replace("-", "", regex=False) == s.replace("-", "")]
-            if not candidates.empty:
-                match = candidates.iloc[0]
-        if match is None:
+        symbol = str(f["underlying_symbol"]).upper().strip()
+        cash_id = f.get("underlying_security_id", np.nan)
+
+        # Prefer the exact derivative->underlying ID supplied by Dhan.
+        if pd.isna(cash_id):
+            # Fallback: exact NSE cash equity trading-symbol match.
+            eq = instruments[
+                (instruments["exchange"] == "NSE") &
+                (instruments["instrument"] == "EQUITY")
+            ].copy()
+            if eq.empty:
+                continue
+
+            if "trading_symbol" in eq.columns:
+                eq["equity_symbol"] = eq["trading_symbol"].astype(str).str.upper().str.strip()
+            else:
+                eq["equity_symbol"] = eq["symbol_name"].astype(str).str.upper().str.strip()
+
+            exact = eq[eq["equity_symbol"] == symbol]
+            if exact.empty:
+                exact = eq[
+                    eq["equity_symbol"].str.replace("-EQ", "", regex=False) == symbol
+                ]
+            if exact.empty:
+                continue
+            cash_id = exact.iloc[0]["security_id"]
+
+        if pd.isna(cash_id):
             continue
 
         rows.append({
-            "Symbol": s,
-            "cash_security_id": int(match["security_id"]),
+            "Symbol": symbol,
+            "cash_security_id": int(float(cash_id)),
             "future_security_id": int(f["security_id"]),
-            "future_expiry": match.get("expiry_date", pd.NaT),
+            "future_expiry": f.get("expiry_date", pd.NaT),
         })
-    return pd.DataFrame(rows).drop_duplicates("Symbol").reset_index(drop=True) if rows else pd.DataFrame()
 
+    return pd.DataFrame(rows).drop_duplicates("Symbol").reset_index(drop=True) if rows else pd.DataFrame()
 
 def market_quote_bulk(payload, label="quote"):
     """One batched Market Quote call. Dhan permits up to 1000 instruments/request."""
@@ -1314,7 +1330,7 @@ elif mode in ("NSE Intraday P&F", "NSE Positional P&F"):
         c3.metric("Bearish", int((res["Bias"] == "Bearish").sum()))
         c4.metric("P&F entries", int(res["System"].isin(["🟢 BUY","🔴 SELL"]).sum()))
         st.caption(
-            f"Exact 3-column DTB/DBS found: {int(res['System'].isin(['🟢 BUY','🔴 SELL']).sum())}. "
+            f"Cash P&F uses the mapped underlying SECURITY ID from Dhan. Exact 3-column DTB/DBS found: {int(res['System'].isin(['🟢 BUY','🔴 SELL']).sum())}. "
             "The first column shows the total 0–3 star rating."
         )
 
@@ -1488,6 +1504,12 @@ else:
         "instrument_rows": len(instruments),
         "NSE FUTSTK contracts": int(((instruments["exchange"]=="NSE") & (instruments["instrument"]=="FUTSTK")).sum()),
         "NSE unique F&O stocks mapped to cash": len(nse_fno_stock_universe(instruments)),
+        "NSE F&O rows with underlying_security_id": int(
+            instruments[
+                (instruments["exchange"] == "NSE") &
+                (instruments["instrument"] == "FUTSTK")
+            ]["underlying_security_id"].notna().sum()
+        ) if "underlying_security_id" in instruments.columns else 0,
         "MCX FUTCOM contracts": int(((instruments["exchange"]=="MCX") & (instruments["instrument"]=="FUTCOM")).sum()),
     })
 

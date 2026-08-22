@@ -1,15 +1,13 @@
-# ALPHA ANALYZER V25 — Four-Star Model
+# ALPHA ANALYZER V26 — NSE CASH DATA FIX
 
-Exactly four visible rating slots:
+The screenshot showed DATA ERROR for every NSE stock. The likely root cause was
+mapping the futures symbol to the wrong NSE cash security ID.
 
-1. ⭐ P&F
-2. ⭐ OI
-3. ⭐ Sector/NIFTY relative-strength P&F
-4. 🟢★ New 3-column P&F pattern
+V26 fixes this by:
+- Loading Dhan's detailed instrument master.
+- Using FUTSTK `UNDERLYING_SECURITY_ID` directly as the NSE cash security ID.
+- Falling back to exact cash-symbol matching only when the underlying ID is absent.
+- Keeping NSETEST instruments excluded.
+- Retaining the existing P&F, OI, sector and star logic.
 
-New pattern:
->15-box Anchor -> 1–5 box Pullback -> 3rd column.
-
-The first three stars are normal confirmation stars. The fourth slot is specifically the green New Pattern star.
-
-P&F DTB/DBS remains the actual entry trigger.
+Diagnostics now reports how many NSE FUTSTK rows have an underlying_security_id.
