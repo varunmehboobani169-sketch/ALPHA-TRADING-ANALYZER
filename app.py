@@ -1521,7 +1521,24 @@ elif page == "Option Seller":
 
         # Dhan v2: fetch active expiries for the selected index.
         expiries = option_expiry_list_v2(index_sid)
-        selected_expiry = select_option_expiry_v2(expiries, horizon)
+
+        expiry_options = [
+            d.strftime("%d-%b-%Y") for d in expiries
+        ]
+
+        default_expiry = select_option_expiry_v2(expiries, horizon)
+        default_index = (
+            expiries.index(default_expiry)
+            if default_expiry in expiries else 0
+        )
+
+        selected_expiry_label = st.selectbox(
+            "Expiry",
+            expiry_options,
+            index=default_index,
+            key=f"expiry_{index_name}_{horizon}",
+        )
+        selected_expiry = expiries[expiry_options.index(selected_expiry_label)]
 
         # Dhan v2: fetch the selected expiry option chain.
         raw_chain = option_chain_request_v2(index_sid, selected_expiry)
@@ -1558,17 +1575,16 @@ elif page == "Option Seller":
             spot,
         )
 
-        a, b, c, d, e = st.columns(5)
+        a, b, c, d = st.columns(4)
         a.metric("Index", index_name)
         b.metric("Spot", f"{spot:,.2f}" if pd.notna(spot) else "—")
-        c.metric("Expiry", selected_expiry.strftime("%d-%b-%Y"))
-        d.metric(
+        c.metric(
             "ATM IV",
             f"{analysis['atm_iv']:.2f}%"
             if pd.notna(analysis["atm_iv"])
             else "—",
         )
-        e.metric(
+        d.metric(
             "ATM Premium",
             f"{analysis['ce_ltp'] + analysis['pe_ltp']:.2f}"
             if pd.notna(analysis["ce_ltp"]) and pd.notna(analysis["pe_ltp"])
