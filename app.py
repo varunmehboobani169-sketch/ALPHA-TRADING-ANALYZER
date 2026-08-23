@@ -1613,6 +1613,7 @@ elif page in ("Intraday", "Positional"):
     for i, (_, r) in enumerate(candidates.iterrows(), 1):
         symbol = str(r["underlying_symbol"])
         sid = int(r["underlying_security_id"])
+        fut_sid = int(r["security_id"])
         ltp = spot_map.get(sid, np.nan)
 
         try:
@@ -1694,29 +1695,22 @@ elif page in ("Intraday", "Positional"):
                 entry = p["entry"]
                 sl = p["sl"]
 
-            # F&O OI confirmation runs ONLY for positional trades.
-            # Intraday remains lightweight and does not query futures OI.
+            # ---------------------------------------------------------
+            # P&F decides the trade. OI is only an optional confirmation.
+            # A failed/unavailable OI request NEVER removes the P&F trade.
+            # ---------------------------------------------------------
+            display_symbol = symbol
+
             if mode == "Positional":
-                trade_direction = None
                 if rec == "🟢 LONG":
-                    trade_direction = "LONG"
+                    oi_conf = oi_confirmation_for_trade(fut_sid, "LONG")
+                    if oi_conf.get("state") == "LONG BUILDUP":
+                        display_symbol = f"★ {symbol}"
+
                 elif rec == "🔴 SHORT":
-                    trade_direction = "SHORT"
-
-                if trade_direction is not None:
-                    oi_conf = oi_confirmation_for_trade(
-                        sid,
-                        trade_direction,
-                    )
-
-            # A star means: valid positional P&F trade + strong OI confirmation.
-            # It does not create the trade.
-            superior = (
-                mode == "Positional"
-                and oi_conf.get("rank", 0) >= 3
-                and rec in ("🟢 LONG", "🔴 SHORT")
-            )
-            display_symbol = f"★ {symbol}" if superior else symbol
+                    oi_conf = oi_confirmation_for_trade(fut_sid, "SHORT")
+                    if oi_conf.get("state") == "SHORT BUILDUP":
+                        display_symbol = f"★ {symbol}"
 
             rows.append({
                 "Script": display_symbol,
@@ -1751,6 +1745,11 @@ elif page in ("Intraday", "Positional"):
         )
 
     prog.empty()
+
+    if mode == "Positional":
+        st.session_state["positional_oi_confirmed_count"] = int(
+            sum(1 for x in rows if str(x.get("Script", "")).startswith("★ "))
+        )
 
     res = pd.DataFrame(rows)
 
