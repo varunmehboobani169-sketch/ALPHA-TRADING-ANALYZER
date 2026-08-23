@@ -1,20 +1,9 @@
-# ALPHA ANALYZER — CLIENT-SECRET-SAFE BUILD
+# ALPHA ANALYZER — CLIENT SAFE FINAL
 
-Core calculation methodology is kept backend-only.
+Market Overview:
+- Uses the current active market structure internally.
+- A plain directional column does not automatically create a directional label.
+- Client sees only BULLISH / BEARISH / SIDEWAYS / UNAVAILABLE.
+- Presentation uses clean market cards.
 
-Client UI does not expose:
-- P&F terminology or construction rules
-- box sizes or reversal settings
-- DTB/DBS or anchor logic
-- sector confirmation calculation
-- RS ratio/construction methodology
-- internal API endpoints/security IDs
-- raw backend exception details
-
-Client sees only:
-- actionable trade/status outputs
-- generic confirmation markers
-- market/sector/relative-strength views
-- alerts and notifications
-
-All backend trading calculations remain unchanged.
+Core calculation methodology remains backend-only.

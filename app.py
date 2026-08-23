@@ -2241,16 +2241,15 @@ if auto:
 
 if page == "Market Overview":
     st.title("MARKET OVERVIEW")
-    st.caption("Current directional bias")
+    st.caption("Market Pulse")
 
     def market_bias_from_history(sec_id, segment, instrument):
         """
-        Daily close-only P&F bias:
-        - 0.25% box
-        - 3-box reversal
-        - active DTB + X => BULLISH
-        - active DBS + O => BEARISH
-        - otherwise SIDEWAYS
+        Backend-only market classification.
+
+        The active directional pattern is evaluated from the latest P&F
+        structure; a plain X/O column without an active breakout/breakdown
+        does not create a directional market bias.
         """
         try:
             h = historical(
@@ -2262,17 +2261,31 @@ if page == "Market Overview":
             if h.empty:
                 return "UNAVAILABLE"
 
-            p = analyze_new_pattern(
-                h,
-                0.0025,
-                anchor_min=0,
-                pullback_max=5,
-            )
+            cols = build_pnf(h["close"], 0.0025, 3)
 
-            if p.get("dtb") and p.get("bias") == "Bullish":
+            if len(cols) < 3:
+                return "SIDEWAYS"
+
+            c1, c2, c3 = cols[-3:]
+
+            # Active bullish pattern: X-O-X with the latest X
+            # taking out the prior X high.
+            if (
+                c1["type"] == "X"
+                and c2["type"] == "O"
+                and c3["type"] == "X"
+                and c3["high"] > c1["high"]
+            ):
                 return "BULLISH"
 
-            if p.get("dbs") and p.get("bias") == "Bearish":
+            # Active bearish pattern: O-X-O with the latest O
+            # breaking the prior O low.
+            if (
+                c1["type"] == "O"
+                and c2["type"] == "X"
+                and c3["type"] == "O"
+                and c3["low"] < c1["low"]
+            ):
                 return "BEARISH"
 
             return "SIDEWAYS"
@@ -2319,24 +2332,76 @@ if page == "Market Overview":
             "Bias": bias,
         })
 
-    cols = st.columns(5)
+    # Client-facing presentation: clean cards, no core methodology exposed.
+    card_css = """
+    <style>
+    .market-card {
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 16px;
+        padding: 16px 16px 14px 16px;
+        min-height: 112px;
+        background: linear-gradient(145deg, rgba(255,255,255,0.055), rgba(255,255,255,0.018));
+        box-shadow: 0 8px 24px rgba(0,0,0,0.16);
+        margin-bottom: 8px;
+    }
+    .market-name {
+        font-size: 0.85rem;
+        font-weight: 700;
+        opacity: 0.78;
+        margin-bottom: 12px;
+        letter-spacing: 0.02em;
+    }
+    .market-bias {
+        font-size: 1.25rem;
+        font-weight: 800;
+        letter-spacing: 0.01em;
+    }
+    .market-dot {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        margin-right: 8px;
+        vertical-align: 1px;
+    }
+    .market-sub {
+        margin-top: 7px;
+        font-size: 0.72rem;
+        opacity: 0.55;
+    }
+    </style>
+    """
+    st.markdown(card_css, unsafe_allow_html=True)
+
+    def bias_parts(bias):
+        if bias == "BULLISH":
+            return "🟢", "BULLISH", "#47d18c"
+        if bias == "BEARISH":
+            return "🔴", "BEARISH", "#ff5c69"
+        if bias == "SIDEWAYS":
+            return "🟡", "SIDEWAYS", "#ffd15c"
+        return "⚪", "UNAVAILABLE", "#a9adb7"
+
+    cols = st.columns(5, gap="medium")
 
     for col, item in zip(cols, overview):
-        bias = item["Bias"]
+        icon, label, dot_color = bias_parts(item["Bias"])
 
-        if bias == "BULLISH":
-            icon = "🟢"
-        elif bias == "BEARISH":
-            icon = "🔴"
-        elif bias == "SIDEWAYS":
-            icon = "🟡"
-        else:
-            icon = "⚪"
-
-        col.metric(
-            item["Market"],
-            f"{icon} {bias}",
-        )
+        with col:
+            st.markdown(
+                f"""
+                <div class="market-card">
+                    <div class="market-name">{item["Market"]}</div>
+                    <div class="market-bias">
+                        <span class="market-dot"
+                              style="background:{dot_color};"></span>
+                        {label}
+                    </div>
+                    <div class="market-sub">{icon} Current market state</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
     st.caption("Market information only.")
 
