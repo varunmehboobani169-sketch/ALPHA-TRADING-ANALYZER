@@ -1,18 +1,13 @@
-# ALPHA ANALYZER — DHAN STYLE OPTION CHAIN
+# ALPHA ANALYZER — OPTION SELLER WITH STRIKE SUGGESTIONS
 
-The Option Seller module now presents the option chain in a Dhan-style layout:
+The Option Seller module now provides exact strikes in addition to the strategy.
 
-CALLS (left) | STRIKE (centre) | PUTS (right)
+Examples:
+- SELL STRADDLE -> current ATM CE + ATM PE
+- SELL PUT -> highest available put strike at/below the detected support
+- SELL CALL -> lowest available call strike at/above the detected resistance
 
-Columns:
-- OI
-- Change OI
-- Volume
-- IV
-- LTP
-- Delta
+The dashboard also shows the live premium for the recommended strike(s).
 
-The ATM strike is highlighted.
-
-Dhan v2 option-chain fetching, expiry selection, IV/OI analysis and alerts
-are unchanged.
+The strategy reason remains visible to the client without exposing proprietary
+calculation details.

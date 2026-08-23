@@ -1189,6 +1189,139 @@ def speak_option_alert(message):
         height=0,
     )
 
+
+
+def option_strategy_suggestion(
+    index_name,
+    horizon,
+    recommendation,
+    spot,
+    atm,
+    expected_move,
+    support,
+    resistance,
+    atm_iv,
+    open_iv,
+    oi_alert,
+    chain_df,
+):
+    """Suggest strategy + exact option strike(s) from the live chain."""
+
+    empty = {
+        "strategy": "WAIT",
+        "reason": "Live option data is incomplete.",
+        "legs": "—",
+        "ce_strike": np.nan,
+        "pe_strike": np.nan,
+        "ce_premium": np.nan,
+        "pe_premium": np.nan,
+    }
+
+    if pd.isna(spot) or pd.isna(atm) or chain_df.empty:
+        return empty
+
+    iv_move = 0.0
+    if pd.notna(atm_iv) and pd.notna(open_iv):
+        iv_move = float(atm_iv) - float(open_iv)
+
+    if iv_move >= 2.5:
+        return {
+            **empty,
+            "strategy": "NO FRESH SELL",
+            "reason": "Implied volatility is expanding sharply; wait for stabilization.",
+        }
+
+    x = chain_df.copy()
+    x["Strike"] = pd.to_numeric(x["Strike"], errors="coerce")
+    x["LTP"] = pd.to_numeric(x["LTP"], errors="coerce")
+    x["OI"] = pd.to_numeric(x["OI"], errors="coerce")
+    x = x.dropna(subset=["Strike"])
+
+    strikes = sorted(x["Strike"].unique())
+    if not strikes:
+        return empty
+
+    # Sell STRADDLE: current ATM CE + ATM PE.
+    if recommendation == "🟢 SELL STRADDLE":
+        ce = x[(x["Side"] == "CE") & (x["Strike"] == atm)]
+        pe = x[(x["Side"] == "PE") & (x["Strike"] == atm)]
+
+        ce_p = float(ce["LTP"].iloc[-1]) if not ce.empty and pd.notna(ce["LTP"].iloc[-1]) else np.nan
+        pe_p = float(pe["LTP"].iloc[-1]) if not pe.empty and pd.notna(pe["LTP"].iloc[-1]) else np.nan
+
+        return {
+            "strategy": "SELL STRADDLE",
+            "reason": "Premium and the implied range are supportive for an ATM premium sale.",
+            "legs": f"SELL {index_name} {int(atm)} CE + {int(atm)} PE",
+            "ce_strike": atm,
+            "pe_strike": atm,
+            "ce_premium": ce_p,
+            "pe_premium": pe_p,
+        }
+
+    # Heavy call-side OI -> consider selling PUT at/below the strongest
+    # nearby put-support strike.
+    if oi_alert.get("alert") and oi_alert.get("side") == "CALL":
+        puts = x[
+            (x["Side"] == "PE")
+            & (x["Strike"] <= float(support))
+        ].copy()
+
+        if not puts.empty:
+            # Highest strike below/equal to support, so we stay just below support.
+            strike = float(puts["Strike"].max())
+            prem = float(
+                puts.loc[puts["Strike"] == strike, "LTP"].iloc[-1]
+            )
+            return {
+                "strategy": "SELL PUT",
+                "reason": "Call-side positioning is concentrated while downside support remains intact.",
+                "legs": f"SELL {index_name} {int(strike)} PE",
+                "ce_strike": np.nan,
+                "pe_strike": strike,
+                "ce_premium": np.nan,
+                "pe_premium": prem,
+            }
+
+    # Heavy put-side OI -> consider selling CALL at/above the strongest
+    # nearby call-resistance strike.
+    if oi_alert.get("alert") and oi_alert.get("side") == "PUT":
+        calls = x[
+            (x["Side"] == "CE")
+            & (x["Strike"] >= float(resistance))
+        ].copy()
+
+        if not calls.empty:
+            # Lowest strike above/equal to resistance, so we stay just above resistance.
+            strike = float(calls["Strike"].min())
+            prem = float(
+                calls.loc[calls["Strike"] == strike, "LTP"].iloc[-1]
+            )
+            return {
+                "strategy": "SELL CALL",
+                "reason": "Put-side positioning is concentrated while upside resistance remains intact.",
+                "legs": f"SELL {index_name} {int(strike)} CE",
+                "ce_strike": strike,
+                "pe_strike": np.nan,
+                "ce_premium": prem,
+                "pe_premium": np.nan,
+            }
+
+    if recommendation == "🟡 CAUTION":
+        return {
+            **empty,
+            "strategy": "WAIT",
+            "reason": "Premium exists, but the current range is not sufficiently contained.",
+        }
+
+    return {
+        **empty,
+        "strategy": "WAIT",
+        "reason": "Current conditions do not justify a fresh premium-selling position.",
+    }
+
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -1208,12 +1341,22 @@ except Exception as e:
 if auto:
     try:
         from streamlit_autorefresh import st_autorefresh
-        mins = 1 if page == "Intraday" else 15
+        if page == "Intraday":
+            mins = 1
+        elif page == "Option Seller":
+            mins = 1 if st.session_state.get("option_horizon", "Intraday") == "Intraday" else 3
+        else:
+            mins = 15
         if page == "Market Overview":
             mins = 3
         st_autorefresh(interval=mins * 60 * 1000, key=f"refresh_{page}")
         if page == "Intraday":
             st.caption("Live intraday monitor — updates every minute.")
+        elif page == "Option Seller":
+            st.caption(
+                "Live option monitor — "
+                + ("updates every minute." if mins == 1 else "updates every 3 minutes.")
+            )
     except Exception:
         pass
 
@@ -1575,6 +1718,21 @@ elif page == "Option Seller":
             spot,
         )
 
+        strategy_name, strategy_reason, strategy_legs = option_strategy_suggestion(
+            index_name=index_name,
+            horizon=horizon,
+            recommendation=analysis["recommendation"],
+            spot=spot,
+            atm=analysis["atm"],
+            expected_move=analysis["expected_move"],
+            support=analysis["support"],
+            resistance=analysis["resistance"],
+            atm_iv=analysis["atm_iv"],
+            open_iv=session_state["open_iv"],
+            oi_alert=oi_risk,
+            chain_df=chain_df,
+        )
+
         a, b, c, d = st.columns(4)
         a.metric("Index", index_name)
         b.metric("Spot", f"{spot:,.2f}" if pd.notna(spot) else "—")
@@ -1604,6 +1762,63 @@ elif page == "Option Seller":
             st.warning("Wait for better conditions.")
         else:
             st.error("Do not sell under current conditions.")
+
+        st.markdown("### Strategy Suggestion")
+        if strategy_name in ("SELL STRADDLE", "SELL PUT", "SELL CALL"):
+            st.success(f"{strategy_name}: {strategy_legs}")
+        elif strategy_name == "NO FRESH SELL":
+            st.error(strategy_reason)
+        else:
+            st.warning(f"{strategy_name}: {strategy_reason}")
+
+        st.caption(f"Why: {strategy_reason}")
+
+        st.markdown("### Suggested Strike")
+        if strategy_name == "SELL STRADDLE":
+            s1, s2, s3 = st.columns(3)
+            s1.metric(
+                "CE Strike",
+                int(strategy["ce_strike"]) if pd.notna(strategy["ce_strike"]) else "—",
+            )
+            s2.metric(
+                "PE Strike",
+                int(strategy["pe_strike"]) if pd.notna(strategy["pe_strike"]) else "—",
+            )
+            s3.metric(
+                "Combined Premium",
+                (
+                    f"{strategy['ce_premium'] + strategy['pe_premium']:.2f}"
+                    if pd.notna(strategy["ce_premium"])
+                    and pd.notna(strategy["pe_premium"])
+                    else "—"
+                ),
+            )
+        elif strategy_name == "SELL PUT":
+            s1, s2 = st.columns(2)
+            s1.metric(
+                "PE Strike",
+                int(strategy["pe_strike"]) if pd.notna(strategy["pe_strike"]) else "—",
+            )
+            s2.metric(
+                "PE Premium",
+                f"{strategy['pe_premium']:.2f}"
+                if pd.notna(strategy["pe_premium"])
+                else "—",
+            )
+        elif strategy_name == "SELL CALL":
+            s1, s2 = st.columns(2)
+            s1.metric(
+                "CE Strike",
+                int(strategy["ce_strike"]) if pd.notna(strategy["ce_strike"]) else "—",
+            )
+            s2.metric(
+                "CE Premium",
+                f"{strategy['ce_premium']:.2f}"
+                if pd.notna(strategy["ce_premium"])
+                else "—",
+            )
+        else:
+            st.info("No specific strike is recommended right now.")
 
         r1, r2, r3, r4 = st.columns(4)
         r1.metric(
