@@ -1,24 +1,39 @@
-# ALPHA ANALYZER — CLIENT INTRADAY ANCHOR BUILD
+# ALPHA ANALYZER — GITHUB DEPLOY BUILD
 
-Intraday eligibility is now:
+Main entry point:
+- app.py
 
-1. Daily cash/spot close data.
-2. 0.25% box size.
-3. 3-box reversal.
-4. The latest completed daily column itself must be an Anchor with >15 boxes.
-   - X column >15 boxes = Bullish intraday candidate.
-   - O column >15 boxes = Bearish intraday candidate.
-5. Stocks without such a qualifying Anchor are NOT scanned intraday.
-6. The eligible universe is built once per trading day and reused on each 1-minute refresh.
-7. Intraday scan:
-   - 0.15% box
-   - 3-box reversal
-   - completed 1-minute closes
-   - BUY only when bullish daily candidate + intraday BUY setup + price above 10-period trend filter
-   - SELL only when bearish daily candidate + intraday SELL setup + price below 10-period trend filter
+Required:
+- requirements.txt
 
-No OI or sector filter is used.
+Client-facing modules:
+1. Option Seller
+2. Intraday
+3. Positional
+4. Market Overview
 
-Client-facing UI remains methodology-safe.
-MCX remains removed.
-Option Seller remains available.
+MCX is not exposed in the client navigation.
+
+POSitional trade logic:
+- Active DTB + latest X = LONG
+- Active DBS + latest O = SHORT
+- Anything else = Sideways / No Position
+- Active LONG rows are highlighted green
+- Active SHORT rows are highlighted red
+- Entry and SL are shown
+
+Intraday:
+- Daily eligibility is built once per trading day.
+- Only instruments passing the daily eligibility gate are scanned intraday.
+- Intraday signals are shown with Entry and SL.
+
+Option Seller:
+- NIFTY
+- BANKNIFTY
+- SENSEX
+- Intraday / Positional
+- recommendation, ATM, premium, IV, expected range,
+  support/resistance and option-chain monitor.
+
+Deploy with Streamlit using:
+app.py

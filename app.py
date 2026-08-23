@@ -694,6 +694,99 @@ def daily_running_pnf_bias(sec_id):
         return "UNAVAILABLE"
 
 
+
+
+def positional_active_pattern(sec_id):
+    """
+    STRICT positional classification.
+
+    Bullish ONLY if:
+      latest 3 completed daily columns are X-O-X
+      AND the latest X breaks the prior X high -> ACTIVE DTB.
+
+    Bearish ONLY if:
+      latest 3 completed daily columns are O-X-O
+      AND the latest O breaks the prior O low -> ACTIVE DBS.
+
+    Everything else = SIDEWAYS / NO POSITION.
+
+    Entry:
+      DTB = prior X high
+      DBS = prior O low
+
+    SL:
+      DTB = pullback O low
+      DBS = pullback X high
+    """
+    result = {
+        "bias": "Sideways",
+        "recommendation": "NO POSITION",
+        "entry": np.nan,
+        "sl": np.nan,
+        "active_dtb": False,
+        "active_dbs": False,
+        "pattern": "Sideways",
+        "reason": "No active directional breakout",
+    }
+
+    try:
+        h = cached_cash_daily(sec_id)
+        if h.empty:
+            result["reason"] = "No daily data"
+            return result
+
+        cols = build_pnf(h["close"], 0.0025, 3)
+
+        if len(cols) < 3:
+            result["reason"] = "No completed 3-column structure"
+            return result
+
+        c1, c2, c3 = cols[-3:]
+
+        # Active bullish pattern: X -> O -> X and new X breaks
+        # the high of the prior X column.
+        if c1["type"] == "X" and c2["type"] == "O" and c3["type"] == "X":
+            if c3["high"] > c1["high"]:
+                result.update({
+                    "bias": "Bullish",
+                    "recommendation": "🟢 LONG",
+                    "entry": float(c1["high"]),
+                    "sl": float(c2["low"]),
+                    "active_dtb": True,
+                    "pattern": "DTB",
+                    "reason": "Active DTB with latest column X",
+                })
+                return result
+
+            result["reason"] = "X-O-X present, but Anchor high not broken"
+            return result
+
+        # Active bearish pattern: O -> X -> O and new O breaks
+        # the low of the prior O column.
+        if c1["type"] == "O" and c2["type"] == "X" and c3["type"] == "O":
+            if c3["low"] < c1["low"]:
+                result.update({
+                    "bias": "Bearish",
+                    "recommendation": "🔴 SHORT",
+                    "entry": float(c1["low"]),
+                    "sl": float(c2["high"]),
+                    "active_dbs": True,
+                    "pattern": "DBS",
+                    "reason": "Active DBS with latest column O",
+                })
+                return result
+
+            result["reason"] = "O-X-O present, but Anchor low not broken"
+            return result
+
+        result["reason"] = f"No active DTB/DBS in {c1['type']}-{c2['type']}-{c3['type']}"
+        return result
+
+    except Exception as exc:
+        result["reason"] = f"Pattern data error: {str(exc)[:120]}"
+        return result
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -739,75 +832,111 @@ if page == "Market Overview":
             st.error(f"Spot LTP test: {e}")
 
 elif page in ("Intraday", "Positional"):
-    mode = "Intraday" if page == "NSE Intraday P&F" else "Positional"
-    st.title("Intraday" if mode == "Intraday" else "Positional")
+    mode = page
+    st.title(mode)
+    st.caption("Live trade monitor.")
 
     fut = future_universe(master, "NSE")
     if fut.empty:
-        st.error("No NSE FUTSTK universe found.")
+        st.error("No NSE F&O instruments available.")
         st.stop()
 
-    if mode == "Positional":
-        st.caption(
-            "Positional bias: cash/spot P&F | 0.25% box | 3-box reversal | daily close."
-        )
-        candidates = fut.copy()
-    else:
-        st.caption("Live intraday opportunity monitor.")
-
-        # Build the positional bias once per trading day and reuse it on every
-        # 1-minute refresh.
+    # ---------------------------------------------------------
+    # INTRADAY: daily Anchor eligibility is calculated once/day
+    # ---------------------------------------------------------
+    if mode == "Intraday":
         if "intraday_daily_filter" not in st.session_state:
             st.session_state.intraday_daily_filter = {}
         if "intraday_filter_date" not in st.session_state:
             st.session_state.intraday_filter_date = None
 
         today = datetime.now().date().isoformat()
+
         if (
             st.session_state.intraday_filter_date != today
             or not st.session_state.intraday_daily_filter
         ):
-            bias_map = {}
-            prog = st.progress(0, text=f"Building positional bias for {len(fut)} stocks...")
+            eligible = {}
+
+            prog = st.progress(
+                0,
+                text=f"Building today's opportunity universe: {len(fut)} instruments..."
+            )
+
             for i, (_, r) in enumerate(fut.iterrows(), 1):
-                bias_map[str(r["underlying_symbol"])] = daily_running_pnf_bias(
-                    int(r["underlying_security_id"])
+                try:
+                    h = cached_cash_daily(int(r["underlying_security_id"]))
+                    cols = build_pnf(h["close"], 0.0025, 3)
+
+                    if cols:
+                        last = cols[-1]
+
+                        if last["type"] == "X" and last["boxes"] > 15:
+                            eligible[str(r["underlying_symbol"])] = "Bullish"
+                        elif last["type"] == "O" and last["boxes"] > 15:
+                            eligible[str(r["underlying_symbol"])] = "Bearish"
+                        else:
+                            eligible[str(r["underlying_symbol"])] = None
+                    else:
+                        eligible[str(r["underlying_symbol"])] = None
+
+                except Exception:
+                    eligible[str(r["underlying_symbol"])] = None
+
+                prog.progress(
+                    i / max(len(fut), 1),
+                    text=f"Universe {i}/{len(fut)}"
                 )
-                prog.progress(i / max(len(fut), 1), text=f"Daily bias {i}/{len(fut)}")
+
             prog.empty()
 
-            st.session_state.intraday_daily_filter = {
-                symbol: {"bias": bias}
-                for symbol, bias in bias_map.items()
-            }
+            st.session_state.intraday_daily_filter = eligible
             st.session_state.intraday_filter_date = today
 
         daily_map = st.session_state.intraday_daily_filter
 
         allowed_symbols = {
             symbol
-            for symbol, info in daily_map.items()
-            if info["bias"] in ("Bullish", "Bearish")
+            for symbol, bias in daily_map.items()
+            if bias in ("Bullish", "Bearish")
         }
+
         candidates = fut[
             fut["underlying_symbol"].isin(allowed_symbols)
         ].copy()
 
-        st.info(f"{len(candidates)} instruments currently eligible for intraday monitoring.")
+        st.info(
+            f"{len(candidates)} instruments currently eligible for intraday monitoring."
+        )
 
-        if st.button("Refresh Eligible Universe", key="rebuild_positional_bias"):
+        if st.button(
+            "Refresh Eligible Universe",
+            key="refresh_intraday_universe"
+        ):
             st.session_state.intraday_daily_filter = {}
             st.session_state.intraday_filter_date = None
             st.rerun()
+
+    # ---------------------------------------------------------
+    # POSITIONAL: show the currently running daily direction
+    # ---------------------------------------------------------
+    else:
+        candidates = fut.copy()
 
     ids = (
         candidates["underlying_security_id"].astype(int).tolist()
         if not candidates.empty else []
     )
+
     spot_map = batch_ltp("NSE_EQ", ids) if ids else {}
 
     rows = []
-    prog = st.progress(0, text=f"Scanning {len(candidates)} NSE stocks...")
+
+    prog = st.progress(
+        0,
+        text=f"Scanning {len(candidates)} instruments..."
+    )
+
     for i, (_, r) in enumerate(candidates.iterrows(), 1):
         symbol = str(r["underlying_symbol"])
         sid = int(r["underlying_security_id"])
@@ -815,9 +944,9 @@ elif page in ("Intraday", "Positional"):
 
         try:
             if mode == "Intraday":
+                # Only eligible stocks reach this point.
                 h = cached_cash_intraday(sid)
 
-                # Intraday P&F only: 0.15% box, 3-box reversal, 1-minute closes.
                 ip = analyze_new_pattern(
                     h,
                     0.0015,
@@ -825,47 +954,49 @@ elif page in ("Intraday", "Positional"):
                     pullback_max=5,
                 )
 
-                positional_bias = daily_map[symbol]["bias"]
-                sma10 = intraday_sma10(h)
+                positional_bias = daily_map[symbol]
 
-                above_sma = (
+                above_trend = (
                     pd.notna(ltp)
-                    and pd.notna(sma10)
-                    and float(ltp) > float(sma10)
+                    and pd.notna(intraday_sma10(h))
+                    and float(ltp) > float(intraday_sma10(h))
                 )
-                below_sma = (
+                below_trend = (
                     pd.notna(ltp)
-                    and pd.notna(sma10)
-                    and float(ltp) < float(sma10)
+                    and pd.notna(intraday_sma10(h))
+                    and float(ltp) < float(intraday_sma10(h))
                 )
 
-                # Entry must align with the 0.25% daily positional bias.
                 if (
                     positional_bias == "Bullish"
                     and ip["dtb"]
-                    and above_sma
+                    and above_trend
                 ):
                     rec = "🟢 BUY"
+
                 elif (
                     positional_bias == "Bearish"
                     and ip["dbs"]
-                    and below_sma
+                    and below_trend
                 ):
                     rec = "🔴 SELL"
+
                 elif (
                     positional_bias == "Bullish"
                     and ip["prospective"]
                     and ip["bias"] == "Bullish"
-                    and above_sma
+                    and above_trend
                 ):
                     rec = "🟡 SETUP"
+
                 elif (
                     positional_bias == "Bearish"
                     and ip["prospective"]
                     and ip["bias"] == "Bearish"
-                    and below_sma
+                    and below_trend
                 ):
                     rec = "🟡 SETUP"
+
                 else:
                     rec = "NO TRADE"
 
@@ -874,34 +1005,19 @@ elif page in ("Intraday", "Positional"):
                 sl = ip.get("sl", np.nan)
 
             else:
-                h = cached_cash_daily(sid)
+                # Positional = ACTIVE DTB/DBS only.
+                p = positional_active_pattern(sid)
 
-                # Positional display uses the running daily P&F direction.
-                pp = analyze_new_pattern(
-                    h,
-                    0.0025,
-                    anchor_min=15,
-                    pullback_max=5,
-                )
-                cols = build_pnf(h["close"], 0.0025, 3)
-
-                if cols and cols[-1]["type"] == "X":
-                    bias = "Bullish"
-                    rec = "🟢 LONG"
-                elif cols and cols[-1]["type"] == "O":
-                    bias = "Bearish"
-                    rec = "🔴 SHORT"
-                else:
-                    bias = "UNAVAILABLE"
-                    rec = "NO TRADE"
-
-                entry = pp.get("entry_level", np.nan)
-                sl = pp.get("sl", np.nan)
+                bias = p["bias"]
+                rec = p["recommendation"]
+                entry = p["entry"]
+                sl = p["sl"]
 
             rows.append({
                 "Script": symbol,
                 "LTP": ltp,
                 "Bias": bias,
+                "Pattern": p.get("pattern", "—") if mode == "Positional" else "—",
                 "Entry": entry,
                 "SL": sl,
                 "Recommendation": rec,
@@ -921,6 +1037,7 @@ elif page in ("Intraday", "Positional"):
             i / max(len(candidates), 1),
             text=f"Scanning {i}/{max(len(candidates), 1)}"
         )
+
     prog.empty()
 
     res = pd.DataFrame(rows)
@@ -929,44 +1046,56 @@ elif page in ("Intraday", "Positional"):
         long_df = res[res["Recommendation"] == "🟢 BUY"].copy()
         short_df = res[res["Recommendation"] == "🔴 SELL"].copy()
         setup_df = res[res["Recommendation"] == "🟡 SETUP"].copy()
-        title = "Intraday Trade Recommendations"
     else:
         long_df = res[res["Recommendation"] == "🟢 LONG"].copy()
         short_df = res[res["Recommendation"] == "🔴 SHORT"].copy()
         setup_df = res[res["Recommendation"] == "🟡 SETUP"].copy()
-        title = "Positional Running Trades"
 
-    st.subheader(title)
+    def active_trade_style(row):
+        rec = str(row.get("Recommendation", ""))
+        if rec == "🟢 LONG":
+            return ["background-color: #d9f2d9; color: #0b5d1e; font-weight: 700"] * len(row)
+        if rec == "🔴 SHORT":
+            return ["background-color: #f8d7da; color: #8a1c1c; font-weight: 700"] * len(row)
+        return [""] * len(row)
 
     st.markdown("## 🟢 BULLISH / LONG")
     if long_df.empty:
-        st.info("No bullish/long trades currently.")
+        st.info("No active bullish positions currently.")
     else:
         st.dataframe(
-            long_df[["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]],
+            long_df[
+                ["Script", "LTP", "Bias", "Pattern", "Entry", "SL", "Recommendation"]
+            ].style.apply(active_trade_style, axis=1),
             use_container_width=True,
             hide_index=True,
         )
 
     st.markdown("## 🔴 BEARISH / SHORT")
     if short_df.empty:
-        st.info("No bearish/short trades currently.")
+        st.info("No active bearish positions currently.")
     else:
         st.dataframe(
-            short_df[["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]],
+            short_df[
+                ["Script", "LTP", "Bias", "Pattern", "Entry", "SL", "Recommendation"]
+            ].style.apply(active_trade_style, axis=1),
             use_container_width=True,
             hide_index=True,
         )
 
-    st.markdown("## 🟡 SETUPS FORMING")
-    if setup_df.empty:
-        st.info("No setups forming currently.")
+    st.markdown("## ⚪ SIDEWAYS / NO ACTIVE PATTERN")
+    sideways_df = res[res["Recommendation"] == "NO POSITION"].copy()
+    if sideways_df.empty:
+        st.info("No sideways instruments currently.")
     else:
         st.dataframe(
-            setup_df[["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]],
+            sideways_df[
+                ["Script", "LTP", "Bias", "Pattern", "Entry", "SL", "Recommendation"]
+            ],
             use_container_width=True,
             hide_index=True,
         )
+
 
 elif page == "Option Seller":
     st.title("OPTION SELLER")
