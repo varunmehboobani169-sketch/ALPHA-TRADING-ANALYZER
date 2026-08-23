@@ -1550,7 +1550,7 @@ elif page == "Option Seller":
         # The option chain's data.last_price also contains underlying LTP,
         # but batch LTP is used as a second independent quote.
         try:
-            spot_map = batch_ltp("NSE_IDX", [index_sid])
+            spot_map = batch_ltp("IDX_I", [index_sid])
         except Exception:
             spot_map = {}
 
@@ -1737,12 +1737,13 @@ elif page == "Option Seller":
             hide_index=True,
         )
 
-    except Exception:
+    except Exception as exc:
         st.error("Option data is currently unavailable.")
         with st.expander("Data status"):
-            st.info(
-                "Check Dhan data access, active index permissions, and the selected expiry."
+            st.warning(
+                "The option data request was rejected or returned no usable data."
             )
+            st.code(str(exc), language="text")
 
 
 else:

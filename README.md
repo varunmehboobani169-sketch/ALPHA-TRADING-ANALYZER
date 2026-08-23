@@ -1,33 +1,21 @@
-# ALPHA ANALYZER — DHAN V2 OPTION SELLER
+# ALPHA ANALYZER — DHAN V2 OPTION SELLER V3
 
-DhanHQ v2-compliant option-selling module.
+Fixes the live Option Seller data path.
 
-Verified against the official Dhan v2 docs:
-- `/optionchain`
-- `/optionchain/expirylist`
-- `IDX_I` as the Index Value segment
-- `UnderlyingScrip` resolved from the instrument master
-- `Expiry` selected from the active expiry list
-- `previous_oi` used to calculate current OI change
-- 3-second option-chain request cache
+Critical correction:
+- Index LTP request uses `IDX_I`, the documented Dhan Index Value segment,
+  instead of `NSE_IDX`.
 
-Client functions:
-- NIFTY
-- BANKNIFTY
-- SENSEX
-- Intraday / Positional
-- Current ATM straddle recommendation
-- Current ATM IV
-- Session-opening IV baseline
-- Expected range
-- OI support/resistance
-- One-sided OI buildup alert
-- Intraday IV expansion alert
-- Spoken option alert on new risk state
-- Full option-chain view
+The option-chain flow remains:
+Index Security ID -> expiry list -> selected expiry -> option chain.
 
-Important:
-The opening IV shown is the first successful observation after market open
-within the active Streamlit session. The Dhan Option Chain response provides
-current IV and previous-day option price/OI, but does not expose previous-day
-IV directly.
+The data-status expander now shows the exact API/data error, which makes any
+remaining Dhan entitlement or instrument-resolution issue directly visible.
+
+Client modules remain:
+- Option Seller
+- Intraday
+- Positional
+- Market Overview
+
+MCX remains excluded from the client navigation.
