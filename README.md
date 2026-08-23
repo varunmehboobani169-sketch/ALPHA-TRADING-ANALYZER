@@ -1,17 +1,24 @@
-# ALPHA ANALYZER V20 — Entry Display Fix
+# ALPHA ANALYZER — CLIENT INTRADAY ANCHOR BUILD
 
-The previous version calculated Entry correctly but did not include the Entry
-column in the Long/Short/Setup dashboard display.
+Intraday eligibility is now:
 
-V20 fixes this.
+1. Daily cash/spot close data.
+2. 0.25% box size.
+3. 3-box reversal.
+4. The latest completed daily column itself must be an Anchor with >15 boxes.
+   - X column >15 boxes = Bullish intraday candidate.
+   - O column >15 boxes = Bearish intraday candidate.
+5. Stocks without such a qualifying Anchor are NOT scanned intraday.
+6. The eligible universe is built once per trading day and reused on each 1-minute refresh.
+7. Intraday scan:
+   - 0.15% box
+   - 3-box reversal
+   - completed 1-minute closes
+   - BUY only when bullish daily candidate + intraday BUY setup + price above 10-period trend filter
+   - SELL only when bearish daily candidate + intraday SELL setup + price below 10-period trend filter
 
-Every NSE and MCX dashboard now shows:
-Script | LTP | Bias | Entry | SL | Recommendation
+No OI or sector filter is used.
 
-Entry:
-- DTB / bullish setup = Anchor high
-- DBS / bearish setup = Anchor low
-
-SL:
-- Existing P&F structural stop
-- Fallback to previous opposite P&F column extreme when needed
+Client-facing UI remains methodology-safe.
+MCX remains removed.
+Option Seller remains available.

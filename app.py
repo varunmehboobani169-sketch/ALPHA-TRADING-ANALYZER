@@ -8,7 +8,6 @@ import requests
 import streamlit as st
 
 st.set_page_config(page_title="ALPHA ANALYZER", page_icon="α", layout="wide")
-CLIENT_BUILD = "CLIENT-V6-4MODULE-OPTION-SELLER"
 
 API = "https://api.dhan.co/v2"
 
@@ -662,26 +661,34 @@ def get_morning_daily_filter(fut):
 
 
 
+
 def daily_running_pnf_bias(sec_id):
     """
-    Positional bias for intraday:
-    0.25% box, 3-box reversal, daily closes.
-    Latest completed X column = Bullish.
-    Latest completed O column = Bearish.
-    No Anchor-size requirement for the bias itself.
+    Intraday eligibility gate:
+    - Daily close-only data
+    - 0.25% box
+    - 3-box reversal
+    - Latest completed daily column must itself be an Anchor >15 boxes.
+      X >15 boxes = Bullish candidate.
+      O >15 boxes = Bearish candidate.
     """
     try:
         h = cached_cash_daily(sec_id)
         if h.empty:
             return "UNAVAILABLE"
+
         cols = build_pnf(h["close"], 0.0025, 3)
         if not cols:
             return "UNAVAILABLE"
+
         last = cols[-1]
-        if last["type"] == "X":
+
+        if last["type"] == "X" and last["boxes"] > 15:
             return "Bullish"
-        if last["type"] == "O":
+
+        if last["type"] == "O" and last["boxes"] > 15:
             return "Bearish"
+
         return "UNAVAILABLE"
     except Exception:
         return "UNAVAILABLE"
@@ -746,7 +753,7 @@ elif page in ("Intraday", "Positional"):
         )
         candidates = fut.copy()
     else:
-        st.caption("Live intraday trade monitor.")
+        st.caption("Live intraday opportunity monitor.")
 
         # Build the positional bias once per trading day and reuse it on every
         # 1-minute refresh.
@@ -786,9 +793,9 @@ elif page in ("Intraday", "Positional"):
             fut["underlying_symbol"].isin(allowed_symbols)
         ].copy()
 
-        st.info(f"{len(candidates)} instruments currently under monitoring.")
+        st.info(f"{len(candidates)} instruments currently eligible for intraday monitoring.")
 
-        if st.button("Refresh Universe", key="rebuild_positional_bias"):
+        if st.button("Refresh Eligible Universe", key="rebuild_positional_bias"):
             st.session_state.intraday_daily_filter = {}
             st.session_state.intraday_filter_date = None
             st.rerun()
