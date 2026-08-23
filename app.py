@@ -1694,20 +1694,32 @@ elif page in ("Intraday", "Positional"):
                 entry = p["entry"]
                 sl = p["sl"]
 
-            trade_direction = None
-            if rec in ("🟢 BUY", "🟢 LONG"):
-                trade_direction = "LONG"
-            elif rec in ("🔴 SELL", "🔴 SHORT"):
-                trade_direction = "SHORT"
+            # F&O OI confirmation runs ONLY for positional trades.
+            # Intraday remains lightweight and does not query futures OI.
+            if mode == "Positional":
+                trade_direction = None
+                if rec == "🟢 LONG":
+                    trade_direction = "LONG"
+                elif rec == "🔴 SHORT":
+                    trade_direction = "SHORT"
 
-            if trade_direction is not None:
-                oi_conf = oi_confirmation_for_trade(
-                    sid,
-                    trade_direction,
-                )
+                if trade_direction is not None:
+                    oi_conf = oi_confirmation_for_trade(
+                        sid,
+                        trade_direction,
+                    )
+
+            # A star means: valid positional P&F trade + strong OI confirmation.
+            # It does not create the trade.
+            superior = (
+                mode == "Positional"
+                and oi_conf.get("rank", 0) >= 3
+                and rec in ("🟢 LONG", "🔴 SHORT")
+            )
+            display_symbol = f"★ {symbol}" if superior else symbol
 
             rows.append({
-                "Script": symbol,
+                "Script": display_symbol,
                 "LTP": ltp,
                 "Bias": bias,
                 "Pattern": p.get("pattern", "—") if mode == "Positional" else "—",
@@ -1779,6 +1791,9 @@ elif page in ("Intraday", "Positional"):
             pass
 
         return styles
+
+    if mode == "Positional":
+        st.caption("★ marks a higher-conviction positional trade.")
 
     st.markdown("## 🟢 BULLISH / LONG")
     if long_df.empty:
