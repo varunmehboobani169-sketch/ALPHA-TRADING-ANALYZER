@@ -1,21 +1,32 @@
-# ALPHA ANALYZER — DHAN V2 OPTION SELLER V3
+# ALPHA ANALYZER — DHAN V2 OPTION SELLER V4
 
-Fixes the live Option Seller data path.
+Dhan v2 verified index handling:
 
-Critical correction:
-- Index LTP request uses `IDX_I`, the documented Dhan Index Value segment,
-  instead of `NSE_IDX`.
+NIFTY = Security ID 13
+BANKNIFTY = Security ID 25
+SENSEX = Security ID 51
 
-The option-chain flow remains:
-Index Security ID -> expiry list -> selected expiry -> option chain.
+Underlying segment:
+IDX_I
 
-The data-status expander now shows the exact API/data error, which makes any
-remaining Dhan entitlement or instrument-resolution issue directly visible.
+Option-chain flow:
+1. Select the documented underlying Security ID.
+2. Get active expiries from /optionchain/expirylist.
+3. Choose the expiry based on Intraday / Positional.
+4. Get /optionchain for that expiry.
+5. Use the documented option-chain `last_price` as the underlying spot.
 
-Client modules remain:
-- Option Seller
-- Intraday
-- Positional
-- Market Overview
+OI:
+Change OI = `oi - previous_oi`.
 
-MCX remains excluded from the client navigation.
+The client module also shows:
+- ATM premium
+- ATM IV
+- expected range
+- OI support/resistance
+- volatility risk alert
+- one-sided OI buildup alert
+- spoken option alert
+- option-chain details
+
+MCX remains removed from the client dashboard.

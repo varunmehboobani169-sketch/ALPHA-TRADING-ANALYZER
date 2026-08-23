@@ -798,51 +798,24 @@ INDEX_NAMES = ["NIFTY", "BANKNIFTY", "SENSEX"]
 
 
 def resolve_index_instrument(master, index_name):
-    """Resolve the Dhan Index Value Security ID dynamically."""
-    x = master.copy()
+    """
+    Dhan-documented Index Security IDs:
+      NIFTY    = 13
+      BANKNIFTY = 25
+      SENSEX   = 51
+    Dhan uses IDX_I for Index Value.
+    """
+    ids = {
+        "NIFTY": 13,
+        "BANKNIFTY": 25,
+        "SENSEX": 51,
+    }
 
-    if "segment" in x.columns:
-        x = x[x["segment"].astype(str).str.upper().eq("IDX_I")].copy()
-    if "instrument" in x.columns:
-        x = x[x["instrument"].astype(str).str.upper().eq("INDEX")].copy()
+    key = str(index_name).upper().strip()
+    if key not in ids:
+        raise RuntimeError(f"Unsupported index: {index_name}")
 
-    if x.empty:
-        raise RuntimeError(f"Index instrument not found for {index_name}")
-
-    candidates = []
-    for c in ["underlying_symbol", "symbol_name", "display_name", "trading_symbol"]:
-        if c in x.columns:
-            vals = x[c].astype(str).str.upper().str.strip()
-            candidates.append(vals)
-
-    target = index_name.upper()
-    mask = pd.Series(False, index=x.index)
-
-    for vals in candidates:
-        mask |= vals.eq(target)
-        if target == "NIFTY":
-            mask |= vals.isin(["NIFTY 50", "NIFTY50"])
-        elif target == "BANKNIFTY":
-            mask |= vals.isin(["NIFTY BANK", "NIFTYBANK", "BANK NIFTY"])
-        elif target == "SENSEX":
-            mask |= vals.isin(["SENSEX", "BSE SENSEX"])
-
-    y = x[mask].copy()
-
-    if y.empty:
-        mask = pd.Series(False, index=x.index)
-        for vals in candidates:
-            mask |= vals.str.contains(target, regex=False, na=False)
-        y = x[mask].copy()
-
-    if y.empty:
-        raise RuntimeError(f"Could not resolve Security ID for {index_name}")
-
-    sid = pd.to_numeric(y["security_id"], errors="coerce").dropna()
-    if sid.empty:
-        raise RuntimeError(f"No valid Security ID for {index_name}")
-
-    return int(sid.iloc[0])
+    return ids[key]
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1546,29 +1519,23 @@ elif page == "Option Seller":
     try:
         index_sid = resolve_index_instrument(master, index_name)
 
-        # Dhan v2 uses IDX_I for Index Value.
-        # The option chain's data.last_price also contains underlying LTP,
-        # but batch LTP is used as a second independent quote.
-        try:
-            spot_map = batch_ltp("IDX_I", [index_sid])
-        except Exception:
-            spot_map = {}
-
-        spot = pd.to_numeric(
-            spot_map.get(index_sid, np.nan),
-            errors="coerce",
-        )
-
+        # Dhan v2: fetch active expiries for the selected index.
         expiries = option_expiry_list_v2(index_sid)
         selected_expiry = select_option_expiry_v2(expiries, horizon)
 
+        # Dhan v2: fetch the selected expiry option chain.
         raw_chain = option_chain_request_v2(index_sid, selected_expiry)
         raw_data = parse_data(raw_chain)
 
-        if pd.isna(spot) and isinstance(raw_data, dict):
-            spot = pd.to_numeric(raw_data.get("last_price"), errors="coerce")
+        # Dhan option-chain response contains the underlying last_price.
+        spot = (
+            pd.to_numeric(raw_data.get("last_price"), errors="coerce")
+            if isinstance(raw_data, dict)
+            else np.nan
+        )
 
         chain_df = parse_option_chain_v2(raw_chain)
+
         analysis = option_seller_analysis_v2(
             chain_df,
             spot,
@@ -1591,7 +1558,6 @@ elif page == "Option Seller":
             spot,
         )
 
-        # Dashboard
         a, b, c, d, e = st.columns(5)
         a.metric("Index", index_name)
         b.metric("Spot", f"{spot:,.2f}" if pd.notna(spot) else "—")
@@ -1662,14 +1628,12 @@ elif page == "Option Seller":
                 "Message": oi_risk["text"],
             },
         ])
-
         st.dataframe(
             risk_df,
             use_container_width=True,
             hide_index=True,
         )
 
-        # Spoken alert only on state transition.
         if "option_alert_states" not in st.session_state:
             st.session_state.option_alert_states = {}
 
@@ -1678,7 +1642,6 @@ elif page == "Option Seller":
             alert_key,
             {"iv": False, "oi": False},
         )
-
         new_state = {
             "iv": bool(iv_risk["alert"]),
             "oi": bool(oi_risk["alert"]),
@@ -1699,21 +1662,19 @@ elif page == "Option Seller":
 
         st.markdown("### Selected Straddle")
         st.dataframe(
-            pd.DataFrame([
-                {
-                    "Index": index_name,
-                    "Expiry": selected_expiry.strftime("%d-%b-%Y"),
-                    "Call Strike": int(analysis["atm"]) if pd.notna(analysis["atm"]) else "—",
-                    "Call Premium": analysis["ce_ltp"],
-                    "Put Strike": int(analysis["atm"]) if pd.notna(analysis["atm"]) else "—",
-                    "Put Premium": analysis["pe_ltp"],
-                    "Combined Premium": (
-                        analysis["ce_ltp"] + analysis["pe_ltp"]
-                        if pd.notna(analysis["ce_ltp"]) and pd.notna(analysis["pe_ltp"])
-                        else np.nan
-                    ),
-                }
-            ]),
+            pd.DataFrame([{
+                "Index": index_name,
+                "Expiry": selected_expiry.strftime("%d-%b-%Y"),
+                "Call Strike": int(analysis["atm"]) if pd.notna(analysis["atm"]) else "—",
+                "Call Premium": analysis["ce_ltp"],
+                "Put Strike": int(analysis["atm"]) if pd.notna(analysis["atm"]) else "—",
+                "Put Premium": analysis["pe_ltp"],
+                "Combined Premium": (
+                    analysis["ce_ltp"] + analysis["pe_ltp"]
+                    if pd.notna(analysis["ce_ltp"]) and pd.notna(analysis["pe_ltp"])
+                    else np.nan
+                ),
+            }]),
             use_container_width=True,
             hide_index=True,
         )
@@ -1740,9 +1701,6 @@ elif page == "Option Seller":
     except Exception as exc:
         st.error("Option data is currently unavailable.")
         with st.expander("Data status"):
-            st.warning(
-                "The option data request was rejected or returned no usable data."
-            )
             st.code(str(exc), language="text")
 
 
