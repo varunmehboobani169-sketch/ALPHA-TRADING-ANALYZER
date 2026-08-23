@@ -1,9 +1,11 @@
-# ALPHA ANALYZER — CLIENT SAFE FINAL
+# ALPHA ANALYZER — FINAL OPTION PCR + ROUTING FIX
 
-Market Overview:
-- Uses the current active market structure internally.
-- A plain directional column does not automatically create a directional label.
-- Client sees only BULLISH / BEARISH / SIDEWAYS / UNAVAILABLE.
-- Presentation uses clean market cards.
-
-Core calculation methodology remains backend-only.
+Fixed:
+- Selecting NSE Positional no longer falls into System Status.
+- Market Overview remains client-friendly and uses the active market state.
+- Option Seller now includes a Positioning Trend visualization based on
+  running PCR snapshots from the monitored option-chain OI.
+- PCR history is maintained per index/expiry/horizon during the session.
+- Core methodology/settings are not exposed in client-facing descriptions.
+- Existing NSE, MCX, Sector Analysis, RS Matrix, OI confirmation,
+  notifications and alerts remain included.
