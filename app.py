@@ -45,6 +45,8 @@ with st.sidebar:
         ],
     )
 
+render_notification_panel()
+
 def headers():
     if not st.session_state.client_id or not st.session_state.access_token:
         raise RuntimeError("Enter Client Code and Access Token.")
@@ -1609,7 +1611,7 @@ def speak_client_alert(message, prefix="New trade alert"):
 
 
 def notify_new_trades(module_name, mode, current_symbols):
-    """Popup + voice only for trades newly appearing since the last refresh."""
+    """Popup + voice + persistent notification entry for new trades."""
     clean = {
         str(s).replace("★ ", "").strip()
         for s in current_symbols
@@ -1626,6 +1628,13 @@ def notify_new_trades(module_name, mode, current_symbols):
     )
 
     new_trades = sorted(clean - previous)
+
+    if new_trades:
+        record_trade_notifications(
+            module_name,
+            mode,
+            new_trades,
+        )
 
     for symbol in new_trades:
         st.toast(
@@ -1663,6 +1672,72 @@ def notify_option_warning(module_name, warning_key, message, active):
         )
 
     st.session_state.option_warning_states[state_key] = current
+
+
+
+# -----------------------------
+# Notification Panel
+# -----------------------------
+def record_trade_notifications(module_name, mode, symbols):
+    """
+    Store the latest new-trade timestamps for the client notification panel.
+    Keeps a small rolling history per module/mode.
+    """
+    now_text = datetime.now().strftime("%d-%b-%Y %H:%M:%S")
+
+    if "notification_history" not in st.session_state:
+        st.session_state.notification_history = {}
+
+    key = f"{module_name}|{mode}"
+    history = st.session_state.notification_history.setdefault(key, [])
+
+    known = {item["symbol"] for item in history}
+
+    for symbol in symbols:
+        clean = str(symbol).replace("★ ", "").strip()
+        if not clean or clean in known:
+            continue
+
+        history.insert(
+            0,
+            {
+                "time": now_text,
+                "module": module_name,
+                "mode": mode,
+                "symbol": clean,
+            },
+        )
+
+    st.session_state.notification_history[key] = history[:10]
+
+
+def render_notification_panel():
+    """Top-right client notification panel."""
+    history = []
+
+    for items in st.session_state.get("notification_history", {}).values():
+        history.extend(items)
+
+    history = sorted(
+        history,
+        key=lambda x: x["time"],
+        reverse=True,
+    )[:10]
+
+    with st.sidebar:
+        st.markdown("### 🔔 Notifications")
+
+        if not history:
+            st.caption("No trades yet.")
+            return
+
+        for item in history[:5]:
+            st.markdown(
+                f"**{item['symbol']}**  \n"
+                f"{item['module']} • {item['mode']}  \n"
+                f"`{item['time']}`"
+            )
+            st.divider()
 
 
 # -----------------------------

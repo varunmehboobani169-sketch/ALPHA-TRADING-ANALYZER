@@ -1,13 +1,14 @@
-# ALPHA ANALYZER — FINAL LOGIN LABELS
+# ALPHA ANALYZER — NOTIFICATION PANEL
 
-Only the visible login labels were changed.
+Added a persistent client notification panel.
 
-Displayed:
-- User Name
-- Password
+The panel is shown in the upper-right/sidebar area and keeps the latest
+new-trade alerts with:
+- Script
+- Module
+- Mode
+- Date/time of the trade alert
 
-Backend behavior is unchanged:
-- The existing Dhan Client Code value is still stored/used exactly as before.
-- The existing Dhan Access Token value is still stored/used exactly as before.
+New trades still trigger the existing popup + sound notification.
 
-No authentication logic was changed.
+The panel stores the last 10 notifications in the current Streamlit session.
