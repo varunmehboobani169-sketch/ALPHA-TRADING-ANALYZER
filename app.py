@@ -40,6 +40,7 @@ with st.sidebar:
             "Option Seller",
             "Intraday",
             "Positional",
+            "MCX Option Seller",
             "Market Overview",
         ],
     )
@@ -439,7 +440,6 @@ def future_quote_map(fut):
     except Exception:
         return {}
 
-@st.cache_data(ttl=60, show_spinner=False)
 def futures_oi_history(sec_id, lookback_days=7):
     """
     Fetch OI history for the SAME futures contract.
@@ -852,12 +852,12 @@ def resolve_index_instrument(master, index_name):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def option_expiry_list_v2(index_security_id):
+def option_expiry_list_v2(index_security_id, underlying_segment="IDX_I"):
     body = api_post(
         "/optionchain/expirylist",
         {
             "UnderlyingScrip": int(index_security_id),
-            "UnderlyingSeg": "IDX_I",
+            "UnderlyingSeg": underlying_segment,
         },
         "Option expiry list",
     )
@@ -905,12 +905,12 @@ def select_option_expiry_v2(expiries, horizon):
 
 
 @st.cache_data(ttl=3, show_spinner=False)
-def option_chain_request_v2(index_security_id, expiry_date):
+def option_chain_request_v2(index_security_id, expiry_date, underlying_segment="IDX_I"):
     return api_post(
         "/optionchain",
         {
             "UnderlyingScrip": int(index_security_id),
-            "UnderlyingSeg": "IDX_I",
+            "UnderlyingSeg": underlying_segment,
             "Expiry": expiry_date.strftime("%Y-%m-%d"),
         },
         "Option chain",
@@ -1385,69 +1385,46 @@ def simple_option_decision(index_name, recommendation, spot, atm, expected_move,
 
 
 
-def oi_confirmation_for_trade(sec_id, trade_direction):
-    """
-    Use nearest active NSE F&O futures price + OI behavior as confirmation.
+# -----------------------------
+# MCX Option Seller
+# -----------------------------
+MCX_OPTION_SYMBOLS = [
+    "GOLD", "GOLDM", "SILVER", "SILVERM",
+    "CRUDEOIL", "CRUDEOILM", "NATURALGAS", "NATURALGASMINI",
+]
 
-    LONG:
-      LONG BUILDUP     -> Strong Long
-      NEUTRAL          -> Long
-      SHORT COVERING   -> Weak Long
-      SHORT BUILDUP    -> Conflict
+def mcx_option_underlyings(master):
+    x = master[
+        (master["exchange"] == "MCX") &
+        (master["instrument"] == "FUTCOM")
+    ].copy()
 
-    SHORT:
-      SHORT BUILDUP    -> Strong Short
-      NEUTRAL          -> Short
-      LONG UNWINDING   -> Weak Short
-      LONG BUILDUP     -> Conflict
-    """
-    if trade_direction not in ("LONG", "SHORT"):
-        return {
-            "label": "—",
-            "state": "—",
-            "oi_change_pct": np.nan,
-            "price_change_pct": np.nan,
-            "rank": 0,
-        }
+    if x.empty:
+        return x
 
-    x = classify_futures_oi(sec_id, trade_direction)
-    state = x.get("state", "UNAVAILABLE")
+    x["expiry_date"] = pd.to_datetime(x["expiry_date"], errors="coerce")
+    now = pd.Timestamp.now()
+    x = x[x["expiry_date"].isna() | (x["expiry_date"] >= now)].copy()
+    x["underlying_symbol"] = x["underlying_symbol"].astype(str).str.upper().str.strip()
+    x = x[x["underlying_symbol"].isin(MCX_OPTION_SYMBOLS)].copy()
+    x = x.sort_values(["underlying_symbol", "expiry_date", "security_id"], na_position="last")
+    return x.drop_duplicates("underlying_symbol", keep="first").reset_index(drop=True)
 
-    if state == "UNAVAILABLE":
-        return {
-            "label": "OI unavailable",
-            "state": state,
-            "oi_change_pct": x.get("oi_change_pct", np.nan),
-            "price_change_pct": x.get("price_change_pct", np.nan),
-            "rank": 0,
-        }
-
-    if trade_direction == "LONG":
-        mapping = {
-            "LONG BUILDUP": ("🟢 STRONG LONG", 3),
-            "NEUTRAL": ("🟢 LONG", 2),
-            "SHORT COVERING": ("🟡 WEAK LONG", 1),
-            "SHORT BUILDUP": ("⚠️ LONG CONFLICT", 0),
-            "LONG UNWINDING": ("⚠️ LONG WEAK", 1),
-        }
-    else:
-        mapping = {
-            "SHORT BUILDUP": ("🔴 STRONG SHORT", 3),
-            "NEUTRAL": ("🔴 SHORT", 2),
-            "LONG UNWINDING": ("🟡 WEAK SHORT", 1),
-            "LONG BUILDUP": ("⚠️ SHORT CONFLICT", 0),
-            "SHORT COVERING": ("⚠️ SHORT WEAK", 1),
-        }
-
-    label, rank = mapping.get(state, ("—", 0))
-
-    return {
-        "label": label,
-        "state": state,
-        "oi_change_pct": x.get("oi_change_pct", np.nan),
-        "price_change_pct": x.get("price_change_pct", np.nan),
-        "rank": rank,
-    }
+def mcx_option_speak_alert(message):
+    safe = str(message).replace("\\", "\\\\").replace('"', '\\"')
+    st.components.v1.html(
+        f"""<script>
+        try {{
+            if ("speechSynthesis" in window) {{
+                window.speechSynthesis.cancel();
+                const u = new SpeechSynthesisUtterance("{safe}");
+                u.rate=0.95; u.volume=1.0;
+                window.speechSynthesis.speak(u);
+            }}
+        }} catch(e) {{}}
+        </script>""",
+        height=0,
+    )
 
 
 # -----------------------------
@@ -1471,8 +1448,9 @@ if auto:
         from streamlit_autorefresh import st_autorefresh
         if page == "Intraday":
             mins = 1
-        elif page == "Option Seller":
-            mins = 1 if st.session_state.get("option_horizon", "Intraday") == "Intraday" else 3
+        elif page in ("Option Seller", "MCX Option Seller"):
+            horizon_key = "option_horizon" if page == "Option Seller" else "mcx_option_horizon"
+            mins = 1 if st.session_state.get(horizon_key, "Intraday") == "Intraday" else 3
         else:
             mins = 15
         if page == "Market Overview":
@@ -1483,6 +1461,11 @@ if auto:
         elif page == "Option Seller":
             st.caption(
                 "Live option monitor — "
+                + ("updates every minute." if mins == 1 else "updates every 3 minutes.")
+            )
+        elif page == "MCX Option Seller":
+            st.caption(
+                "Live MCX option monitor — "
                 + ("updates every minute." if mins == 1 else "updates every 3 minutes.")
             )
     except Exception:
@@ -1613,18 +1596,9 @@ elif page in ("Intraday", "Positional"):
     for i, (_, r) in enumerate(candidates.iterrows(), 1):
         symbol = str(r["underlying_symbol"])
         sid = int(r["underlying_security_id"])
-        fut_sid = int(r["security_id"])
         ltp = spot_map.get(sid, np.nan)
 
         try:
-            oi_conf = {
-                "label": "—",
-                "state": "—",
-                "oi_change_pct": np.nan,
-                "price_change_pct": np.nan,
-                "rank": 0,
-            }
-
             if mode == "Intraday":
                 # Only eligible stocks reach this point.
                 h = cached_cash_intraday(sid)
@@ -1695,34 +1669,14 @@ elif page in ("Intraday", "Positional"):
                 entry = p["entry"]
                 sl = p["sl"]
 
-            # ---------------------------------------------------------
-            # P&F decides the trade. OI is only an optional confirmation.
-            # A failed/unavailable OI request NEVER removes the P&F trade.
-            # ---------------------------------------------------------
-            display_symbol = symbol
-
-            if mode == "Positional":
-                if rec == "🟢 LONG":
-                    oi_conf = oi_confirmation_for_trade(fut_sid, "LONG")
-                    if oi_conf.get("state") == "LONG BUILDUP":
-                        display_symbol = f"★ {symbol}"
-
-                elif rec == "🔴 SHORT":
-                    oi_conf = oi_confirmation_for_trade(fut_sid, "SHORT")
-                    if oi_conf.get("state") == "SHORT BUILDUP":
-                        display_symbol = f"★ {symbol}"
-
             rows.append({
-                "Script": display_symbol,
+                "Script": symbol,
                 "LTP": ltp,
                 "Bias": bias,
                 "Pattern": p.get("pattern", "—") if mode == "Positional" else "—",
-                "OI Confirmation": oi_conf["label"],
-                "OI Δ%": oi_conf["oi_change_pct"],
                 "Entry": entry,
                 "SL": sl,
                 "Recommendation": rec,
-                "_OI Rank": oi_conf["rank"],
             })
 
         except Exception:
@@ -1730,13 +1684,9 @@ elif page in ("Intraday", "Positional"):
                 "Script": symbol,
                 "LTP": ltp,
                 "Bias": "UNAVAILABLE",
-                "Pattern": "—",
-                "OI Confirmation": "DATA ERROR",
-                "OI Δ%": np.nan,
                 "Entry": np.nan,
                 "SL": np.nan,
                 "Recommendation": "DATA ERROR",
-                "_OI Rank": 0,
             })
 
         prog.progress(
@@ -1745,11 +1695,6 @@ elif page in ("Intraday", "Positional"):
         )
 
     prog.empty()
-
-    if mode == "Positional":
-        st.session_state["positional_oi_confirmed_count"] = int(
-            sum(1 for x in rows if str(x.get("Script", "")).startswith("★ "))
-        )
 
     res = pd.DataFrame(rows)
 
@@ -1762,37 +1707,13 @@ elif page in ("Intraday", "Positional"):
         short_df = res[res["Recommendation"] == "🔴 SHORT"].copy()
         setup_df = res[res["Recommendation"] == "🟡 SETUP"].copy()
 
-    long_df = long_df.sort_values("_OI Rank", ascending=False)
-    short_df = short_df.sort_values("_OI Rank", ascending=False)
-
     def active_trade_style(row):
         rec = str(row.get("Recommendation", ""))
-        oi = str(row.get("OI Confirmation", ""))
-
-        if rec in ("🟢 BUY", "🟢 LONG"):
-            base = "background-color: #d9f2d9; color: #0b5d1e; font-weight: 700"
-        elif rec in ("🔴 SELL", "🔴 SHORT"):
-            base = "background-color: #f8d7da; color: #8a1c1c; font-weight: 700"
-        else:
-            base = ""
-
-        styles = [base] * len(row)
-
-        try:
-            oi_col = row.index.get_loc("OI Confirmation")
-            if "STRONG LONG" in oi or "STRONG SHORT" in oi:
-                styles[oi_col] = "background-color: #b7e4c7; color: #064420; font-weight: 800"
-            elif "CONFLICT" in oi:
-                styles[oi_col] = "background-color: #f8b4b4; color: #7a0000; font-weight: 800"
-            elif "WEAK" in oi:
-                styles[oi_col] = "background-color: #fff3cd; color: #7a5200; font-weight: 700"
-        except Exception:
-            pass
-
-        return styles
-
-    if mode == "Positional":
-        st.caption("★ marks a higher-conviction positional trade.")
+        if rec == "🟢 LONG":
+            return ["background-color: #d9f2d9; color: #0b5d1e; font-weight: 700"] * len(row)
+        if rec == "🔴 SHORT":
+            return ["background-color: #f8d7da; color: #8a1c1c; font-weight: 700"] * len(row)
+        return [""] * len(row)
 
     st.markdown("## 🟢 BULLISH / LONG")
     if long_df.empty:
@@ -1800,8 +1721,8 @@ elif page in ("Intraday", "Positional"):
     else:
         st.dataframe(
             long_df[
-                ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
-            ],
+                ["Script", "LTP", "Bias", "Pattern", "Entry", "SL", "Recommendation"]
+            ].style.apply(active_trade_style, axis=1),
             use_container_width=True,
             hide_index=True,
         )
@@ -1812,20 +1733,20 @@ elif page in ("Intraday", "Positional"):
     else:
         st.dataframe(
             short_df[
-                ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
-            ],
+                ["Script", "LTP", "Bias", "Pattern", "Entry", "SL", "Recommendation"]
+            ].style.apply(active_trade_style, axis=1),
             use_container_width=True,
             hide_index=True,
         )
 
-    st.markdown("## ⚪ OTHER")
+    st.markdown("## ⚪ SIDEWAYS / NO ACTIVE PATTERN")
     sideways_df = res[res["Recommendation"] == "NO POSITION"].copy()
     if sideways_df.empty:
         st.info("No sideways instruments currently.")
     else:
         st.dataframe(
             sideways_df[
-                ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
+                ["Script", "LTP", "Bias", "Pattern", "Entry", "SL", "Recommendation"]
             ],
             use_container_width=True,
             hide_index=True,
@@ -2113,6 +2034,149 @@ elif page == "Option Seller":
 
     except Exception as exc:
         st.error("Option data is currently unavailable.")
+        with st.expander("Data status"):
+            st.code(str(exc), language="text")
+
+
+
+elif page == "MCX Option Seller":
+    st.title("MCX OPTION SELLER")
+    st.caption("GOLD • GOLDM • SILVER • SILVERM • CRUDEOIL • NATURALGAS")
+
+    horizon = st.radio(
+        "Horizon",
+        ["Intraday", "Positional"],
+        horizontal=True,
+        key="mcx_option_horizon",
+    )
+
+    mcx_fut = mcx_option_underlyings(master)
+    if mcx_fut.empty:
+        st.error("No active MCX option underlyings found.")
+        st.stop()
+
+    commodity = st.selectbox(
+        "Commodity",
+        mcx_fut["underlying_symbol"].tolist(),
+        key="mcx_option_symbol",
+    )
+    fut = mcx_fut[mcx_fut["underlying_symbol"] == commodity].iloc[0]
+    underlying_sid = int(fut["security_id"])
+
+    try:
+        expiries = option_expiry_list_v2(underlying_sid, "MCX_COMM")
+        expiry_labels = [d.strftime("%d-%b-%Y") for d in expiries]
+        default_expiry = select_option_expiry_v2(expiries, horizon)
+        default_index = expiries.index(default_expiry) if default_expiry in expiries else 0
+
+        expiry_label = st.selectbox(
+            "Expiry",
+            expiry_labels,
+            index=default_index,
+            key=f"mcx_expiry_{commodity}_{horizon}",
+        )
+        expiry = expiries[expiry_labels.index(expiry_label)]
+
+        raw_chain = option_chain_request_v2(
+            underlying_sid,
+            expiry,
+            "MCX_COMM",
+        )
+        raw_data = parse_data(raw_chain)
+        spot = pd.to_numeric(
+            raw_data.get("last_price") if isinstance(raw_data, dict) else np.nan,
+            errors="coerce",
+        )
+
+        chain_df = parse_option_chain_v2(raw_chain)
+        chain_df = filter_atm_strike_window(chain_df, spot, strikes_each_side=20)
+
+        analysis = option_seller_analysis_v2(chain_df, spot, horizon)
+        session_state = option_session_state(
+            f"MCX-{commodity}",
+            expiry,
+            analysis["atm_iv"],
+        )
+        iv_risk = option_iv_risk(analysis["atm_iv"], session_state)
+        oi_risk = option_oi_risk(chain_df, spot)
+
+        strategy_name, strategy_reason = simple_option_decision(
+            index_name=commodity,
+            recommendation=analysis["recommendation"],
+            spot=spot,
+            atm=analysis["atm"],
+            expected_move=analysis["expected_move"],
+            support=analysis["support"],
+            resistance=analysis["resistance"],
+            atm_iv=analysis["atm_iv"],
+            open_iv=session_state["open_iv"],
+            oi_alert=oi_risk,
+        )
+
+        a,b,c,d = st.columns(4)
+        a.metric("Commodity", commodity)
+        b.metric("Underlying", f"{spot:,.2f}" if pd.notna(spot) else "—")
+        c.metric("Expiry", expiry_label)
+        d.metric("ATM IV", f"{analysis['atm_iv']:.2f}%" if pd.notna(analysis["atm_iv"]) else "—")
+
+        st.markdown("### Strategy")
+        if strategy_name=="SELL STRADDLE":
+            st.success(f"SELL {commodity} ATM CALL + ATM PUT")
+        elif strategy_name=="SELL PUT":
+            st.success(f"SELL {commodity} PUT")
+        elif strategy_name=="SELL CALL":
+            st.success(f"SELL {commodity} CALL")
+        else:
+            st.warning(strategy_name)
+        st.caption(f"Why: {strategy_reason}")
+
+        st.markdown("### Risk Alerts")
+        st.dataframe(
+            pd.DataFrame([
+                {"Risk":"Volatility","Status":"🔴 ALERT" if iv_risk["alert"] else "🟢 NORMAL","Message":iv_risk["text"]},
+                {"Risk":"Positioning","Status":"🔴 ALERT" if oi_risk["alert"] else "🟢 NORMAL","Message":oi_risk["text"]},
+            ]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if "mcx_option_alert_states" not in st.session_state:
+            st.session_state.mcx_option_alert_states = {}
+        alert_key=f"{commodity}|{horizon}|{expiry}"
+        old=st.session_state.mcx_option_alert_states.get(alert_key, {"iv":False,"oi":False})
+        cur={"iv":bool(iv_risk["alert"]), "oi":bool(oi_risk["alert"])}
+
+        if cur["iv"] and not old["iv"]:
+            mcx_option_speak_alert(f"Option alert. {commodity}. Implied volatility is rising.")
+        if cur["oi"] and not old["oi"]:
+            side_word="call" if oi_risk["side"]=="CALL" else "put"
+            mcx_option_speak_alert(
+                f"Option alert. {commodity}. Heavy {side_word} side positioning buildup."
+            )
+        st.session_state.mcx_option_alert_states[alert_key]=cur
+
+        st.markdown("### Option Chain")
+        view=chain_df.copy()
+        calls=view[view["Side"]=="CE"].set_index("Strike").sort_index()
+        puts=view[view["Side"]=="PE"].set_index("Strike").sort_index()
+        strikes=sorted(set(calls.index.tolist()) | set(puts.index.tolist()))
+        rows=[]
+        for strike in strikes:
+            ce=calls.loc[strike] if strike in calls.index else pd.Series(dtype=float)
+            pe=puts.loc[strike] if strike in puts.index else pd.Series(dtype=float)
+            def num(s,k):
+                return pd.to_numeric(s[k], errors="coerce") if k in s.index else np.nan
+            rows.append({
+                "CE OI":num(ce,"OI"), "CE ΔOI":num(ce,"Change OI"), "CE IV":num(ce,"IV"),
+                "CE LTP":num(ce,"LTP"), "STRIKE":strike,
+                "PE LTP":num(pe,"LTP"), "PE IV":num(pe,"IV"),
+                "PE ΔOI":num(pe,"Change OI"), "PE OI":num(pe,"OI"),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption("MCX option analysis uses ATM ±20 available strikes.")
+
+    except Exception as exc:
+        st.error("MCX option data is currently unavailable.")
         with st.expander("Data status"):
             st.code(str(exc), language="text")
 

@@ -1,26 +1,28 @@
-# ALPHA ANALYZER — P&F TRADES + OPTIONAL OI STAR
+# ALPHA ANALYZER — MCX OPTION SELLER
 
-Exact positional behavior:
+Added MCX Option Seller using the same simple framework as NSE.
 
-1. P&F is the ONLY trade gate.
-   - Active DTB + X -> LONG
-   - Active DBS + O -> SHORT
-   - Everything else -> no directional trade.
+MCX symbols:
+GOLD, GOLDM, SILVER, SILVERM, CRUDEOIL, CRUDEOILM, NATURALGAS, NATURALGASMINI.
 
-2. Every P&F-approved trade is displayed.
-   Example: 13 P&F Long trades -> all 13 are shown.
+Dhan v2:
+- MCX options use `MCX_COMM` as the underlying segment.
+- The underlying is the nearest active `FUTCOM` contract Security ID.
+- Active expiries are fetched from Dhan.
+- Option-chain data is fetched for the selected expiry.
+- Analysis is limited to ATM +/-20 available strikes.
 
-3. F&O OI is checked only as an additional confirmation.
-   - LONG + Long Buildup -> add ★
-   - SHORT + Short Buildup -> add ★
+Logic:
+- Overall OI -> support/resistance.
+- OI change -> one-sided buildup.
+- ATM IV -> volatility monitoring.
+- Expected range -> strategy context.
+- SELL STRADDLE / SELL PUT / SELL CALL / WAIT.
 
-4. OI NEVER removes, rejects, or changes a P&F trade.
-   If OI is unavailable or does not confirm, the trade remains in the list
-   without a star.
+Notifications:
+- New IV risk state -> spoken alert.
+- New one-sided OI buildup -> spoken alert.
 
-5. Intraday does not run this positional OI confirmation layer.
-
-Client display remains:
-Script | LTP | Bias | Entry | SL | Recommendation
-
-Only the ★ is visible; the detailed OI confirmation stays backend-only.
+Refresh:
+- Intraday -> 1 minute.
+- Positional -> 3 minutes.
