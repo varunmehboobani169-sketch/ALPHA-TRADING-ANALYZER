@@ -1,18 +1,20 @@
-# ALPHA ANALYZER — FINAL BUILD WITH SECTOR ANALYSIS FIX
+# ALPHA ANALYZER — FINAL SECTOR + NIFTY 50 RS FIX
 
-Sector Analysis:
-- NSE F&O universe
-- Daily close-only
-- 1% P&F box
-- 3-box reversal
-- Manual refresh only
-- Keeps stocks even when sector mapping is unavailable
-- Shows sector summary and stock-level results for diagnosis
+Fixed the RS Matrix runtime error occurring when requesting NIFTY historical data.
 
-RS Matrix:
-- NIFTY 50 only
-- Stock/NIFTY 50 daily close ratio
-- 3%, 2%, 1%, 0.25% P&F
-- Manual refresh only
+Changes:
+- NIFTY/BANKNIFTY Security IDs are resolved from Dhan's detailed instrument master.
+- The Dhan master uses segment `I` for the `IDX_I` index segment.
+- NIFTY 50 resolves to its current master Security ID instead of relying on a
+  hard-coded number.
+- Daily index requests use `exchangeSegment=IDX_I`, `instrument=INDEX`.
+- For index daily history, `timeframe=1D` is included to handle Data API
+  deployments that enforce the explicit daily timeframe.
+- RS Matrix remains NIFTY 50 only and manual-refresh.
+- Sector Analysis remains daily close-only, 1% box, 3-box reversal, manual-refresh.
+- Other modules remain unchanged.
 
-All other existing modules remain in app.py.
+Dhan documentation references:
+- Instrument List: Dhan Security IDs come from the instrument master.
+- Annexure: `IDX_I` is the Index Value segment and `INDEX` is the instrument.
+- Historical Data: `/charts/historical` is the daily OHLC endpoint.

@@ -238,6 +238,11 @@ def historical(sec_id, segment, instrument, mode):
             "fromDate": str(datetime.now().date() - timedelta(days=220)),
             "toDate": str(datetime.now().date() + timedelta(days=1)),
         }
+
+        # Dhan uses IDX_I + INDEX for indices. Some Data API deployments
+        # also validate the daily timeframe explicitly.
+        if segment == "IDX_I" and instrument == "INDEX":
+            payload["timeframe"] = "1D"
         body = api_post("/charts/historical", payload, "daily history")
     else:
         payload = {
@@ -1771,7 +1776,7 @@ def manual_daily_close(sec_id):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def manual_index_daily(sec_id):
-    return historical(int(sec_id), "NSE_IDX", "INDEX", "Positional")
+    return historical(int(sec_id), "IDX_I", "INDEX", "Positional")
 
 def pnf_direction_from_close(close_series, box_pct):
     s = pd.to_numeric(close_series, errors="coerce").dropna()
@@ -1903,7 +1908,11 @@ def run_rs_matrix_manual(fut):
     Apply P&F independently to the raw ratio at 3%, 2%, 1%, 0.25%.
     NIFTY 50 itself is not converted to P&F first.
     """
-    nifty = manual_index_daily(13)
+    nifty_id = resolve_nse_index_security_id(master, "NIFTY")
+    if nifty_id is None:
+        return pd.DataFrame()
+
+    nifty = manual_index_daily(nifty_id)
     if nifty.empty or "close" not in nifty.columns:
         return pd.DataFrame()
 
@@ -1978,6 +1987,48 @@ def run_rs_matrix_manual(fut):
     ).reset_index(drop=True)
 
 
+
+# -----------------------------
+# Dhan Index Resolver
+# -----------------------------
+def resolve_nse_index_security_id(master, symbol="NIFTY"):
+    """
+    Resolve an NSE index security ID from Dhan's detailed instrument master.
+    The master uses SEGMENT='I' for the IDX_I segment.
+    """
+    try:
+        x = master.copy()
+
+        if "exchange" in x.columns:
+            x = x[x["exchange"].astype(str).str.upper().eq("NSE")]
+
+        if "segment" in x.columns:
+            x = x[x["segment"].astype(str).str.upper().eq("I")]
+
+        if "instrument" in x.columns:
+            x = x[x["instrument"].astype(str).str.upper().eq("INDEX")]
+
+        target = str(symbol).upper().strip()
+
+        for col in ["underlying_symbol", "symbol_name", "display_name", "trading_symbol"]:
+            if col not in x.columns:
+                continue
+
+            m = x[x[col].astype(str).str.upper().str.strip().eq(target)]
+            if not m.empty:
+                sid = pd.to_numeric(
+                    m.iloc[0]["security_id"],
+                    errors="coerce",
+                )
+                if pd.notna(sid):
+                    return int(sid)
+
+        return None
+
+    except Exception:
+        return None
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -2050,13 +2101,18 @@ if page == "Market Overview":
 
     overview = []
 
-    for name, sid in [("NIFTY", 13), ("BANKNIFTY", 25)]:
+    for name in ["NIFTY", "BANKNIFTY"]:
+        sid = resolve_nse_index_security_id(master, name)
         overview.append({
             "Market": name,
-            "Bias": market_bias_from_history(
-                sid,
-                "NSE_IDX",
-                "INDEX",
+            "Bias": (
+                market_bias_from_history(
+                    sid,
+                    "IDX_I",
+                    "INDEX",
+                )
+                if sid is not None
+                else "UNAVAILABLE"
             ),
         })
 
