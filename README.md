@@ -1,14 +1,12 @@
-# ALPHA ANALYZER — NOTIFICATION PANEL
+# ALPHA ANALYZER — NOTIFICATION PANEL FIX
 
-Added a persistent client notification panel.
+Fixed the startup NameError shown by Streamlit.
 
-The panel is shown in the upper-right/sidebar area and keeps the latest
-new-trade alerts with:
-- Script
-- Module
-- Mode
-- Date/time of the trade alert
+Cause:
+`render_notification_panel()` was called before the function definition.
 
-New trades still trigger the existing popup + sound notification.
+Fix:
+The call now occurs after the notification-panel helper is defined and before
+the main page routing/auto-refresh section.
 
-The panel stores the last 10 notifications in the current Streamlit session.
+Trading logic and notification behavior are unchanged.

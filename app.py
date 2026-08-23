@@ -45,8 +45,6 @@ with st.sidebar:
         ],
     )
 
-render_notification_panel()
-
 def headers():
     if not st.session_state.client_id or not st.session_state.access_token:
         raise RuntimeError("Enter Client Code and Access Token.")
@@ -1752,6 +1750,8 @@ try:
 except Exception as e:
     st.error(f"Instrument master failed: {e}")
     st.stop()
+
+render_notification_panel()
 
 # Auto refresh is deliberately longer than the initial full-universe scan.
 # The full NSE scan can take longer than 1 minute, so a 1-minute rerun would
