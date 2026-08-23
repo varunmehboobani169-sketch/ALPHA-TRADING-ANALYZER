@@ -1456,8 +1456,15 @@ def oi_confirmation_for_trade(sec_id, trade_direction):
 # MCX Futures Trading
 # -----------------------------
 MCX_FUTURE_SYMBOLS = [
-    "GOLD","GOLDM","SILVER","SILVERM",
-    "CRUDEOIL","CRUDEOILM","NATURALGAS","NATURALGASMINI",
+    "GOLD",
+    "SILVER",
+    "COPPER",
+    "CRUDEOIL",
+    "NATURALGAS",
+    "ZINC",
+    "LEAD",
+    "NICKEL",
+    "ALUMINIUM",
 ]
 
 def mcx_futures_universe(master):
@@ -1575,6 +1582,89 @@ def mcx_intraday_daily_eligibility(sec_id):
     return None
 
 
+
+# -----------------------------
+# Client Alerts
+# -----------------------------
+def speak_client_alert(message, prefix="New trade alert"):
+    spoken = f"{prefix}. {message}"
+    safe = spoken.replace("\\", "\\\\").replace('"', '\\"')
+
+    st.components.v1.html(
+        f"""
+        <script>
+        try {{
+            if ("speechSynthesis" in window) {{
+                window.speechSynthesis.cancel();
+                const u = new SpeechSynthesisUtterance("{safe}");
+                u.rate = 0.95;
+                u.volume = 1.0;
+                window.speechSynthesis.speak(u);
+            }}
+        }} catch(e) {{}}
+        </script>
+        """,
+        height=0,
+    )
+
+
+def notify_new_trades(module_name, mode, current_symbols):
+    """Popup + voice only for trades newly appearing since the last refresh."""
+    clean = {
+        str(s).replace("★ ", "").strip()
+        for s in current_symbols
+        if str(s).strip()
+    }
+
+    state_key = f"{module_name}|{mode}"
+
+    if "trade_alert_previous" not in st.session_state:
+        st.session_state.trade_alert_previous = {}
+
+    previous = set(
+        st.session_state.trade_alert_previous.get(state_key, set())
+    )
+
+    new_trades = sorted(clean - previous)
+
+    for symbol in new_trades:
+        st.toast(
+            f"🆕 New {module_name} {mode} trade: {symbol}",
+            icon="🔔",
+        )
+        speak_client_alert(
+            f"{module_name} {mode} trade in {symbol}",
+            prefix="New trade alert",
+        )
+
+    st.session_state.trade_alert_previous[state_key] = clean
+
+
+def notify_option_warning(module_name, warning_key, message, active):
+    """Popup + warning voice only when a risk warning turns ON."""
+    state_key = f"{module_name}|{warning_key}"
+
+    if "option_warning_states" not in st.session_state:
+        st.session_state.option_warning_states = {}
+
+    previous = bool(
+        st.session_state.option_warning_states.get(state_key, False)
+    )
+    current = bool(active)
+
+    if current and not previous:
+        st.toast(
+            f"⚠️ {module_name}: {message}",
+            icon="⚠️",
+        )
+        speak_client_alert(
+            message,
+            prefix=f"Warning. {module_name}",
+        )
+
+    st.session_state.option_warning_states[state_key] = current
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -1616,20 +1706,86 @@ if auto:
         pass
 
 if page == "Market Overview":
-    nse = future_universe(master, "NSE")
-    st.title("ALPHA ANALYZER")
-    a,b,c = st.columns(3)
-    a.metric("Instruments", len(nse))
-    b.metric("Data Rows", len(master))
-    c.metric("Live Status", "Online")
+    st.title("MARKET OVERVIEW")
+    st.caption("Current directional bias")
 
-    if not nse.empty:
-        sample = nse.head(min(20, len(nse)))
+    def market_bias_from_history(sec_id, segment, instrument):
         try:
-            spot = batch_ltp("NSE_EQ", sample["underlying_security_id"].dropna().astype(int).tolist())
-            st.metric("Live NSE cash LTPs returned", f"{len(spot)}/{len(sample)}")
-        except Exception as e:
-            st.error(f"Spot LTP test: {e}")
+            h = historical(sec_id, segment, instrument, "Positional")
+            if h.empty:
+                return "UNAVAILABLE"
+
+            cols = build_pnf(h["close"], 0.0025, 3)
+            if not cols:
+                return "SIDEWAYS"
+
+            last = cols[-1]
+
+            if last["type"] == "X":
+                return "BULLISH"
+            if last["type"] == "O":
+                return "BEARISH"
+            return "SIDEWAYS"
+
+        except Exception:
+            return "UNAVAILABLE"
+
+    overview = []
+
+    for name, sid in [("NIFTY", 13), ("BANKNIFTY", 25)]:
+        overview.append({
+            "Market": name,
+            "Bias": market_bias_from_history(
+                sid,
+                "NSE_IDX",
+                "INDEX",
+            ),
+        })
+
+    mcx = mcx_futures_universe(master)
+
+    for commodity in ["GOLD", "SILVER", "CRUDEOIL"]:
+        match = mcx[
+            mcx["underlying_symbol"] == commodity
+        ]
+
+        if match.empty:
+            bias = "UNAVAILABLE"
+        else:
+            bias = market_bias_from_history(
+                int(match.iloc[0]["security_id"]),
+                "MCX_COMM",
+                "FUTCOM",
+            )
+
+        overview.append({
+            "Market": commodity,
+            "Bias": bias,
+        })
+
+    cols = st.columns(5)
+
+    for col, item in zip(cols, overview):
+        bias = item["Bias"]
+
+        if bias == "BULLISH":
+            icon = "🟢"
+        elif bias == "BEARISH":
+            icon = "🔴"
+        elif bias == "SIDEWAYS":
+            icon = "🟡"
+        else:
+            icon = "⚪"
+
+        col.metric(
+            item["Market"],
+            f"{icon} {bias}",
+        )
+
+    st.caption(
+        "Display only. No trade generation or OI confirmation runs here."
+    )
+
 
 elif page in ("Intraday", "Positional"):
     mode = page
@@ -1889,6 +2045,25 @@ elif page in ("Intraday", "Positional"):
     res = pd.DataFrame(rows)
 
     if mode == "Intraday":
+        notify_new_trades(
+            "NSE",
+            "Intraday",
+            res.loc[
+                res["Recommendation"].isin(["🟢 BUY", "🔴 SELL"]),
+                "Script",
+            ].tolist(),
+        )
+    else:
+        notify_new_trades(
+            "NSE",
+            "Positional",
+            res.loc[
+                res["Recommendation"].isin(["🟢 LONG", "🔴 SHORT"]),
+                "Script",
+            ].tolist(),
+        )
+
+    if mode == "Intraday":
         long_df = res[res["Recommendation"] == "🟢 BUY"].copy()
         short_df = res[res["Recommendation"] == "🔴 SELL"].copy()
         setup_df = res[res["Recommendation"] == "🟡 SETUP"].copy()
@@ -1970,7 +2145,7 @@ elif page in ("Intraday", "Positional"):
 
 elif page == "MCX Futures":
     st.title("MCX FUTURES")
-    st.caption("GOLD • GOLDM • SILVER • SILVERM • CRUDEOIL • CRUDEOILM • NATURALGAS • NATURALGASMINI")
+    st.caption("GOLD • SILVER • COPPER • CRUDEOIL • NATURALGAS • ZINC • LEAD • NICKEL • ALUMINIUM")
 
     mode=st.radio("Horizon",["Intraday","Positional"],horizontal=True,key="mcx_futures_mode")
     fut=mcx_futures_universe(master)
@@ -2068,6 +2243,26 @@ elif page == "MCX Futures":
         })
 
     res=pd.DataFrame(rows)
+
+    if mode=="Intraday":
+        notify_new_trades(
+            "MCX",
+            "Intraday",
+            res.loc[
+                res["Recommendation"].isin(["🟢 BUY", "🔴 SELL"]),
+                "Script",
+            ].tolist(),
+        )
+    else:
+        notify_new_trades(
+            "MCX",
+            "Positional",
+            res.loc[
+                res["Recommendation"].isin(["🟢 LONG", "🔴 SHORT"]),
+                "Script",
+            ].tolist(),
+        )
+
     long_rec="🟢 LONG" if mode=="Positional" else "🟢 BUY"
     short_rec="🔴 SHORT" if mode=="Positional" else "🔴 SELL"
 
@@ -2186,6 +2381,19 @@ elif page == "Option Seller":
             spot,
         )
 
+        notify_option_warning(
+            index_name,
+            "iv_expansion",
+            f"{index_name} IV is expanding sharply.",
+            bool(iv_risk["alert"]),
+        )
+        notify_option_warning(
+            index_name,
+            "oi_buildup",
+            f"{index_name} has unusual one-sided OI buildup.",
+            bool(oi_risk["alert"]),
+        )
+
         strategy_name, strategy_reason = simple_option_decision(
             index_name=index_name,
             recommendation=analysis["recommendation"],
@@ -2274,14 +2482,26 @@ elif page == "Option Seller":
         }
 
         if new_state["iv"] and not old_state["iv"]:
+            warning_text = f"{index_name} implied volatility is rising."
+            st.toast(
+                f"⚠️ Option warning: {warning_text}",
+                icon="⚠️",
+            )
             speak_option_alert(
-                f"Option alert. {index_name}. Implied volatility is rising."
+                f"Warning. {warning_text}"
             )
 
         if new_state["oi"] and not old_state["oi"]:
             side_word = "call" if oi_risk["side"] == "CALL" else "put"
+            warning_text = (
+                f"{index_name} heavy {side_word} side positioning buildup."
+            )
+            st.toast(
+                f"⚠️ Option warning: {warning_text}",
+                icon="⚠️",
+            )
             speak_option_alert(
-                f"Option alert. {index_name}. Heavy {side_word} side positioning buildup."
+                f"Warning. {warning_text}"
             )
 
         st.session_state.option_alert_states[alert_key] = new_state
