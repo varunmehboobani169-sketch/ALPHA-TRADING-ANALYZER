@@ -1,39 +1,33 @@
-# ALPHA ANALYZER — GITHUB DEPLOY BUILD
+# ALPHA ANALYZER — DHAN V2 OPTION SELLER
 
-Main entry point:
-- app.py
+DhanHQ v2-compliant option-selling module.
 
-Required:
-- requirements.txt
+Verified against the official Dhan v2 docs:
+- `/optionchain`
+- `/optionchain/expirylist`
+- `IDX_I` as the Index Value segment
+- `UnderlyingScrip` resolved from the instrument master
+- `Expiry` selected from the active expiry list
+- `previous_oi` used to calculate current OI change
+- 3-second option-chain request cache
 
-Client-facing modules:
-1. Option Seller
-2. Intraday
-3. Positional
-4. Market Overview
-
-MCX is not exposed in the client navigation.
-
-POSitional trade logic:
-- Active DTB + latest X = LONG
-- Active DBS + latest O = SHORT
-- Anything else = Sideways / No Position
-- Active LONG rows are highlighted green
-- Active SHORT rows are highlighted red
-- Entry and SL are shown
-
-Intraday:
-- Daily eligibility is built once per trading day.
-- Only instruments passing the daily eligibility gate are scanned intraday.
-- Intraday signals are shown with Entry and SL.
-
-Option Seller:
+Client functions:
 - NIFTY
 - BANKNIFTY
 - SENSEX
 - Intraday / Positional
-- recommendation, ATM, premium, IV, expected range,
-  support/resistance and option-chain monitor.
+- Current ATM straddle recommendation
+- Current ATM IV
+- Session-opening IV baseline
+- Expected range
+- OI support/resistance
+- One-sided OI buildup alert
+- Intraday IV expansion alert
+- Spoken option alert on new risk state
+- Full option-chain view
 
-Deploy with Streamlit using:
-app.py
+Important:
+The opening IV shown is the first successful observation after market open
+within the active Streamlit session. The Dhan Option Chain response provides
+current IV and previous-day option price/OI, but does not expose previous-day
+IV directly.
