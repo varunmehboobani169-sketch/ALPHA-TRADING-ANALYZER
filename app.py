@@ -575,21 +575,89 @@ def classify_futures_oi(sec_id, direction):
 
 
 def sector_breadth_star(df, symbol, direction):
-    """Sector confirmation from the already-scanned P&F universe; no extra API calls."""
-    sec = sector_of(symbol)
-    if sec == "Other":
-        return {"sector": sec, "breadth": np.nan, "star": False}
-    x = df[df["Sector"] == sec].copy()
-    valid = x[x["Bias"].isin(["Bullish", "Bearish"])]
-    if valid.empty:
-        return {"sector": sec, "breadth": np.nan, "star": False}
-    if direction == "LONG":
-        pct = 100.0 * (valid["Bias"] == "Bullish").mean()
-        return {"sector": sec, "breadth": pct, "star": pct >= 50.0}
-    if direction == "SHORT":
-        pct = 100.0 * (valid["Bias"] == "Bearish").mean()
-        return {"sector": sec, "breadth": pct, "star": pct >= 50.0}
-    return {"sector": sec, "breadth": np.nan, "star": False}
+    """
+    Sector confirmation from the already-scanned NSE P&F universe.
+
+    Backend-only:
+    - Uses the sector assigned to each scanned stock.
+    - Uses only valid Bullish/Bearish directional rows.
+    - >=50% same-direction breadth confirms the trade.
+    """
+    try:
+        sec = sector_of(symbol)
+
+        if sec == "Other" or df is None or df.empty:
+            return {
+                "sector": sec,
+                "breadth": np.nan,
+                "star": False,
+            }
+
+        x = df.copy()
+
+        # The client-safe positional table keeps sector as "_Sector".
+        # Older code may pass "Sector", so support both.
+        sector_col = (
+            "_Sector"
+            if "_Sector" in x.columns
+            else "Sector"
+            if "Sector" in x.columns
+            else None
+        )
+
+        if sector_col is None or "Bias" not in x.columns:
+            return {
+                "sector": sec,
+                "breadth": np.nan,
+                "star": False,
+            }
+
+        x[sector_col] = x[sector_col].astype(str).str.strip()
+        x = x[x[sector_col] == sec].copy()
+
+        valid = x[
+            x["Bias"].isin(["Bullish", "Bearish"])
+        ].copy()
+
+        if valid.empty:
+            return {
+                "sector": sec,
+                "breadth": np.nan,
+                "star": False,
+            }
+
+        if direction == "LONG":
+            pct = 100.0 * (
+                valid["Bias"] == "Bullish"
+            ).mean()
+            return {
+                "sector": sec,
+                "breadth": pct,
+                "star": pct >= 50.0,
+            }
+
+        if direction == "SHORT":
+            pct = 100.0 * (
+                valid["Bias"] == "Bearish"
+            ).mean()
+            return {
+                "sector": sec,
+                "breadth": pct,
+                "star": pct >= 50.0,
+            }
+
+        return {
+            "sector": sec,
+            "breadth": np.nan,
+            "star": False,
+        }
+
+    except Exception:
+        return {
+            "sector": sector_of(symbol),
+            "breadth": np.nan,
+            "star": False,
+        }
 
 
 
@@ -2465,10 +2533,10 @@ elif page in ("Intraday", "Positional"):
 
             if oi_ok and sector_ok:
                 res.at[idx_row, "Script"] = f"★★ {symbol_clean}"
-            elif oi_ok:
+            elif oi_ok or sector_ok:
                 res.at[idx_row, "Script"] = f"★ {symbol_clean}"
-            elif sector_ok:
-                res.at[idx_row, "Script"] = f"★ {symbol_clean}"
+            else:
+                res.at[idx_row, "Script"] = symbol_clean
 
     if mode == "Intraday":
         notify_new_trades(
