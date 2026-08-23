@@ -1,28 +1,30 @@
-# ALPHA ANALYZER — MCX OPTION SELLER
+# ALPHA ANALYZER — MCX FUTURES FINAL
 
-Added MCX Option Seller using the same simple framework as NSE.
+MCX is a futures-trading module only. No MCX option-selling module is included.
 
-MCX symbols:
-GOLD, GOLDM, SILVER, SILVERM, CRUDEOIL, CRUDEOILM, NATURALGAS, NATURALGASMINI.
+Same Dhan Client Code + Access Token are reused for NSE and MCX.
 
-Dhan v2:
-- MCX options use `MCX_COMM` as the underlying segment.
-- The underlying is the nearest active `FUTCOM` contract Security ID.
-- Active expiries are fetched from Dhan.
-- Option-chain data is fetched for the selected expiry.
-- Analysis is limited to ATM +/-20 available strikes.
+Supported:
+GOLD, GOLDM, SILVER, SILVERM, CRUDEOIL, CRUDEOILM, NATURALGAS, NATURALGASMINI
 
-Logic:
-- Overall OI -> support/resistance.
-- OI change -> one-sided buildup.
-- ATM IV -> volatility monitoring.
-- Expected range -> strategy context.
-- SELL STRADDLE / SELL PUT / SELL CALL / WAIT.
+POSITIONAL:
+- Daily close-only
+- 0.25% / 3-box
+- Active DTB + X -> LONG
+- Active DBS + O -> SHORT
+- Every valid P&F trade is displayed
+- Futures OI confirmation adds ★ only
+- OI never removes a P&F trade
+- Entry and SL displayed
 
-Notifications:
-- New IV risk state -> spoken alert.
-- New one-sided OI buildup -> spoken alert.
+INTRADAY:
+- Daily >15-box eligibility gate
+- 1-minute / 0.15% / 3-box
+- Trend filter
+- BUY / SELL / SETUP
+- No OI confirmation scan every minute
 
-Refresh:
-- Intraday -> 1 minute.
-- Positional -> 3 minutes.
+Dhan:
+- exchangeSegment = MCX_COMM
+- instrument = FUTCOM
+- same login as NSE
