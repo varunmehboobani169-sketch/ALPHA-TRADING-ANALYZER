@@ -791,6 +791,38 @@ def positional_active_pattern(sec_id):
 # Option Seller Analyzer
 # -----------------------------
 
+
+def filter_atm_strike_window(chain_df, spot, strikes_each_side=20):
+    """
+    Restrict all option analysis to ATM +/- N strikes.
+
+    ATM is selected from the live spot using the nearest available strike.
+    The returned chain contains:
+      - 20 strikes below ATM
+      - ATM
+      - 20 strikes above ATM
+    wherever those strikes exist in the live chain.
+    """
+    if chain_df is None or chain_df.empty or pd.isna(spot):
+        return chain_df.copy() if chain_df is not None else pd.DataFrame()
+
+    x = chain_df.copy()
+    x["Strike"] = pd.to_numeric(x["Strike"], errors="coerce")
+    x = x.dropna(subset=["Strike"])
+
+    strikes = sorted(x["Strike"].unique())
+    if not strikes:
+        return x
+
+    atm = min(strikes, key=lambda s: abs(float(s) - float(spot)))
+    atm_idx = strikes.index(atm)
+
+    lo = max(0, atm_idx - strikes_each_side)
+    hi = min(len(strikes), atm_idx + strikes_each_side + 1)
+
+    allowed = set(strikes[lo:hi])
+    return x[x["Strike"].isin(allowed)].copy()
+
 # -----------------------------
 # Dhan v2 Option Seller Analyzer
 # -----------------------------
@@ -1695,6 +1727,13 @@ elif page == "Option Seller":
         )
 
         chain_df = parse_option_chain_v2(raw_chain)
+        # All strategy, IV and OI analysis is restricted to ATM +/- 20 strikes.
+        chain_df = filter_atm_strike_window(
+            chain_df,
+            spot,
+            strikes_each_side=20,
+        )
+
 
         analysis = option_seller_analysis_v2(
             chain_df,
