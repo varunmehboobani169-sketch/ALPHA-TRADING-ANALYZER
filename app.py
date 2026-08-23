@@ -1738,6 +1738,27 @@ def render_notification_panel():
             st.divider()
 
 
+
+def positional_sector_confirmation(df, symbol, direction):
+    """
+    Backend-only sector confirmation for already-valid positional P&F trades.
+    A sector confirms when at least 50% of its valid directional members agree.
+    """
+    try:
+        result = sector_breadth_star(df, symbol, direction)
+        return {
+            "confirmed": bool(result.get("star", False)),
+            "breadth": result.get("breadth", np.nan),
+            "sector": result.get("sector", "Other"),
+        }
+    except Exception:
+        return {
+            "confirmed": False,
+            "breadth": np.nan,
+            "sector": "Other",
+        }
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -1982,6 +2003,11 @@ elif page in ("Intraday", "Positional"):
                 "price_change_pct": np.nan,
                 "rank": 0,
             }
+            sector_conf = {
+                "confirmed": False,
+                "breadth": np.nan,
+                "sector": "Other",
+            }
 
             if mode == "Intraday":
                 # Only eligible stocks reach this point.
@@ -2068,6 +2094,10 @@ elif page in ("Intraday", "Positional"):
                         trade_direction,
                     )
 
+                    # Sector confirmation is additive only.
+                    # It never removes or changes the P&F trade.
+                    sector_direction = trade_direction
+
             # A star means: valid positional P&F trade + strong OI confirmation.
             # It does not create the trade.
             superior = (
@@ -2089,6 +2119,9 @@ elif page in ("Intraday", "Positional"):
                 "SL": sl,
                 "Recommendation": rec,
                 "_OI Rank": oi_conf["rank"],
+                "_Sector Confirmed": False,
+                "_Sector": "Other",
+                "_Sector Breadth %": np.nan,
             })
 
         except Exception:
@@ -2118,6 +2151,41 @@ elif page in ("Intraday", "Positional"):
         )
 
     res = pd.DataFrame(rows)
+
+    if mode == "Positional" and not res.empty:
+        for idx_row, trade_row in res.iterrows():
+            rec = str(trade_row.get("Recommendation", ""))
+            if rec not in ("🟢 LONG", "🔴 SHORT"):
+                continue
+
+            symbol_clean = str(trade_row["Script"]).replace("★ ", "").strip()
+            direction = "LONG" if rec == "🟢 LONG" else "SHORT"
+
+            sector_conf = positional_sector_confirmation(
+                res,
+                symbol_clean,
+                direction,
+            )
+
+            res.at[idx_row, "_Sector Confirmed"] = bool(
+                sector_conf["confirmed"]
+            )
+            res.at[idx_row, "_Sector"] = sector_conf["sector"]
+            res.at[idx_row, "_Sector Breadth %"] = sector_conf["breadth"]
+
+            # Visual marker:
+            # 2 confirmations = ★★
+            # 1 confirmation = ★
+            # 0 confirmations = no star
+            oi_ok = int(trade_row.get("_OI Rank", 0)) >= 3
+            sector_ok = bool(sector_conf["confirmed"])
+
+            if oi_ok and sector_ok:
+                res.at[idx_row, "Script"] = f"★★ {symbol_clean}"
+            elif oi_ok:
+                res.at[idx_row, "Script"] = f"★ {symbol_clean}"
+            elif sector_ok:
+                res.at[idx_row, "Script"] = f"★ {symbol_clean}"
 
     if mode == "Intraday":
         notify_new_trades(
