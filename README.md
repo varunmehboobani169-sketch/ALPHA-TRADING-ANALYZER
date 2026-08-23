@@ -1,13 +1,18 @@
-# ALPHA ANALYZER — DHAN V2 OPTION SELLER V5
+# ALPHA ANALYZER — DHAN STYLE OPTION CHAIN
 
-Added a client-facing expiry selector to the Option Seller module.
+The Option Seller module now presents the option chain in a Dhan-style layout:
 
-Behavior:
-- Fetches the active expiry list from Dhan.
-- Shows all available expiries in a dropdown.
-- Defaults to:
-  - Intraday: nearest active expiry.
-  - Positional: preferred current-month expiry.
-- Changing the expiry reloads the option chain for that expiry.
+CALLS (left) | STRIKE (centre) | PUTS (right)
 
-The rest of the Dhan v2 option-chain logic is unchanged.
+Columns:
+- OI
+- Change OI
+- Volume
+- IV
+- LTP
+- Delta
+
+The ATM strike is highlighted.
+
+Dhan v2 option-chain fetching, expiry selection, IV/OI analysis and alerts
+are unchanged.

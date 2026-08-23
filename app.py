@@ -1696,23 +1696,81 @@ elif page == "Option Seller":
         )
 
         st.markdown("### Option Chain")
+
+        # Dhan-style two-sided layout:
+        # CALLS | STRIKE | PUTS
+        chain_view = chain_df.copy()
+        chain_view["Strike"] = pd.to_numeric(chain_view["Strike"], errors="coerce")
+        chain_view = chain_view.dropna(subset=["Strike"])
+
+        calls = chain_view[chain_view["Side"] == "CE"].set_index("Strike").sort_index()
+        puts = chain_view[chain_view["Side"] == "PE"].set_index("Strike").sort_index()
+
+        strikes = sorted(set(calls.index.tolist()) | set(puts.index.tolist()))
+
+        rows = []
+        for strike in strikes:
+            ce = calls.loc[strike] if strike in calls.index else pd.Series(dtype=float)
+            pe = puts.loc[strike] if strike in puts.index else pd.Series(dtype=float)
+
+            def num(series, key):
+                if key not in series.index:
+                    return np.nan
+                return pd.to_numeric(series[key], errors="coerce")
+
+            rows.append({
+                "CE OI": num(ce, "OI"),
+                "CE ΔOI": num(ce, "Change OI"),
+                "CE Volume": num(ce, "Volume"),
+                "CE IV": num(ce, "IV"),
+                "CE LTP": num(ce, "LTP"),
+                "CE Δ": num(ce, "Delta"),
+                "STRIKE": strike,
+                "PE Δ": num(pe, "Delta"),
+                "PE LTP": num(pe, "LTP"),
+                "PE IV": num(pe, "IV"),
+                "PE Volume": num(pe, "Volume"),
+                "PE ΔOI": num(pe, "Change OI"),
+                "PE OI": num(pe, "OI"),
+            })
+
+        dhan_chain = pd.DataFrame(rows)
+
+        atm_strike = analysis["atm"]
+
+        def highlight_atm(row):
+            if pd.notna(atm_strike) and row["STRIKE"] == atm_strike:
+                return [
+                    "background-color: #174c38; color: white; font-weight: 700"
+                ] * len(row)
+            return [""] * len(row)
+
         st.dataframe(
-            chain_df[
-                [
-                    "Strike",
-                    "Side",
-                    "LTP",
-                    "IV",
-                    "OI",
-                    "Previous OI",
-                    "Change OI",
-                    "Volume",
-                    "Delta",
-                ]
-            ].sort_values(["Strike", "Side"]),
+            dhan_chain.style.apply(highlight_atm, axis=1),
             use_container_width=True,
             hide_index=True,
+            column_config={
+                "CE OI": st.column_config.NumberColumn("OI", format="%.0f"),
+                "CE ΔOI": st.column_config.NumberColumn("Δ OI", format="%.0f"),
+                "CE Volume": st.column_config.NumberColumn("Volume", format="%.0f"),
+                "CE IV": st.column_config.NumberColumn("IV", format="%.2f"),
+                "CE LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
+                "CE Δ": st.column_config.NumberColumn("Delta", format="%.2f"),
+                "STRIKE": st.column_config.NumberColumn("STRIKE", format="%.0f"),
+                "PE Δ": st.column_config.NumberColumn("Delta", format="%.2f"),
+                "PE LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
+                "PE IV": st.column_config.NumberColumn("IV", format="%.2f"),
+                "PE Volume": st.column_config.NumberColumn("Volume", format="%.0f"),
+                "PE ΔOI": st.column_config.NumberColumn("Δ OI", format="%.0f"),
+                "PE OI": st.column_config.NumberColumn("OI", format="%.0f"),
+            },
         )
+
+        st.caption(
+            "Calls on the left, strike prices in the centre, puts on the right. "
+            "ATM is highlighted."
+        )
+
 
     except Exception as exc:
         st.error("Option data is currently unavailable.")
