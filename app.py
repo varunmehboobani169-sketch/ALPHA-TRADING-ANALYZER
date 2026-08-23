@@ -2120,7 +2120,7 @@ elif page in ("Intraday", "Positional"):
                 "Recommendation": rec,
                 "_OI Rank": oi_conf["rank"],
                 "_Sector Confirmed": False,
-                "_Sector": "Other",
+                "_Sector": sector_of(symbol),
                 "_Sector Breadth %": np.nan,
             })
 
@@ -2136,6 +2136,9 @@ elif page in ("Intraday", "Positional"):
                 "SL": np.nan,
                 "Recommendation": "DATA ERROR",
                 "_OI Rank": 0,
+                "_Sector Confirmed": False,
+                "_Sector": sector_of(symbol),
+                "_Sector Breadth %": np.nan,
             })
 
         prog.progress(
@@ -2162,7 +2165,9 @@ elif page in ("Intraday", "Positional"):
             direction = "LONG" if rec == "🟢 LONG" else "SHORT"
 
             sector_conf = positional_sector_confirmation(
-                res,
+                res[
+                    ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation", "_Sector"]
+                ].copy(),
                 symbol_clean,
                 direction,
             )

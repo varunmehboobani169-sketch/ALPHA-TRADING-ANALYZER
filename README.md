@@ -1,20 +1,13 @@
-# ALPHA ANALYZER — POSITIONAL OI + SECTOR CONFIRMATION
+# ALPHA ANALYZER — POSITIONAL OI + SECTOR CONFIRMATION FIX
 
-Positional P&F remains the only trade gate.
+Fixes the sector-confirmation layer so it can actually calculate sector breadth.
 
-All valid P&F LONG/SHORT trades are displayed.
+Positional logic:
+- P&F decides all valid LONG/SHORT trades.
+- OI confirmation can add ★.
+- Sector confirmation can add ★.
+- Both confirmations can produce ★★.
+- No confirmation never removes the P&F trade.
 
-Additional backend confirmations:
-- Futures OI confirmation
-- Sector breadth confirmation
-
-Client markers:
-- `★` = one strong confirmation (OI or sector)
-- `★★` = both OI and sector confirm
-- no star = P&F trade without either confirmation
-
-The confirmation layers never remove or change the underlying P&F trade.
-
-Intraday:
-- unchanged
-- no sector/OI confirmation scan added
+The Sector column is backend-only and is not displayed to the client.
+Intraday remains unchanged.
