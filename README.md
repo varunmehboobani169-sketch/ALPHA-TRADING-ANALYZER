@@ -1,25 +1,16 @@
-# ALPHA ANALYZER — SIMPLE OPTION SELLER
+# ALPHA ANALYZER — CLIENT DISPLAY CLEAN
 
-Simple live decision logic:
+Client-facing trade tables now show only:
+- Script
+- LTP
+- Bias
+- Entry
+- SL
+- Recommendation
 
-1. IV
-   - Current IV versus the session opening IV.
-   - Sharp IV increase -> WAIT / risk.
+The following remain calculated and available internally in the backend:
+- Pattern
+- OI Confirmation
+- OI Change %
 
-2. OI
-   - Overall OI gives support and resistance.
-   - OI change gives fresh one-sided buildup.
-   - Heavy call buildup can favor SELL PUT.
-   - Heavy put buildup can favor SELL CALL.
-
-3. Expected range
-   - ATM CE premium + ATM PE premium.
-   - Compare expected range with OI support/resistance.
-
-4. Output
-   - SELL STRADDLE
-   - SELL PUT
-   - SELL CALL
-   - WAIT
-
-Analysis remains restricted to ATM +/- 20 strikes.
+The F&O OI confirmation layer and the core trade logic are unchanged.

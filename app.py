@@ -439,6 +439,7 @@ def future_quote_map(fut):
     except Exception:
         return {}
 
+@st.cache_data(ttl=60, show_spinner=False)
 def futures_oi_history(sec_id, lookback_days=7):
     """
     Fetch OI history for the SAME futures contract.
@@ -1383,6 +1384,72 @@ def simple_option_decision(index_name, recommendation, spot, atm, expected_move,
     return "WAIT", "Current conditions are not strong enough for a fresh option sale."
 
 
+
+def oi_confirmation_for_trade(sec_id, trade_direction):
+    """
+    Use nearest active NSE F&O futures price + OI behavior as confirmation.
+
+    LONG:
+      LONG BUILDUP     -> Strong Long
+      NEUTRAL          -> Long
+      SHORT COVERING   -> Weak Long
+      SHORT BUILDUP    -> Conflict
+
+    SHORT:
+      SHORT BUILDUP    -> Strong Short
+      NEUTRAL          -> Short
+      LONG UNWINDING   -> Weak Short
+      LONG BUILDUP     -> Conflict
+    """
+    if trade_direction not in ("LONG", "SHORT"):
+        return {
+            "label": "—",
+            "state": "—",
+            "oi_change_pct": np.nan,
+            "price_change_pct": np.nan,
+            "rank": 0,
+        }
+
+    x = classify_futures_oi(sec_id, trade_direction)
+    state = x.get("state", "UNAVAILABLE")
+
+    if state == "UNAVAILABLE":
+        return {
+            "label": "OI unavailable",
+            "state": state,
+            "oi_change_pct": x.get("oi_change_pct", np.nan),
+            "price_change_pct": x.get("price_change_pct", np.nan),
+            "rank": 0,
+        }
+
+    if trade_direction == "LONG":
+        mapping = {
+            "LONG BUILDUP": ("🟢 STRONG LONG", 3),
+            "NEUTRAL": ("🟢 LONG", 2),
+            "SHORT COVERING": ("🟡 WEAK LONG", 1),
+            "SHORT BUILDUP": ("⚠️ LONG CONFLICT", 0),
+            "LONG UNWINDING": ("⚠️ LONG WEAK", 1),
+        }
+    else:
+        mapping = {
+            "SHORT BUILDUP": ("🔴 STRONG SHORT", 3),
+            "NEUTRAL": ("🔴 SHORT", 2),
+            "LONG UNWINDING": ("🟡 WEAK SHORT", 1),
+            "LONG BUILDUP": ("⚠️ SHORT CONFLICT", 0),
+            "SHORT COVERING": ("⚠️ SHORT WEAK", 1),
+        }
+
+    label, rank = mapping.get(state, ("—", 0))
+
+    return {
+        "label": label,
+        "state": state,
+        "oi_change_pct": x.get("oi_change_pct", np.nan),
+        "price_change_pct": x.get("price_change_pct", np.nan),
+        "rank": rank,
+    }
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -1549,6 +1616,14 @@ elif page in ("Intraday", "Positional"):
         ltp = spot_map.get(sid, np.nan)
 
         try:
+            oi_conf = {
+                "label": "—",
+                "state": "—",
+                "oi_change_pct": np.nan,
+                "price_change_pct": np.nan,
+                "rank": 0,
+            }
+
             if mode == "Intraday":
                 # Only eligible stocks reach this point.
                 h = cached_cash_intraday(sid)
@@ -1619,14 +1694,29 @@ elif page in ("Intraday", "Positional"):
                 entry = p["entry"]
                 sl = p["sl"]
 
+            trade_direction = None
+            if rec in ("🟢 BUY", "🟢 LONG"):
+                trade_direction = "LONG"
+            elif rec in ("🔴 SELL", "🔴 SHORT"):
+                trade_direction = "SHORT"
+
+            if trade_direction is not None:
+                oi_conf = oi_confirmation_for_trade(
+                    sid,
+                    trade_direction,
+                )
+
             rows.append({
                 "Script": symbol,
                 "LTP": ltp,
                 "Bias": bias,
                 "Pattern": p.get("pattern", "—") if mode == "Positional" else "—",
+                "OI Confirmation": oi_conf["label"],
+                "OI Δ%": oi_conf["oi_change_pct"],
                 "Entry": entry,
                 "SL": sl,
                 "Recommendation": rec,
+                "_OI Rank": oi_conf["rank"],
             })
 
         except Exception:
@@ -1634,9 +1724,13 @@ elif page in ("Intraday", "Positional"):
                 "Script": symbol,
                 "LTP": ltp,
                 "Bias": "UNAVAILABLE",
+                "Pattern": "—",
+                "OI Confirmation": "DATA ERROR",
+                "OI Δ%": np.nan,
                 "Entry": np.nan,
                 "SL": np.nan,
                 "Recommendation": "DATA ERROR",
+                "_OI Rank": 0,
             })
 
         prog.progress(
@@ -1657,13 +1751,34 @@ elif page in ("Intraday", "Positional"):
         short_df = res[res["Recommendation"] == "🔴 SHORT"].copy()
         setup_df = res[res["Recommendation"] == "🟡 SETUP"].copy()
 
+    long_df = long_df.sort_values("_OI Rank", ascending=False)
+    short_df = short_df.sort_values("_OI Rank", ascending=False)
+
     def active_trade_style(row):
         rec = str(row.get("Recommendation", ""))
-        if rec == "🟢 LONG":
-            return ["background-color: #d9f2d9; color: #0b5d1e; font-weight: 700"] * len(row)
-        if rec == "🔴 SHORT":
-            return ["background-color: #f8d7da; color: #8a1c1c; font-weight: 700"] * len(row)
-        return [""] * len(row)
+        oi = str(row.get("OI Confirmation", ""))
+
+        if rec in ("🟢 BUY", "🟢 LONG"):
+            base = "background-color: #d9f2d9; color: #0b5d1e; font-weight: 700"
+        elif rec in ("🔴 SELL", "🔴 SHORT"):
+            base = "background-color: #f8d7da; color: #8a1c1c; font-weight: 700"
+        else:
+            base = ""
+
+        styles = [base] * len(row)
+
+        try:
+            oi_col = row.index.get_loc("OI Confirmation")
+            if "STRONG LONG" in oi or "STRONG SHORT" in oi:
+                styles[oi_col] = "background-color: #b7e4c7; color: #064420; font-weight: 800"
+            elif "CONFLICT" in oi:
+                styles[oi_col] = "background-color: #f8b4b4; color: #7a0000; font-weight: 800"
+            elif "WEAK" in oi:
+                styles[oi_col] = "background-color: #fff3cd; color: #7a5200; font-weight: 700"
+        except Exception:
+            pass
+
+        return styles
 
     st.markdown("## 🟢 BULLISH / LONG")
     if long_df.empty:
@@ -1671,8 +1786,8 @@ elif page in ("Intraday", "Positional"):
     else:
         st.dataframe(
             long_df[
-                ["Script", "LTP", "Bias", "Pattern", "Entry", "SL", "Recommendation"]
-            ].style.apply(active_trade_style, axis=1),
+                ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
+            ],
             use_container_width=True,
             hide_index=True,
         )
@@ -1683,20 +1798,20 @@ elif page in ("Intraday", "Positional"):
     else:
         st.dataframe(
             short_df[
-                ["Script", "LTP", "Bias", "Pattern", "Entry", "SL", "Recommendation"]
-            ].style.apply(active_trade_style, axis=1),
+                ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
+            ],
             use_container_width=True,
             hide_index=True,
         )
 
-    st.markdown("## ⚪ SIDEWAYS / NO ACTIVE PATTERN")
+    st.markdown("## ⚪ OTHER")
     sideways_df = res[res["Recommendation"] == "NO POSITION"].copy()
     if sideways_df.empty:
         st.info("No sideways instruments currently.")
     else:
         st.dataframe(
             sideways_df[
-                ["Script", "LTP", "Bias", "Pattern", "Entry", "SL", "Recommendation"]
+                ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
             ],
             use_container_width=True,
             hide_index=True,
