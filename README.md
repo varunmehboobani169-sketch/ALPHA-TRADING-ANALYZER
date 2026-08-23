@@ -1,13 +1,14 @@
-# ALPHA ANALYZER — OPTION SELLER WITH STRIKE SUGGESTIONS
+# ALPHA ANALYZER — OPTION SELLER STRIKE FIX
 
-The Option Seller module now provides exact strikes in addition to the strategy.
+Fixed the Option Seller runtime error:
+`too many values to unpack (expected 3, got 7)`
 
-Examples:
-- SELL STRADDLE -> current ATM CE + ATM PE
-- SELL PUT -> highest available put strike at/below the detected support
-- SELL CALL -> lowest available call strike at/above the detected resistance
+Cause:
+The strategy-suggestion function returns a dictionary with multiple fields,
+but the dashboard was trying to unpack it into three variables.
 
-The dashboard also shows the live premium for the recommended strike(s).
+Fix:
+The dashboard now reads the returned strategy dictionary explicitly and keeps
+the exact strike/premium suggestions.
 
-The strategy reason remains visible to the client without exposing proprietary
-calculation details.
+All other option-chain, expiry, IV/OI and alert logic is unchanged.

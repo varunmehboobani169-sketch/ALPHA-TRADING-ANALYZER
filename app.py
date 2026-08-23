@@ -1718,7 +1718,7 @@ elif page == "Option Seller":
             spot,
         )
 
-        strategy_name, strategy_reason, strategy_legs = option_strategy_suggestion(
+        strategy = option_strategy_suggestion(
             index_name=index_name,
             horizon=horizon,
             recommendation=analysis["recommendation"],
@@ -1732,6 +1732,9 @@ elif page == "Option Seller":
             oi_alert=oi_risk,
             chain_df=chain_df,
         )
+        strategy_name = strategy["strategy"]
+        strategy_reason = strategy["reason"]
+        strategy_legs = strategy["legs"]
 
         a, b, c, d = st.columns(4)
         a.metric("Index", index_name)
