@@ -1,23 +1,25 @@
-# ALPHA ANALYZER — OPTION SELLER ATM ±20
+# ALPHA ANALYZER — SIMPLE OPTION SELLER
 
-Client-facing Option Seller module for:
-- NIFTY
-- BANKNIFTY
-- SENSEX
+Simple live decision logic:
 
-Features:
-- Intraday / Positional
-- User-selectable expiry
-- Dhan v2 option-chain integration
-- Dhan-style two-sided option chain
-- ATM premium and IV
-- Expected range
-- OI support/resistance
-- Exact strike recommendation
-- IV and OI risk alerts
-- Analysis restricted to ATM ±20 strikes
+1. IV
+   - Current IV versus the session opening IV.
+   - Sharp IV increase -> WAIT / risk.
 
-ATM ±20 means:
-20 available strikes below ATM + ATM + 20 available strikes above ATM.
+2. OI
+   - Overall OI gives support and resistance.
+   - OI change gives fresh one-sided buildup.
+   - Heavy call buildup can favor SELL PUT.
+   - Heavy put buildup can favor SELL CALL.
 
-Use `app.py` as the Streamlit entry point.
+3. Expected range
+   - ATM CE premium + ATM PE premium.
+   - Compare expected range with OI support/resistance.
+
+4. Output
+   - SELL STRADDLE
+   - SELL PUT
+   - SELL CALL
+   - WAIT
+
+Analysis remains restricted to ATM +/- 20 strikes.

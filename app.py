@@ -1354,6 +1354,35 @@ def option_strategy_suggestion(
 
 
 
+
+def simple_option_decision(index_name, recommendation, spot, atm, expected_move,
+                           support, resistance, atm_iv, open_iv, oi_alert):
+    """Simple client-facing decision engine."""
+    if pd.isna(spot) or pd.isna(atm):
+        return "WAIT", "Live option data is incomplete."
+
+    if pd.notna(atm_iv) and pd.notna(open_iv):
+        iv_move = float(atm_iv) - float(open_iv)
+        if iv_move >= 2.5:
+            return "WAIT", "Volatility is rising sharply."
+
+    if recommendation == "🟢 SELL STRADDLE":
+        return "SELL STRADDLE", "IV and the expected range are supportive."
+
+    if oi_alert.get("alert"):
+        if oi_alert.get("side") == "CALL":
+            return "SELL PUT", "Call-side OI buildup is strong and downside support is holding."
+        if oi_alert.get("side") == "PUT":
+            return "SELL CALL", "Put-side OI buildup is strong and upside resistance is holding."
+
+    if pd.notna(expected_move) and pd.notna(support) and pd.notna(resistance):
+        if float(spot) - float(expected_move) >= float(support) * 0.995 and \
+           float(spot) + float(expected_move) <= float(resistance) * 1.005:
+            return "SELL STRADDLE", "The expected range fits inside the current support/resistance zone."
+
+    return "WAIT", "Current conditions are not strong enough for a fresh option sale."
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -1757,9 +1786,8 @@ elif page == "Option Seller":
             spot,
         )
 
-        strategy = option_strategy_suggestion(
+        strategy_name, strategy_reason = simple_option_decision(
             index_name=index_name,
-            horizon=horizon,
             recommendation=analysis["recommendation"],
             spot=spot,
             atm=analysis["atm"],
@@ -1769,11 +1797,7 @@ elif page == "Option Seller":
             atm_iv=analysis["atm_iv"],
             open_iv=session_state["open_iv"],
             oi_alert=oi_risk,
-            chain_df=chain_df,
         )
-        strategy_name = strategy["strategy"]
-        strategy_reason = strategy["reason"]
-        strategy_legs = strategy["legs"]
 
         a, b, c, d = st.columns(4)
         a.metric("Index", index_name)
@@ -1805,88 +1829,17 @@ elif page == "Option Seller":
         else:
             st.error("Do not sell under current conditions.")
 
-        st.markdown("### Strategy Suggestion")
-        if strategy_name in ("SELL STRADDLE", "SELL PUT", "SELL CALL"):
-            st.success(f"{strategy_name}: {strategy_legs}")
-        elif strategy_name == "NO FRESH SELL":
-            st.error(strategy_reason)
+        st.markdown("### Strategy")
+        if strategy_name == "SELL STRADDLE":
+            st.success(f"SELL {index_name} ATM CE + ATM PE")
+        elif strategy_name == "SELL PUT":
+            st.success(f"SELL {index_name} PUT")
+        elif strategy_name == "SELL CALL":
+            st.success(f"SELL {index_name} CALL")
         else:
-            st.warning(f"{strategy_name}: {strategy_reason}")
+            st.warning("WAIT")
 
         st.caption(f"Why: {strategy_reason}")
-
-        st.markdown("### Suggested Strike")
-        if strategy_name == "SELL STRADDLE":
-            s1, s2, s3 = st.columns(3)
-            s1.metric(
-                "CE Strike",
-                int(strategy["ce_strike"]) if pd.notna(strategy["ce_strike"]) else "—",
-            )
-            s2.metric(
-                "PE Strike",
-                int(strategy["pe_strike"]) if pd.notna(strategy["pe_strike"]) else "—",
-            )
-            s3.metric(
-                "Combined Premium",
-                (
-                    f"{strategy['ce_premium'] + strategy['pe_premium']:.2f}"
-                    if pd.notna(strategy["ce_premium"])
-                    and pd.notna(strategy["pe_premium"])
-                    else "—"
-                ),
-            )
-        elif strategy_name == "SELL PUT":
-            s1, s2 = st.columns(2)
-            s1.metric(
-                "PE Strike",
-                int(strategy["pe_strike"]) if pd.notna(strategy["pe_strike"]) else "—",
-            )
-            s2.metric(
-                "PE Premium",
-                f"{strategy['pe_premium']:.2f}"
-                if pd.notna(strategy["pe_premium"])
-                else "—",
-            )
-        elif strategy_name == "SELL CALL":
-            s1, s2 = st.columns(2)
-            s1.metric(
-                "CE Strike",
-                int(strategy["ce_strike"]) if pd.notna(strategy["ce_strike"]) else "—",
-            )
-            s2.metric(
-                "CE Premium",
-                f"{strategy['ce_premium']:.2f}"
-                if pd.notna(strategy["ce_premium"])
-                else "—",
-            )
-        else:
-            st.info("No specific strike is recommended right now.")
-
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric(
-            "Expected Range",
-            f"±{analysis['expected_move']:.2f}"
-            if pd.notna(analysis["expected_move"])
-            else "—",
-        )
-        r2.metric(
-            "Support",
-            f"{analysis['support']:,.0f}"
-            if pd.notna(analysis["support"])
-            else "—",
-        )
-        r3.metric(
-            "Resistance",
-            f"{analysis['resistance']:,.0f}"
-            if pd.notna(analysis["resistance"])
-            else "—",
-        )
-        r4.metric(
-            "Opening IV",
-            f"{session_state['open_iv']:.2f}%"
-            if pd.notna(session_state["open_iv"])
-            else "Recording",
-        )
 
         st.markdown("### Risk Alerts")
         risk_df = pd.DataFrame([
