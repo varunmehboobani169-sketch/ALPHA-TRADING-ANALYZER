@@ -2244,21 +2244,37 @@ if page == "Market Overview":
     st.caption("Current directional bias")
 
     def market_bias_from_history(sec_id, segment, instrument):
+        """
+        Daily close-only P&F bias:
+        - 0.25% box
+        - 3-box reversal
+        - active DTB + X => BULLISH
+        - active DBS + O => BEARISH
+        - otherwise SIDEWAYS
+        """
         try:
-            h = historical(sec_id, segment, instrument, "Positional")
+            h = historical(
+                sec_id,
+                segment,
+                instrument,
+                "Positional",
+            )
             if h.empty:
                 return "UNAVAILABLE"
 
-            cols = build_pnf(h["close"], 0.0025, 3)
-            if not cols:
-                return "SIDEWAYS"
+            p = analyze_new_pattern(
+                h,
+                0.0025,
+                anchor_min=0,
+                pullback_max=5,
+            )
 
-            last = cols[-1]
-
-            if last["type"] == "X":
+            if p.get("dtb") and p.get("bias") == "Bullish":
                 return "BULLISH"
-            if last["type"] == "O":
+
+            if p.get("dbs") and p.get("bias") == "Bearish":
                 return "BEARISH"
+
             return "SIDEWAYS"
 
         except Exception:
@@ -2268,6 +2284,7 @@ if page == "Market Overview":
 
     for name in ["NIFTY", "BANKNIFTY"]:
         sid = resolve_nse_index_security_id(master, name)
+
         overview.append({
             "Market": name,
             "Bias": (
@@ -2321,454 +2338,7 @@ if page == "Market Overview":
             f"{icon} {bias}",
         )
 
-    st.caption(
-        "Display only. No trade generation or OI confirmation runs here."
-    )
-
-
-elif page in ("Intraday", "Positional"):
-    mode = page
-    st.title(mode)
-    st.caption("Live trade monitor.")
-
-    fut = future_universe(master, "NSE")
-    if fut.empty:
-        st.error("No NSE F&O instruments available.")
-        st.stop()
-
-    # ---------------------------------------------------------
-    # INTRADAY: daily Anchor eligibility is calculated once/day
-    # ---------------------------------------------------------
-    if mode == "Intraday":
-        if "intraday_daily_filter" not in st.session_state:
-            st.session_state.intraday_daily_filter = {}
-        if "intraday_filter_date" not in st.session_state:
-            st.session_state.intraday_filter_date = None
-
-        today = datetime.now().date().isoformat()
-
-        if (
-            st.session_state.intraday_filter_date != today
-            or not st.session_state.intraday_daily_filter
-        ):
-            eligible = {}
-
-            prog = st.progress(
-                0,
-                text=f"Building today's opportunity universe: {len(fut)} instruments..."
-            )
-
-            for i, (_, r) in enumerate(fut.iterrows(), 1):
-                try:
-                    h = cached_cash_daily(int(r["underlying_security_id"]))
-                    cols = build_pnf(h["close"], 0.0025, 3)
-
-                    if cols:
-                        last = cols[-1]
-
-                        if last["type"] == "X" and last["boxes"] > 15:
-                            eligible[str(r["underlying_symbol"])] = "Bullish"
-                        elif last["type"] == "O" and last["boxes"] > 15:
-                            eligible[str(r["underlying_symbol"])] = "Bearish"
-                        else:
-                            eligible[str(r["underlying_symbol"])] = None
-                    else:
-                        eligible[str(r["underlying_symbol"])] = None
-
-                except Exception:
-                    eligible[str(r["underlying_symbol"])] = None
-
-                prog.progress(
-                    i / max(len(fut), 1),
-                    text=f"Universe {i}/{len(fut)}"
-                )
-
-            prog.empty()
-
-            st.session_state.intraday_daily_filter = eligible
-            st.session_state.intraday_filter_date = today
-
-        daily_map = st.session_state.intraday_daily_filter
-
-        allowed_symbols = {
-            symbol
-            for symbol, bias in daily_map.items()
-            if bias in ("Bullish", "Bearish")
-        }
-
-        candidates = fut[
-            fut["underlying_symbol"].isin(allowed_symbols)
-        ].copy()
-
-        st.info(
-            f"{len(candidates)} instruments currently eligible for intraday monitoring."
-        )
-
-        if st.button(
-            "Refresh Eligible Universe",
-            key="refresh_intraday_universe"
-        ):
-            st.session_state.intraday_daily_filter = {}
-            st.session_state.intraday_filter_date = None
-            st.rerun()
-
-    # ---------------------------------------------------------
-    # POSITIONAL: show the currently running daily direction
-    # ---------------------------------------------------------
-    else:
-        candidates = fut.copy()
-
-    ids = (
-        candidates["underlying_security_id"].astype(int).tolist()
-        if not candidates.empty else []
-    )
-
-    spot_map = batch_ltp("NSE_EQ", ids) if ids else {}
-
-    rows = []
-
-    prog = st.progress(
-        0,
-        text=f"Scanning {len(candidates)} instruments..."
-    )
-
-    for i, (_, r) in enumerate(candidates.iterrows(), 1):
-        symbol = str(r["underlying_symbol"])
-        sid = int(r["underlying_security_id"])
-        fut_sid = int(r["security_id"])
-        ltp = spot_map.get(sid, np.nan)
-
-        try:
-            oi_conf = {
-                "label": "—",
-                "state": "—",
-                "oi_change_pct": np.nan,
-                "price_change_pct": np.nan,
-                "rank": 0,
-            }
-            sector_conf = {
-                "confirmed": False,
-                "breadth": np.nan,
-                "sector": "Other",
-            }
-
-            if mode == "Intraday":
-                # Only eligible stocks reach this point.
-                h = cached_cash_intraday(sid)
-
-                ip = analyze_new_pattern(
-                    h,
-                    0.0015,
-                    anchor_min=15,
-                    pullback_max=5,
-                )
-
-                positional_bias = daily_map[symbol]
-
-                above_trend = (
-                    pd.notna(ltp)
-                    and pd.notna(intraday_sma10(h))
-                    and float(ltp) > float(intraday_sma10(h))
-                )
-                below_trend = (
-                    pd.notna(ltp)
-                    and pd.notna(intraday_sma10(h))
-                    and float(ltp) < float(intraday_sma10(h))
-                )
-
-                if (
-                    positional_bias == "Bullish"
-                    and ip["dtb"]
-                    and above_trend
-                ):
-                    rec = "🟢 BUY"
-
-                elif (
-                    positional_bias == "Bearish"
-                    and ip["dbs"]
-                    and below_trend
-                ):
-                    rec = "🔴 SELL"
-
-                elif (
-                    positional_bias == "Bullish"
-                    and ip["prospective"]
-                    and ip["bias"] == "Bullish"
-                    and above_trend
-                ):
-                    rec = "🟡 SETUP"
-
-                elif (
-                    positional_bias == "Bearish"
-                    and ip["prospective"]
-                    and ip["bias"] == "Bearish"
-                    and below_trend
-                ):
-                    rec = "🟡 SETUP"
-
-                else:
-                    rec = "NO TRADE"
-
-                bias = positional_bias
-                entry = ip.get("entry_level", np.nan)
-                sl = ip.get("sl", np.nan)
-
-            else:
-                # Positional = ACTIVE DTB/DBS only.
-                p = positional_active_pattern(sid)
-
-                bias = p["bias"]
-                rec = p["recommendation"]
-                entry = p["entry"]
-                sl = p["sl"]
-
-            # F&O OI confirmation runs ONLY for positional trades.
-            # Intraday remains lightweight and does not query futures OI.
-            if mode == "Positional":
-                trade_direction = None
-                if rec == "🟢 LONG":
-                    trade_direction = "LONG"
-                elif rec == "🔴 SHORT":
-                    trade_direction = "SHORT"
-
-                if trade_direction is not None:
-                    oi_conf = oi_confirmation_for_trade(
-                        fut_sid,
-                        trade_direction,
-                    )
-
-                    # Sector confirmation is additive only.
-                    # It never removes or changes the P&F trade.
-                    sector_direction = trade_direction
-
-            # A star means: valid positional P&F trade + strong OI confirmation.
-            # It does not create the trade.
-            superior = (
-                mode == "Positional"
-                and oi_conf.get("state") in ("LONG BUILDUP", "SHORT BUILDUP")
-                and oi_conf.get("rank", 0) >= 3
-                and rec in ("🟢 LONG", "🔴 SHORT")
-            )
-            display_symbol = f"★ {symbol}" if superior else symbol
-
-            rows.append({
-                "Script": display_symbol,
-                "LTP": ltp,
-                "Bias": bias,
-                "Pattern": p.get("pattern", "—") if mode == "Positional" else "—",
-                "OI Confirmation": oi_conf["label"],
-                "OI Δ%": oi_conf["oi_change_pct"],
-                "Entry": entry,
-                "SL": sl,
-                "Recommendation": rec,
-                "_OI Rank": oi_conf["rank"],
-                "_Sector Confirmed": False,
-                "_Sector": sector_of(symbol),
-                "_Sector Breadth %": np.nan,
-            })
-
-        except Exception:
-            rows.append({
-                "Script": symbol,
-                "LTP": ltp,
-                "Bias": "UNAVAILABLE",
-                "Pattern": "—",
-                "OI Confirmation": "DATA ERROR",
-                "OI Δ%": np.nan,
-                "Entry": np.nan,
-                "SL": np.nan,
-                "Recommendation": "DATA ERROR",
-                "_OI Rank": 0,
-                "_Sector Confirmed": False,
-                "_Sector": sector_of(symbol),
-                "_Sector Breadth %": np.nan,
-            })
-
-        prog.progress(
-            i / max(len(candidates), 1),
-            text=f"Scanning {i}/{max(len(candidates), 1)}"
-        )
-
-    prog.empty()
-
-    if mode == "Positional":
-        st.session_state["positional_oi_confirmed_count"] = int(
-            sum(1 for x in rows if str(x.get("Script", "")).startswith("★ "))
-        )
-
-    res = pd.DataFrame(rows)
-
-    if mode == "Positional" and not res.empty:
-        # IMPORTANT:
-        # Sector confirmation is based on the same 1% / 3-box daily
-        # Sector Analysis module, NOT the individual stock's 0.25% P&F.
-        fut_for_sector = future_universe(master, "NSE")
-        sector_map_1pct = sector_confirmation_1pct_map(
-            fut_for_sector
-        )
-
-        for idx_row, trade_row in res.iterrows():
-            rec = str(
-                trade_row.get("Recommendation", "")
-            )
-
-            if rec not in ("🟢 LONG", "🔴 SHORT"):
-                continue
-
-            symbol_clean = (
-                str(trade_row["Script"])
-                .replace("★★ ", "")
-                .replace("★ ", "")
-                .strip()
-            )
-
-            direction = (
-                "LONG"
-                if rec == "🟢 LONG"
-                else "SHORT"
-            )
-
-            sector_name = sector_of(symbol_clean)
-            sector_info = sector_map_1pct.get(
-                sector_name,
-                {
-                    "bullish_pct": np.nan,
-                    "bearish_pct": np.nan,
-                    "bias": "UNAVAILABLE",
-                    "stocks": 0,
-                },
-            )
-
-            sector_bias = sector_info["bias"]
-
-            if direction == "LONG":
-                sector_ok = sector_bias == "BULLISH"
-                breadth = sector_info["bullish_pct"]
-            else:
-                sector_ok = sector_bias == "BEARISH"
-                breadth = sector_info["bearish_pct"]
-
-            res.at[idx_row, "_Sector Confirmed"] = bool(
-                sector_ok
-            )
-            res.at[idx_row, "_Sector"] = sector_name
-            res.at[idx_row, "_Sector Breadth %"] = breadth
-
-            # ★ = one confirmation
-            # ★★ = both OI + sector confirmation
-            oi_ok = (
-                int(trade_row.get("_OI Rank", 0)) >= 3
-            )
-
-            if oi_ok and sector_ok:
-                res.at[idx_row, "Script"] = (
-                    f"★★ {symbol_clean}"
-                )
-            elif oi_ok or sector_ok:
-                res.at[idx_row, "Script"] = (
-                    f"★ {symbol_clean}"
-                )
-            else:
-                res.at[idx_row, "Script"] = symbol_clean
-
-
-    if mode == "Intraday":
-        notify_new_trades(
-            "NSE",
-            "Intraday",
-            res.loc[
-                res["Recommendation"].isin(["🟢 BUY", "🔴 SELL"]),
-                "Script",
-            ].tolist(),
-        )
-    else:
-        notify_new_trades(
-            "NSE",
-            "Positional",
-            res.loc[
-                res["Recommendation"].isin(["🟢 LONG", "🔴 SHORT"]),
-                "Script",
-            ].tolist(),
-        )
-
-    if mode == "Intraday":
-        long_df = res[res["Recommendation"] == "🟢 BUY"].copy()
-        short_df = res[res["Recommendation"] == "🔴 SELL"].copy()
-        setup_df = res[res["Recommendation"] == "🟡 SETUP"].copy()
-    else:
-        long_df = res[res["Recommendation"] == "🟢 LONG"].copy()
-        short_df = res[res["Recommendation"] == "🔴 SHORT"].copy()
-        setup_df = res[res["Recommendation"] == "🟡 SETUP"].copy()
-
-    long_df = long_df.sort_values("_OI Rank", ascending=False)
-    short_df = short_df.sort_values("_OI Rank", ascending=False)
-
-    def active_trade_style(row):
-        rec = str(row.get("Recommendation", ""))
-        oi = str(row.get("OI Confirmation", ""))
-
-        if rec in ("🟢 BUY", "🟢 LONG"):
-            base = "background-color: #d9f2d9; color: #0b5d1e; font-weight: 700"
-        elif rec in ("🔴 SELL", "🔴 SHORT"):
-            base = "background-color: #f8d7da; color: #8a1c1c; font-weight: 700"
-        else:
-            base = ""
-
-        styles = [base] * len(row)
-
-        try:
-            oi_col = row.index.get_loc("OI Confirmation")
-            if "STRONG LONG" in oi or "STRONG SHORT" in oi:
-                styles[oi_col] = "background-color: #b7e4c7; color: #064420; font-weight: 800"
-            elif "CONFLICT" in oi:
-                styles[oi_col] = "background-color: #f8b4b4; color: #7a0000; font-weight: 800"
-            elif "WEAK" in oi:
-                styles[oi_col] = "background-color: #fff3cd; color: #7a5200; font-weight: 700"
-        except Exception:
-            pass
-
-        return styles
-
-    if mode == "Positional":
-        st.caption("★ = OI or Sector confirmation • ★★ = OI + Sector confirmation")
-
-    st.markdown("## 🟢 BULLISH / LONG")
-    if long_df.empty:
-        st.info("No active bullish positions currently.")
-    else:
-        st.dataframe(
-            long_df[
-                ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.markdown("## 🔴 BEARISH / SHORT")
-    if short_df.empty:
-        st.info("No active bearish positions currently.")
-    else:
-        st.dataframe(
-            short_df[
-                ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.markdown("## ⚪ OTHER")
-    sideways_df = res[res["Recommendation"] == "NO POSITION"].copy()
-    if sideways_df.empty:
-        st.info("No sideways instruments currently.")
-    else:
-        st.dataframe(
-            sideways_df[
-                ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
+    st.caption("Market information only.")
 
 
 elif page == "MCX Futures":
@@ -3233,14 +2803,12 @@ elif page == "Option Seller":
     except Exception as exc:
         st.error("Option data is currently unavailable.")
         with st.expander("Data status"):
-            st.code(str(exc), language="text")
+            st.info("Please refresh or try again later.")
 
 
 elif page == "Sector Analysis":
     st.title("SECTOR ANALYSIS")
-    st.caption(
-        "NSE F&O • Daily close-only • 1% box • 3-box reversal • Manual refresh"
-    )
+    st.caption("Sector market view • Manual refresh only")
 
     fut = future_universe(master, "NSE")
 
@@ -3277,10 +2845,7 @@ elif page == "Sector Analysis":
             )
 
             if not stock_detail.empty:
-                st.warning(
-                    "Sector summary is empty, but stock-level P&F results "
-                    "were generated. Check the stock table below."
-                )
+                st.warning("Some sector data is currently unavailable. Please refresh.")
                 st.dataframe(
                     stock_detail,
                     use_container_width=True,
@@ -3294,22 +2859,13 @@ elif page == "Sector Analysis":
                 hide_index=True,
             )
 
-            with st.expander("Stock-level P&F results"):
-                st.dataframe(
-                    stock_detail.sort_values(
-                        ["Sector", "Bias", "Stock"]
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+            # Stock-level calculation remains backend-only.
+            # Do not expose calculation methodology or diagnostic stock list.
 
 
 elif page == "RS Matrix":
     st.title("RS MATRIX")
-    st.caption(
-        "Stock / NIFTY 50 ratio • Daily close-only • "
-        "3% / 2% / 1% / 0.25% P&F • Manual refresh"
-    )
+    st.caption("Relative strength market view • Manual refresh only")
 
     fut = future_universe(master, "NSE")
 
