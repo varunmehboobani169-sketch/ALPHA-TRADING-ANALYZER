@@ -1,12 +1,12 @@
-# ALPHA ANALYZER — PCR P&F FINAL
+# ALPHA ANALYZER — CLIENT PRO FINAL
 
-Option Seller now shows an actual P&F-style PCR chart instead of a simple
-stacked trend graphic.
+Presentation-only upgrade:
+- Professional dark trading-terminal theme
+- Cleaner sidebar
+- Polished page header
+- Rounded tables, metrics, alerts and controls
+- More consistent spacing and hierarchy
+- Improved notification panel styling
+- Client-facing wording remains methodology-safe
 
-Client-facing display:
-- PCR P&F chart with X/O columns
-- Current PCR value
-- Simple rising/falling legend
-
-Internal PCR construction settings remain backend-only.
-The existing option-chain, OI, IV, alerts, and other modules are unchanged.
+No trading, P&F, OI, sector, RS, MCX, option, or refresh logic was changed.
