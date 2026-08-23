@@ -2097,6 +2097,103 @@ def resolve_nse_index_security_id(master, symbol="NIFTY"):
         return None
 
 
+
+@st.cache_data(ttl=900, show_spinner=False)
+def sector_confirmation_1pct_map(fut):
+    """
+    Positional sector confirmation must come from the standalone Sector
+    Analysis logic: daily close-only, 1% box, 3-box reversal.
+
+    Returns:
+        {
+            sector: {
+                bullish_pct: ...,
+                bearish_pct: ...,
+                bias: "BULLISH"/"BEARISH"/"SIDEWAYS",
+                stocks: ...,
+            }
+        }
+    """
+    counts = {}
+
+    for _, r in fut.iterrows():
+        symbol = str(r.get("underlying_symbol", "")).strip()
+        sector = sector_of(symbol)
+
+        if sector not in counts:
+            counts[sector] = {
+                "bullish": 0,
+                "bearish": 0,
+                "stocks": 0,
+            }
+
+        try:
+            sid = int(r["underlying_security_id"])
+            h = manual_daily_close(sid)
+
+            if h is None or h.empty or "close" not in h.columns:
+                continue
+
+            close = pd.to_numeric(
+                h["close"],
+                errors="coerce",
+            ).dropna()
+
+            if len(close) < 10:
+                continue
+
+            direction = pnf_direction_from_close(
+                close,
+                0.01,
+            )
+
+            if direction not in ("BULLISH", "BEARISH"):
+                continue
+
+            counts[sector]["stocks"] += 1
+
+            if direction == "BULLISH":
+                counts[sector]["bullish"] += 1
+            else:
+                counts[sector]["bearish"] += 1
+
+        except Exception:
+            continue
+
+    result = {}
+
+    for sector, c in counts.items():
+        n = c["stocks"]
+
+        if n <= 0:
+            result[sector] = {
+                "bullish_pct": np.nan,
+                "bearish_pct": np.nan,
+                "bias": "UNAVAILABLE",
+                "stocks": 0,
+            }
+            continue
+
+        bull_pct = 100.0 * c["bullish"] / n
+        bear_pct = 100.0 * c["bearish"] / n
+
+        if bull_pct >= 50.0:
+            bias = "BULLISH"
+        elif bear_pct >= 50.0:
+            bias = "BEARISH"
+        else:
+            bias = "SIDEWAYS"
+
+        result[sector] = {
+            "bullish_pct": bull_pct,
+            "bearish_pct": bear_pct,
+            "bias": bias,
+            "stocks": n,
+        }
+
+    return result
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -2502,41 +2599,78 @@ elif page in ("Intraday", "Positional"):
     res = pd.DataFrame(rows)
 
     if mode == "Positional" and not res.empty:
+        # IMPORTANT:
+        # Sector confirmation is based on the same 1% / 3-box daily
+        # Sector Analysis module, NOT the individual stock's 0.25% P&F.
+        fut_for_sector = future_universe(master, "NSE")
+        sector_map_1pct = sector_confirmation_1pct_map(
+            fut_for_sector
+        )
+
         for idx_row, trade_row in res.iterrows():
-            rec = str(trade_row.get("Recommendation", ""))
+            rec = str(
+                trade_row.get("Recommendation", "")
+            )
+
             if rec not in ("🟢 LONG", "🔴 SHORT"):
                 continue
 
-            symbol_clean = str(trade_row["Script"]).replace("★ ", "").strip()
-            direction = "LONG" if rec == "🟢 LONG" else "SHORT"
-
-            sector_conf = positional_sector_confirmation(
-                res[
-                    ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation", "_Sector"]
-                ].copy(),
-                symbol_clean,
-                direction,
+            symbol_clean = (
+                str(trade_row["Script"])
+                .replace("★★ ", "")
+                .replace("★ ", "")
+                .strip()
             )
+
+            direction = (
+                "LONG"
+                if rec == "🟢 LONG"
+                else "SHORT"
+            )
+
+            sector_name = sector_of(symbol_clean)
+            sector_info = sector_map_1pct.get(
+                sector_name,
+                {
+                    "bullish_pct": np.nan,
+                    "bearish_pct": np.nan,
+                    "bias": "UNAVAILABLE",
+                    "stocks": 0,
+                },
+            )
+
+            sector_bias = sector_info["bias"]
+
+            if direction == "LONG":
+                sector_ok = sector_bias == "BULLISH"
+                breadth = sector_info["bullish_pct"]
+            else:
+                sector_ok = sector_bias == "BEARISH"
+                breadth = sector_info["bearish_pct"]
 
             res.at[idx_row, "_Sector Confirmed"] = bool(
-                sector_conf["confirmed"]
+                sector_ok
             )
-            res.at[idx_row, "_Sector"] = sector_conf["sector"]
-            res.at[idx_row, "_Sector Breadth %"] = sector_conf["breadth"]
+            res.at[idx_row, "_Sector"] = sector_name
+            res.at[idx_row, "_Sector Breadth %"] = breadth
 
-            # Visual marker:
-            # 2 confirmations = ★★
-            # 1 confirmation = ★
-            # 0 confirmations = no star
-            oi_ok = int(trade_row.get("_OI Rank", 0)) >= 3
-            sector_ok = bool(sector_conf["confirmed"])
+            # ★ = one confirmation
+            # ★★ = both OI + sector confirmation
+            oi_ok = (
+                int(trade_row.get("_OI Rank", 0)) >= 3
+            )
 
             if oi_ok and sector_ok:
-                res.at[idx_row, "Script"] = f"★★ {symbol_clean}"
+                res.at[idx_row, "Script"] = (
+                    f"★★ {symbol_clean}"
+                )
             elif oi_ok or sector_ok:
-                res.at[idx_row, "Script"] = f"★ {symbol_clean}"
+                res.at[idx_row, "Script"] = (
+                    f"★ {symbol_clean}"
+                )
             else:
                 res.at[idx_row, "Script"] = symbol_clean
+
 
     if mode == "Intraday":
         notify_new_trades(
@@ -2596,7 +2730,7 @@ elif page in ("Intraday", "Positional"):
         return styles
 
     if mode == "Positional":
-        st.caption("★ marks a higher-conviction positional trade.")
+        st.caption("★ = OI or Sector confirmation • ★★ = OI + Sector confirmation")
 
     st.markdown("## 🟢 BULLISH / LONG")
     if long_df.empty:
