@@ -2222,37 +2222,115 @@ def pcr_trend_columns(values):
     return build_pnf(vals,0.05,3) if len(vals)>=3 else []
 
 def render_pcr_positioning_chart(values):
-    vals=[float(v) for v in values if pd.notna(v)]
-    if not vals:
-        st.info("Positioning trend will appear after option data refreshes.")
-        return
-    cols=pcr_trend_columns(vals)
-    if not cols:
-        st.info(f"Positioning trend is building • Current reading: {vals[-1]:.2f}")
-        return
-    recent=cols[-12:]
-    height=max(150,min(290,90+max(4,max(int(c["boxes"]) for c in recent))*11))
-    parts=[]
-    for c in recent:
-        glyph="▮" if c["type"]=="X" else "▯"
-        parts.append(
-            "<div style='display:flex;flex-direction:column;justify-content:flex-end;"
-            "align-items:center;min-width:20px;height:100%;gap:2px;'>"
-            + "".join(
-                f"<span style='font-size:13px;line-height:11px'>{glyph}</span>"
-                for _ in range(max(1,int(c["boxes"])))
-            )
-            + "</div>"
-        )
-    html=f"""<div style="border:1px solid rgba(255,255,255,.10);border-radius:16px;padding:16px;
-    background:linear-gradient(145deg,rgba(255,255,255,.055),rgba(255,255,255,.018));
-    box-shadow:0 8px 24px rgba(0,0,0,.16);">
-    <div style="font-size:1.05rem;font-weight:800;margin-bottom:4px;">Positioning Trend</div>
-    <div style="font-size:.76rem;opacity:.55;margin-bottom:12px;">Current reading: {vals[-1]:.2f}</div>
-    <div style="height:{height-55}px;display:flex;align-items:flex-end;gap:12px;overflow:hidden;
-    border-bottom:1px solid rgba(255,255,255,.10);padding:8px 4px;">{''.join(parts)}</div></div>"""
-    st.components.v1.html(html,height=height,scrolling=False)
+    """Client-facing PCR P&F chart. Internal construction settings stay hidden."""
+    vals = [float(v) for v in values if pd.notna(v)]
 
+    if len(vals) < 3:
+        st.info("Positioning trend will appear after more option-data updates.")
+        return
+
+    cols = pcr_trend_columns(vals)
+    if not cols:
+        st.info("Positioning trend is building.")
+        return
+
+    # Draw a simple, readable P&F chart as inline SVG.
+    recent = cols[-14:]
+    max_boxes = max(5, max(int(c["boxes"]) for c in recent))
+    min_rows = 5
+    rows = max(min_rows, max_boxes)
+
+    col_w = 32
+    row_h = 20
+    left_pad = 24
+    top_pad = 28
+    right_pad = 18
+    bottom_pad = 22
+
+    width = left_pad + len(recent) * col_w + right_pad
+    height = top_pad + rows * row_h + bottom_pad
+
+    svg = [
+        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        'xmlns="http://www.w3.org/2000/svg" role="img" aria-label="PCR P and F chart">'
+    ]
+
+    # Grid
+    for r in range(rows + 1):
+        y = top_pad + r * row_h
+        svg.append(
+            f'<line x1="{left_pad}" y1="{y}" x2="{width-right_pad}" y2="{y}" '
+            'stroke="rgba(255,255,255,.10)" stroke-width="1"/>'
+        )
+
+    for j in range(len(recent) + 1):
+        x = left_pad + j * col_w
+        svg.append(
+            f'<line x1="{x}" y1="{top_pad}" x2="{x}" y2="{top_pad+rows*row_h}" '
+            'stroke="rgba(255,255,255,.05)" stroke-width="1"/>'
+        )
+
+    # Column X/O marks
+    for j, c in enumerate(recent):
+        x = left_pad + j * col_w + col_w / 2
+        boxes = max(1, int(c["boxes"]))
+        boxes = min(boxes, rows)
+
+        for k in range(boxes):
+            y = top_pad + (rows - 1 - k) * row_h + row_h / 2
+
+            if c["type"] == "X":
+                svg.append(
+                    f'<text x="{x}" y="{y+5}" text-anchor="middle" '
+                    'font-size="16" font-weight="700" fill="#47d18c">X</text>'
+                )
+            else:
+                svg.append(
+                    f'<text x="{x}" y="{y+5}" text-anchor="middle" '
+                    'font-size="16" font-weight="700" fill="#ff5c69">O</text>'
+                )
+
+    # Title + current PCR
+    current = vals[-1]
+    svg.append(
+        f'<text x="{left_pad}" y="16" fill="white" font-size="14" '
+        'font-weight="700">PCR P&amp;F</text>'
+    )
+    svg.append(
+        f'<text x="{width-right_pad}" y="16" text-anchor="end" '
+        'fill="rgba(255,255,255,.65)" font-size="12">Current {current:.2f}</text>'
+    )
+    svg.append("</svg>")
+
+    html = f"""
+    <div style="
+        border:1px solid rgba(255,255,255,.10);
+        border-radius:16px;
+        padding:14px 14px 10px 14px;
+        background:linear-gradient(145deg,
+            rgba(255,255,255,.055),
+            rgba(255,255,255,.018));
+        box-shadow:0 8px 24px rgba(0,0,0,.16);
+    ">
+        {''.join(svg)}
+        <div style="
+            display:flex;
+            justify-content:space-between;
+            margin-top:4px;
+            font-size:11px;
+            opacity:.55;
+        ">
+            <span>🟢 Rising positioning</span>
+            <span>🔴 Falling positioning</span>
+        </div>
+    </div>
+    """
+
+    st.components.v1.html(
+        html,
+        height=height + 66,
+        scrolling=False,
+    )
 
 # -----------------------------
 # Main
@@ -3275,7 +3353,7 @@ elif page == "Option Seller":
             if not pcr_history or (now_ts-pcr_history[-1][0]).total_seconds()>=45:
                 pcr_history.append((now_ts,float(pcr_now)))
         pcr_history[:]=pcr_history[-120:]
-        st.markdown("### Positioning Trend")
+        st.markdown("### PCR Positioning")
         render_pcr_positioning_chart([v for _,v in pcr_history])
 
 
