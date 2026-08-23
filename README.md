@@ -1,13 +1,18 @@
-# ALPHA ANALYZER — POSITIONAL OI + SECTOR CONFIRMATION FIX
+# ALPHA ANALYZER — FINAL BUILD WITH SECTOR ANALYSIS FIX
 
-Fixes the sector-confirmation layer so it can actually calculate sector breadth.
+Sector Analysis:
+- NSE F&O universe
+- Daily close-only
+- 1% P&F box
+- 3-box reversal
+- Manual refresh only
+- Keeps stocks even when sector mapping is unavailable
+- Shows sector summary and stock-level results for diagnosis
 
-Positional logic:
-- P&F decides all valid LONG/SHORT trades.
-- OI confirmation can add ★.
-- Sector confirmation can add ★.
-- Both confirmations can produce ★★.
-- No confirmation never removes the P&F trade.
+RS Matrix:
+- NIFTY 50 only
+- Stock/NIFTY 50 daily close ratio
+- 3%, 2%, 1%, 0.25% P&F
+- Manual refresh only
 
-The Sector column is backend-only and is not displayed to the client.
-Intraday remains unchanged.
+All other existing modules remain in app.py.

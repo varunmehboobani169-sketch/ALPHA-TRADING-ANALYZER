@@ -24,11 +24,11 @@ if "api_log" not in st.session_state:
 with st.sidebar:
     st.title("ALPHA ANALYZER")
     st.session_state.client_id = st.text_input(
-        "Client Code",
+        "User Name",
         value=st.session_state.client_id,
     ).strip()
     st.session_state.access_token = st.text_input(
-        "Access Token",
+        "Password",
         value=st.session_state.access_token,
         type="password",
     ).strip()
@@ -42,6 +42,8 @@ with st.sidebar:
             "Positional",
             "MCX Futures",
             "Market Overview",
+            "Sector Analysis",
+            "RS Matrix",
         ],
     )
 
@@ -1759,6 +1761,223 @@ def positional_sector_confirmation(df, symbol, direction):
         }
 
 
+
+# -----------------------------
+# Manual Sector Analysis + RS Matrix
+# -----------------------------
+@st.cache_data(ttl=900, show_spinner=False)
+def manual_daily_close(sec_id):
+    return cached_cash_daily(int(sec_id))
+
+@st.cache_data(ttl=900, show_spinner=False)
+def manual_index_daily(sec_id):
+    return historical(int(sec_id), "NSE_IDX", "INDEX", "Positional")
+
+def pnf_direction_from_close(close_series, box_pct):
+    s = pd.to_numeric(close_series, errors="coerce").dropna()
+    if len(s) < 3:
+        return "UNAVAILABLE"
+    cols = build_pnf(s, box_pct, 3)
+    if not cols:
+        return "SIDEWAYS"
+    return "BULLISH" if cols[-1]["type"] == "X" else "BEARISH"
+
+def run_sector_analysis_manual(fut):
+    """
+    Sector Analysis:
+    - NSE F&O universe
+    - Daily timeframe
+    - Close-only
+    - 1% P&F box
+    - 3-box reversal
+
+    Returns a sector summary. The stock-level calculation is also retained
+    in session state by the page so an empty sector summary can be diagnosed.
+    """
+    rows = []
+    progress = st.progress(0, text="Building sector analysis...")
+    total = len(fut)
+
+    for i, (_, r) in enumerate(fut.iterrows(), 1):
+        symbol = str(r.get("underlying_symbol", "")).strip()
+
+        try:
+            sec_id = int(r["underlying_security_id"])
+        except Exception:
+            progress.progress(i / max(total, 1), text=f"Sector: {symbol}")
+            continue
+
+        # Use the existing daily cash history loader. Do not rely on a
+        # particular column name beyond close/datetime/date.
+        try:
+            h = manual_daily_close(sec_id)
+        except Exception:
+            h = pd.DataFrame()
+
+        if h is None or h.empty or "close" not in h.columns:
+            progress.progress(i / max(total, 1), text=f"Sector: {symbol}")
+            continue
+
+        close = pd.to_numeric(h["close"], errors="coerce")
+        close = close.dropna()
+
+        if len(close) < 10:
+            progress.progress(i / max(total, 1), text=f"Sector: {symbol}")
+            continue
+
+        # Existing P&F builder is close-only. 1% box, 3-box reversal.
+        try:
+            bias = pnf_direction_from_close(close, 0.01)
+        except Exception:
+            bias = "UNAVAILABLE"
+
+        if bias not in ("BULLISH", "BEARISH"):
+            progress.progress(i / max(total, 1), text=f"Sector: {symbol}")
+            continue
+
+        # Always retain the stock. If the existing sector map has no entry,
+        # put it into "Other" rather than dropping it silently.
+        try:
+            sector = str(sector_of(symbol)).strip()
+        except Exception:
+            sector = "Other"
+
+        if not sector or sector.lower() in ("none", "nan"):
+            sector = "Other"
+
+        rows.append({
+            "Sector": sector,
+            "Stock": symbol,
+            "Bias": bias,
+        })
+
+        progress.progress(i / max(total, 1), text=f"Sector: {symbol}")
+
+    progress.empty()
+
+    stock_df = pd.DataFrame(rows)
+
+    if stock_df.empty:
+        return pd.DataFrame(), stock_df
+
+    result = []
+
+    for sector, g in stock_df.groupby("Sector", dropna=False):
+        stocks = len(g)
+        bullish = int((g["Bias"] == "BULLISH").sum())
+        bearish = int((g["Bias"] == "BEARISH").sum())
+
+        bull_pct = 100.0 * bullish / stocks if stocks else 0.0
+        bear_pct = 100.0 * bearish / stocks if stocks else 0.0
+
+        if bull_pct >= 50:
+            bias = "🟢 BULLISH"
+        elif bear_pct >= 50:
+            bias = "🔴 BEARISH"
+        else:
+            bias = "🟡 SIDEWAYS"
+
+        result.append({
+            "Sector": sector,
+            "Bias": bias,
+            "Bullish": bullish,
+            "Bearish": bearish,
+            "Stocks": stocks,
+            "Bullish %": round(bull_pct, 1),
+            "Bearish %": round(bear_pct, 1),
+        })
+
+    summary = pd.DataFrame(result).sort_values(
+        ["Bullish %", "Bearish %", "Stocks"],
+        ascending=[False, True, False],
+    ).reset_index(drop=True)
+
+    return summary, stock_df
+
+
+def run_rs_matrix_manual(fut):
+    """
+    Relative Strength Matrix versus NIFTY 50.
+
+    RS = Stock daily close / NIFTY 50 daily close.
+    Apply P&F independently to the raw ratio at 3%, 2%, 1%, 0.25%.
+    NIFTY 50 itself is not converted to P&F first.
+    """
+    nifty = manual_index_daily(13)
+    if nifty.empty or "close" not in nifty.columns:
+        return pd.DataFrame()
+
+    nifty = nifty[["datetime", "close"]].copy()
+    nifty["date"] = pd.to_datetime(nifty["datetime"], errors="coerce").dt.date
+    nifty["close"] = pd.to_numeric(nifty["close"], errors="coerce")
+    nifty = nifty.dropna(subset=["date", "close"])
+    nifty = nifty.groupby("date")["close"].last()
+
+    rows = []
+    progress = st.progress(0, text="Building RS Matrix vs NIFTY 50...")
+    total = len(fut)
+
+    for i, (_, r) in enumerate(fut.iterrows(), 1):
+        symbol = str(r["underlying_symbol"])
+        h = manual_daily_close(int(r["underlying_security_id"]))
+
+        if not h.empty and "close" in h.columns:
+            stock = h[["datetime", "close"]].copy()
+            stock["date"] = pd.to_datetime(stock["datetime"], errors="coerce").dt.date
+            stock["close"] = pd.to_numeric(stock["close"], errors="coerce")
+            stock = stock.dropna(subset=["date", "close"])
+            stock = stock.groupby("date")["close"].last()
+
+            common = stock.index.intersection(nifty.index)
+            if len(common) >= 3:
+                ratio = (
+                    stock.loc[common].astype(float)
+                    / nifty.loc[common].astype(float)
+                ).dropna()
+
+                row = {"Stock": symbol}
+
+                for label, box in [
+                    ("3%", 0.03),
+                    ("2%", 0.02),
+                    ("1%", 0.01),
+                    ("0.25%", 0.0025),
+                ]:
+                    d = pnf_direction_from_close(ratio, box)
+                    row[label] = (
+                        "🟢 OUTPERFORM"
+                        if d == "BULLISH"
+                        else "🔴 UNDERPERFORM"
+                        if d == "BEARISH"
+                        else "🟡 SIDEWAYS"
+                        if d == "SIDEWAYS"
+                        else "⚪ N/A"
+                    )
+
+                row["_score"] = sum(
+                    1 if row[k] == "🟢 OUTPERFORM"
+                    else -1 if row[k] == "🔴 UNDERPERFORM"
+                    else 0
+                    for k in ["3%", "2%", "1%", "0.25%"]
+                )
+                rows.append(row)
+
+        progress.progress(
+            i / max(total, 1),
+            text=f"RS Matrix: {symbol}",
+        )
+
+    progress.empty()
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows).sort_values(
+        ["_score", "Stock"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -1786,11 +2005,14 @@ if auto:
             mins = 1 if st.session_state.get("option_horizon", "Intraday") == "Intraday" else 3
         elif page == "MCX Futures":
             mins = 1 if st.session_state.get("mcx_futures_mode", "Intraday") == "Intraday" else 15
+        elif page in ("Sector Analysis", "RS Matrix"):
+            mins = None
         else:
             mins = 15
         if page == "Market Overview":
             mins = 3
-        st_autorefresh(interval=mins * 60 * 1000, key=f"refresh_{page}")
+        if mins is not None:
+            st_autorefresh(interval=mins * 60 * 1000, key=f"refresh_{page}")
         if page == "Intraday":
             st.caption("Live intraday monitor — updates every minute.")
         elif page == "Option Seller":
@@ -2754,6 +2976,113 @@ elif page == "Option Seller":
         st.error("Option data is currently unavailable.")
         with st.expander("Data status"):
             st.code(str(exc), language="text")
+
+
+elif page == "Sector Analysis":
+    st.title("SECTOR ANALYSIS")
+    st.caption(
+        "NSE F&O • Daily close-only • 1% box • 3-box reversal • Manual refresh"
+    )
+
+    fut = future_universe(master, "NSE")
+
+    if fut.empty:
+        st.error("No NSE F&O universe available.")
+    else:
+        if st.button(
+            "🔄 Calculate / Refresh Sector Analysis",
+            key="sector_manual_refresh",
+        ):
+            # Only clear the analysis caches. Do not destroy login/session data.
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+
+            summary, stock_detail = run_sector_analysis_manual(fut)
+            st.session_state.sector_analysis_result = summary
+            st.session_state.sector_stock_detail = stock_detail
+
+        result = st.session_state.get(
+            "sector_analysis_result",
+            pd.DataFrame(),
+        )
+        stock_detail = st.session_state.get(
+            "sector_stock_detail",
+            pd.DataFrame(),
+        )
+
+        if result.empty:
+            st.info(
+                "Press 'Calculate / Refresh Sector Analysis' to calculate "
+                "sector strength."
+            )
+
+            if not stock_detail.empty:
+                st.warning(
+                    "Sector summary is empty, but stock-level P&F results "
+                    "were generated. Check the stock table below."
+                )
+                st.dataframe(
+                    stock_detail,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        else:
+            st.subheader("Sector Strength")
+            st.dataframe(
+                result,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            with st.expander("Stock-level P&F results"):
+                st.dataframe(
+                    stock_detail.sort_values(
+                        ["Sector", "Bias", "Stock"]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+
+elif page == "RS Matrix":
+    st.title("RS MATRIX")
+    st.caption(
+        "Stock / NIFTY 50 ratio • Daily close-only • "
+        "3% / 2% / 1% / 0.25% P&F • Manual refresh"
+    )
+
+    fut = future_universe(master, "NSE")
+
+    if fut.empty:
+        st.error("No NSE F&O universe available.")
+    else:
+        if st.button(
+            "🔄 Calculate / Refresh RS Matrix",
+            key="rs_manual_refresh",
+        ):
+            st.cache_data.clear()
+            st.session_state.rs_matrix_result = run_rs_matrix_manual(fut)
+
+        result = st.session_state.get(
+            "rs_matrix_result",
+            pd.DataFrame(),
+        )
+
+        if result.empty:
+            st.info("Press the button above to calculate relative strength.")
+        else:
+            display_result = result.drop(
+                columns=["_score"],
+                errors="ignore",
+            )
+
+            st.dataframe(
+                display_result,
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 else:
