@@ -24,6 +24,11 @@ if "api_log" not in st.session_state:
 with st.sidebar:
     st.title("ALPHA ANALYZER")
     st.caption("Professional market dashboard")
+    st.markdown(
+        "<div style='margin:4px 0 14px 0;opacity:.48;font-size:.72rem;"
+        "letter-spacing:.08em;'>MARKET INTELLIGENCE</div>",
+        unsafe_allow_html=True,
+    )
     st.session_state.client_id = st.text_input(
         "User Name",
         value=st.session_state.client_id,
@@ -54,149 +59,16 @@ with st.sidebar:
 # -----------------------------
 st.markdown(
     """
-    <style>
-    /* Overall app */
-    .stApp {
-        background:
-            radial-gradient(circle at 10% 0%, rgba(82,120,255,.10), transparent 28%),
-            radial-gradient(circle at 90% 10%, rgba(43,200,150,.08), transparent 25%),
-            linear-gradient(180deg, #0b1020 0%, #0a0f1b 100%);
-    }
-
-    /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #0d1324 0%, #0a0f1b 100%);
-        border-right: 1px solid rgba(255,255,255,.07);
-    }
-    section[data-testid="stSidebar"] .block-container {
-        padding-top: 1.2rem;
-    }
-    section[data-testid="stSidebar"] h1 {
-        letter-spacing: .04em;
-        font-weight: 800;
-    }
-
-    /* Main content */
-    .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
-        max-width: 1500px;
-    }
-
-    /* Page title polish */
-    h1, h2, h3 {
-        letter-spacing: -.02em;
-    }
-
-    /* Inputs */
-    div[data-baseweb="input"] > div,
-    div[data-baseweb="select"] > div {
-        border-radius: 10px !important;
-        background: rgba(255,255,255,.035) !important;
-        border-color: rgba(255,255,255,.09) !important;
-    }
-
-    /* Buttons */
-    .stButton > button {
-        border-radius: 10px;
-        border: 1px solid rgba(255,255,255,.09);
-        background: linear-gradient(135deg, rgba(83,120,255,.95), rgba(78,87,170,.95));
-        font-weight: 700;
-        min-height: 2.45rem;
-        box-shadow: 0 6px 18px rgba(0,0,0,.18);
-    }
-    .stButton > button:hover {
-        border-color: rgba(255,255,255,.18);
-        transform: translateY(-1px);
-    }
-
-    /* Metric cards */
-    div[data-testid="stMetric"] {
-        border-radius: 14px;
-        padding: 12px 14px;
-        background: rgba(255,255,255,.035);
-        border: 1px solid rgba(255,255,255,.07);
-        box-shadow: 0 8px 22px rgba(0,0,0,.12);
-    }
-
-    /* Dataframes / tables */
-    div[data-testid="stDataFrame"] {
-        border-radius: 14px;
-        overflow: hidden;
-        border: 1px solid rgba(255,255,255,.07);
-        box-shadow: 0 8px 22px rgba(0,0,0,.10);
-    }
-
-    /* Expanders */
-    div[data-testid="stExpander"] {
-        border-radius: 12px;
-        border: 1px solid rgba(255,255,255,.07);
-        background: rgba(255,255,255,.025);
-    }
-
-    /* Alerts */
-    div[data-testid="stAlert"] {
-        border-radius: 12px;
-    }
-
-    /* Horizontal rules */
-    hr {
-        border-color: rgba(255,255,255,.07);
-    }
-
-    /* Small helper text */
-    .alpha-muted {
-        color: rgba(255,255,255,.56);
-        font-size: .78rem;
-    }
-
-    .alpha-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        padding: 14px 16px;
-        margin-bottom: 16px;
-        border-radius: 16px;
-        background: linear-gradient(135deg, rgba(255,255,255,.055), rgba(255,255,255,.018));
-        border: 1px solid rgba(255,255,255,.07);
-        box-shadow: 0 8px 26px rgba(0,0,0,.14);
-    }
-
-    .alpha-brand {
-        font-weight: 850;
-        font-size: 1.05rem;
-        letter-spacing: .05em;
-    }
-
-    .alpha-status {
-        font-size: .72rem;
-        color: rgba(255,255,255,.56);
-    }
-
-    @media (max-width: 900px) {
-        .block-container {
-            padding-left: 0.8rem;
-            padding-right: 0.8rem;
-        }
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    """
-    <div class="alpha-header">
-        <div>
-            <div class="alpha-brand">ALPHA ANALYZER</div>
-            <div class="alpha-muted">Market intelligence & trade monitoring</div>
-        </div>
-        <div class="alpha-status">LIVE CLIENT DASHBOARD</div>
+    <div class="alpha-statusbar">
+        <span class="alpha-live-dot"></span>
+        <span>ALPHA ANALYZER</span>
+        <span class="alpha-divider">•</span>
+        <span class="alpha-status-text">LIVE MARKET DASHBOARD</span>
     </div>
     """,
     unsafe_allow_html=True,
 )
+
 
 def headers():
     if not st.session_state.client_id or not st.session_state.access_token:
@@ -2491,7 +2363,41 @@ if page == "Market Overview":
     .market-name{font-size:.82rem;font-weight:700;opacity:.75;margin-bottom:10px;}
     .market-bias{font-size:1.18rem;font-weight:800;}
     .market-sub{margin-top:7px;font-size:.70rem;opacity:.50;}
-    </style>
+    
+    .alpha-statusbar {
+        display:flex;
+        align-items:center;
+        gap:9px;
+        padding:9px 13px;
+        margin:0 0 18px 0;
+        border-radius:12px;
+        background:rgba(255,255,255,.028);
+        border:1px solid rgba(255,255,255,.06);
+        color:rgba(255,255,255,.78);
+        font-size:.78rem;
+        font-weight:750;
+        letter-spacing:.04em;
+    }
+
+    .alpha-live-dot {
+        width:8px;
+        height:8px;
+        border-radius:50%;
+        background:#47d18c;
+        box-shadow:0 0 12px rgba(71,209,140,.55);
+        flex:0 0 auto;
+    }
+
+    .alpha-divider {
+        opacity:.35;
+    }
+
+    .alpha-status-text {
+        opacity:.55;
+        font-weight:650;
+        letter-spacing:.03em;
+    }
+</style>
     """,unsafe_allow_html=True)
 
     def _market_parts(bias):

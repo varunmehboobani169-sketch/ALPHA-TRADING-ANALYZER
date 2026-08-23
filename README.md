@@ -1,12 +1,9 @@
-# ALPHA ANALYZER — CLIENT PRO FINAL
+# ALPHA ANALYZER — CLIENT PRO V2
 
-Presentation-only upgrade:
-- Professional dark trading-terminal theme
-- Cleaner sidebar
-- Polished page header
-- Rounded tables, metrics, alerts and controls
-- More consistent spacing and hierarchy
-- Improved notification panel styling
-- Client-facing wording remains methodology-safe
-
-No trading, P&F, OI, sector, RS, MCX, option, or refresh logic was changed.
+UI-only improvement:
+- Removes the large top brand header that could be clipped by Streamlit's
+  top toolbar.
+- Replaces it with a compact, clean live status bar.
+- Adds more top padding to the main content area.
+- Keeps the full ALPHA ANALYZER brand prominent in the sidebar.
+- Preserves all trading/data/refresh logic unchanged.
