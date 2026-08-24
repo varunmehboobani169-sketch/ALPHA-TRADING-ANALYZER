@@ -1,15 +1,15 @@
 
 import os
 from datetime import datetime, timedelta
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 from zoneinfo import ZoneInfo
+ALPHA_LOGO_PATH = Path(__file__).resolve().parent / "alpha_analyzer_logo.png"
 
-st.set_page_config(page_title="ALPHA ANALYZER V9", page_icon="α", layout="wide")
+st.set_page_config(page_title="ALPHA ANALYZER", page_icon="α", layout="wide")
 
 API = "https://api.dhan.co/v2"
 LOCAL_TZ = ZoneInfo("Asia/Kolkata")
@@ -35,24 +35,28 @@ if "trade_book" not in st.session_state:
 
 if "trade_sequence" not in st.session_state:
     st.session_state.trade_sequence = 0
-if "fresh_trade_log" not in st.session_state:
-    st.session_state.fresh_trade_log = []
-if "fresh_trade_loaded_date" not in st.session_state:
-    st.session_state.fresh_trade_loaded_date = None
 
 with st.sidebar:
-    st.markdown(
-        """
-        <div class="a-brand">
-            <div class="a-mark">A</div>
-            <div>
+    logo_col, brand_col = st.columns([1, 3], gap="small")
+    with logo_col:
+        if ALPHA_LOGO_PATH.exists():
+            st.image(str(ALPHA_LOGO_PATH), width=46)
+        else:
+            st.markdown(
+                '<div class="a-mark">A</div>',
+                unsafe_allow_html=True,
+            )
+    with brand_col:
+        st.markdown(
+            """
+            <div style="padding-top:2px;">
                 <div class="a-brand-name">ALPHA ANALYZER</div>
                 <div class="a-brand-sub">Professional Market Dashboard</div>
             </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+            """,
+            unsafe_allow_html=True,
+        )
+
     st.markdown('<div class="a-side-head">Account</div>', unsafe_allow_html=True)
     st.session_state.client_id = st.text_input(
         "User Name",
@@ -64,26 +68,15 @@ with st.sidebar:
         type="password",
     ).strip()
 
-    st.markdown(
-        """
-        <div class="a-account">
-            <div class="a-account-label">Connection</div>
-            <div class="a-account-value">Dhan • Live Session</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
     auto = st.checkbox("Auto Refresh", True)
     page = st.radio(
         "Module",
         [
-            "Market Overview",
-            "Fresh Trades",
             "Option Seller",
             "Intraday",
             "Positional",
             "MCX Futures",
+            "Market Overview",
             "Sector Analysis",
             "RS Matrix",
         ],
@@ -376,16 +369,6 @@ st.markdown(
     }
 
     hr{border-color:var(--line);}
-
-    .market-dashboard-hero{display:flex;justify-content:space-between;align-items:center;border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:15px 18px;margin-bottom:13px;background:linear-gradient(135deg,rgba(40,105,194,.10),rgba(255,255,255,.018));}
-    .market-dashboard-title{font-size:1.45rem;font-weight:950;letter-spacing:-.03em;}
-    .market-dashboard-sub{font-size:.70rem;color:#f3c95c;font-weight:800;margin-top:3px;}
-    .market-dashboard-live{text-align:right;color:#22d77c;font-size:.70rem;font-weight:900;line-height:1.6;}
-    .market-dashboard-live span{color:#7f8ca0;font-weight:600;font-size:.60rem;}
-    .market-dashboard-card{border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:12px;background:linear-gradient(145deg,rgba(255,255,255,.045),rgba(255,255,255,.012));min-height:96px;}
-    .market-dashboard-card .name{font-size:.67rem;color:#7f8ca0;font-weight:850;}
-    .market-dashboard-card .bias{font-size:1.08rem;font-weight:950;margin-top:7px;}
-    .market-dashboard-card .sub{font-size:.61rem;color:#7f8ca0;margin-top:4px;}
 
     @media(max-width:900px){
         .a-top-time{display:none;}
@@ -2117,158 +2100,6 @@ def notify_option_warning(module_name, warning_key, message, active):
 
 
 # -----------------------------
-# Fresh Trade Ledger
-# -----------------------------
-FRESH_TRADE_DIR = Path(os.getenv("ALPHA_TRADE_DATA_DIR", "alpha_data"))
-FRESH_TRADE_DIR.mkdir(parents=True, exist_ok=True)
-
-def _fresh_trade_path(day=None):
-    day = day or local_now().date()
-    return FRESH_TRADE_DIR / f"fresh_trades_{day.isoformat()}.csv"
-
-def _fresh_trade_columns():
-    return [
-        "Trade ID", "Date", "Time", "Module", "Mode", "Symbol",
-        "Direction", "Trade Price", "Entry", "SL", "Status", "First Logged"
-    ]
-
-def _load_fresh_trades_today():
-    today = local_now().date()
-    if st.session_state.get("fresh_trade_loaded_date") == today:
-        return
-    path = _fresh_trade_path(today)
-    if path.exists():
-        try:
-            df = pd.read_csv(path)
-            for col in _fresh_trade_columns():
-                if col not in df.columns:
-                    df[col] = ""
-            st.session_state.fresh_trade_log = df[_fresh_trade_columns()].to_dict("records")
-        except Exception:
-            st.session_state.fresh_trade_log = []
-    else:
-        st.session_state.fresh_trade_log = []
-    st.session_state.fresh_trade_loaded_date = today
-
-def _save_fresh_trades_today():
-    _load_fresh_trades_today()
-    try:
-        pd.DataFrame(
-            st.session_state.fresh_trade_log,
-            columns=_fresh_trade_columns(),
-        ).to_csv(_fresh_trade_path(local_now().date()), index=False)
-    except Exception:
-        pass
-
-def _record_fresh_trade(trade, trade_price):
-    _load_fresh_trades_today()
-    trade_id = str(trade.get("Trade ID", ""))
-    if not trade_id:
-        return
-    opened_text = str(trade.get("Opened", ""))
-    duplicate_key = (trade_id, opened_text, str(trade.get("Symbol", "")))
-    known_keys = {
-        (str(x.get("Trade ID", "")), str(x.get("First Logged", "")), str(x.get("Symbol", "")))
-        for x in st.session_state.fresh_trade_log
-    }
-    if duplicate_key in known_keys:
-        return
-
-    date_text = str(trade.get("Date", local_now().strftime("%d-%b-%Y")))
-    time_text = opened_text.replace(date_text, "", 1).replace("IST", "").strip()
-
-    st.session_state.fresh_trade_log.insert(0, {
-        "Trade ID": trade_id,
-        "Date": date_text,
-        "Time": time_text,
-        "Module": trade.get("Module", ""),
-        "Mode": trade.get("Mode", ""),
-        "Symbol": trade.get("Symbol", ""),
-        "Direction": trade.get("Direction", ""),
-        "Trade Price": float(trade_price) if pd.notna(trade_price) else np.nan,
-        "Entry": trade.get("Entry", np.nan),
-        "SL": trade.get("SL", np.nan),
-        "Status": "ACTIVE",
-        "First Logged": opened_text,
-    })
-    _save_fresh_trades_today()
-
-def _sync_fresh_trade_status():
-    _load_fresh_trades_today()
-    current = {str(t.get("Trade ID")): t for t in st.session_state.trade_book.values()}
-    changed = False
-    for row in st.session_state.fresh_trade_log:
-        trade = current.get(str(row.get("Trade ID")))
-        if trade is None:
-            continue
-        new_status = "ACTIVE" if trade.get("status") == "ACTIVE" else "CLOSED"
-        if row.get("Status") != new_status:
-            row["Status"] = new_status
-            changed = True
-    if changed:
-        _save_fresh_trades_today()
-
-def fresh_trades_dataframe():
-    _sync_fresh_trade_status()
-    df = pd.DataFrame(st.session_state.fresh_trade_log, columns=_fresh_trade_columns())
-    if df.empty:
-        return df
-    for col in ["Trade Price", "Entry", "SL"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.reset_index(drop=True)
-
-def render_fresh_trades_module():
-    df = fresh_trades_dataframe()
-
-    st.markdown(
-        '<div class="alpha-hero"><div class="alpha-hero-title">FRESH TRADES</div>'
-        '<div class="alpha-hero-sub">Every new trade detected today • first-seen time and market price are preserved</div>'
-        '<span class="alpha-badge">AUTO LOGGED</span></div>',
-        unsafe_allow_html=True,
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Date", local_now().strftime("%d-%b-%Y"))
-    c2.metric("Fresh Trades", len(df))
-    c3.metric("Active", int((df["Status"] == "ACTIVE").sum()) if not df.empty else 0)
-    c4.metric("Closed", int((df["Status"] == "CLOSED").sum()) if not df.empty else 0)
-
-    st.markdown(
-        "<div class=\"alpha-section\"><span class=\"alpha-section-dot\" style=\"background:#22d77c;\"></span>TODAY'S TRADE LEDGER</div>",
-        unsafe_allow_html=True,
-    )
-
-    if df.empty:
-        st.info("No fresh trades detected today.")
-        st.caption("A row is created automatically only when the analyzer opens a new trade.")
-        return
-
-    display = df[[
-        "Time", "Module", "Mode", "Symbol", "Direction",
-        "Trade Price", "Entry", "SL", "Status", "First Logged"
-    ]].copy()
-
-    st.dataframe(
-        display,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Trade Price": st.column_config.NumberColumn("Price", format="%.2f"),
-            "Entry": st.column_config.NumberColumn("Signal Entry", format="%.2f"),
-            "SL": st.column_config.NumberColumn("SL", format="%.2f"),
-        },
-    )
-
-    st.download_button(
-        "⬇️ Download Today's Fresh Trades",
-        data=display.to_csv(index=False).encode("utf-8"),
-        file_name=f"alpha_fresh_trades_{local_now().strftime('%Y-%m-%d')}.csv",
-        mime="text/csv",
-        key="download_fresh_trades_today",
-    )
-
-
-# -----------------------------
 # Trade Book / Active Trade Manager
 # -----------------------------
 def _trade_key(module_name, mode, symbol):
@@ -2363,15 +2194,6 @@ def _close_trade_record(trade, exit_price, reason):
         now,
     )
 
-    # Keep the immutable daily Fresh Trades ledger synchronized immediately.
-    _load_fresh_trades_today()
-    for row in st.session_state.fresh_trade_log:
-        if str(row.get("First Logged", "")) == str(trade.get("Opened", "")) and \
-           str(row.get("Symbol", "")) == str(trade.get("Symbol", "")):
-            row["Status"] = "CLOSED"
-            break
-    _save_fresh_trades_today()
-
 
 def manage_trade_book(module_name, mode, signal_rows):
     """
@@ -2464,7 +2286,6 @@ def manage_trade_book(module_name, mode, signal_rows):
             )
             if created:
                 trade["Current"] = float(ltp)
-                _record_fresh_trade(trade, ltp)
                 opened.append(trade.copy())
 
     return opened, exited
@@ -3095,7 +2916,6 @@ except Exception as e:
     st.error(f"Instrument master failed: {e}")
     st.stop()
 
-_load_fresh_trades_today()
 render_notification_panel()
 
 # The report button is rendered only after trade-report helpers are defined.
@@ -3316,7 +3136,7 @@ render_global_option_warning_monitor()
 if auto:
     try:
         from streamlit_autorefresh import st_autorefresh
-        if page in ("Intraday", "Fresh Trades"):
+        if page == "Intraday":
             mins = 1
         elif page == "Option Seller":
             mins = 1 if st.session_state.get("option_horizon", "Intraday") == "Intraday" else 3
@@ -3340,24 +3160,18 @@ if auto:
     except Exception:
         pass
 
-if page == "Fresh Trades":
-    render_fresh_trades_module()
-
-elif page == "Market Overview":
+if page == "Market Overview":
     st.markdown(
-        f"""
-        <div class="market-dashboard-hero">
-          <div>
-            <div class="market-dashboard-title">ALPHA ANALYZER</div>
-            <div class="market-dashboard-sub">Smart View • Clear Signals • Better Trades</div>
-          </div>
-          <div class="market-dashboard-live">● LIVE MARKET<br><span>{local_now().strftime('%d-%b-%Y %H:%M:%S IST')}</span></div>
+        """
+        <div class="alpha-hero">
+            <div class="alpha-hero-title">MARKET OVERVIEW</div>
+            <div class="alpha-hero-sub">Current market pulse</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-
-    st.caption("Market Pulse • P&F Direction • Fresh Trade Flow")
+    
+    st.caption("Market Pulse")
 
     def market_bias_from_history(sec_id, segment, instrument):
         try:
@@ -3439,35 +3253,16 @@ elif page == "Market Overview":
         if bias=="SIDEWAYS": return "🟡","SIDEWAYS","#ffd15c"
         return "⚪","UNAVAILABLE","#a9adb7"
 
-    cards=st.columns(5,gap="small")
+    cards=st.columns(5,gap="medium")
     for col,item in zip(cards,overview):
         icon,label,dot=_market_parts(item["Bias"])
         with col:
             st.markdown(
-                f"""<div class="market-dashboard-card"><div class="name">{item["Market"]}</div>
-                <div class="bias" style="color:{dot};">{icon} {label}</div>
-                <div class="sub">Current market state</div></div>""",
+                f"""<div class="market-card"><div class="market-name">{item["Market"]}</div>
+                <div class="market-bias"><span style="display:inline-block;width:11px;height:11px;border-radius:50%;
+                background:{dot};margin-right:7px;"></span>{label}</div>
+                <div class="market-sub">{icon} Current market state</div></div>""",
                 unsafe_allow_html=True)
-
-    st.markdown("### Dashboard Signals")
-    ft=fresh_trades_dataframe()
-    a,b,c=st.columns([1.25,1.25,1.5],gap="small")
-    with a:
-        bull=sum(1 for x in overview if x["Bias"]=="BULLISH")
-        bear=sum(1 for x in overview if x["Bias"]=="BEARISH")
-        st.metric("Bullish Markets",bull)
-    with b:
-        st.metric("Bearish Markets",bear)
-    with c:
-        st.metric("Fresh Trades Today",len(ft))
-
-    if not ft.empty:
-        st.markdown("#### Latest Fresh Trades")
-        st.dataframe(
-            ft.head(8)[["Time","Symbol","Direction","Trade Price","Module","Mode","Status"]],
-            use_container_width=True, hide_index=True,
-            column_config={"Trade Price": st.column_config.NumberColumn("Price",format="%.2f")},
-        )
     st.caption("Market information only.")
 
 
