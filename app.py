@@ -213,21 +213,6 @@ with st.sidebar:
         ],
     )
 
-    _today_sidebar_report = today_trade_report_dataframe()
-    if not _today_sidebar_report.empty:
-        st.markdown(
-            '<div class="a-side-head">Today\'s Report</div>',
-            unsafe_allow_html=True,
-        )
-        st.download_button(
-            "⬇️ Download Trade Log",
-            data=_today_sidebar_report.to_csv(index=False).encode("utf-8"),
-            file_name=f"alpha_trades_{local_now().strftime('%Y-%m-%d')}.csv",
-            mime="text/csv",
-            key="sidebar_today_trade_report",
-        )
-
-
 # -----------------------------
 # Client UI Theme
 # -----------------------------
@@ -2566,6 +2551,24 @@ def today_trade_report_dataframe(module_name=None, mode=None):
 
     return df.reset_index(drop=True)
 
+
+
+# Render the current-day report shortcut only after the report functions
+# have been defined. This avoids the startup NameError shown in Streamlit.
+_today_sidebar_report = today_trade_report_dataframe()
+if not _today_sidebar_report.empty:
+    with st.sidebar:
+        st.markdown(
+            '<div class="a-side-head">Today\'s Report</div>',
+            unsafe_allow_html=True,
+        )
+        st.download_button(
+            "⬇️ Download Trade Log",
+            data=_today_sidebar_report.to_csv(index=False).encode("utf-8"),
+            file_name=f"alpha_trades_{local_now().strftime('%Y-%m-%d')}.csv",
+            mime="text/csv",
+            key="sidebar_today_trade_report",
+        )
 
 
 def render_trade_monitor(module_name=None, mode=None):
