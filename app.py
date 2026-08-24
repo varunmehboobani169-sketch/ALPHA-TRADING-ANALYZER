@@ -2198,7 +2198,7 @@ def _fresh_trade_path(day=None):
 def _fresh_trade_columns():
     return [
         "Trade ID", "Date", "Entry Time", "Module", "Mode", "Symbol",
-        "Direction", "Trade Price", "Signal Entry", "Entry",
+        "Direction", "Trade Price", "LTP", "Signal Entry", "Entry",
         "Initial SL", "SL", "Current", "Exit", "Status", "Exit Reason",
         "Points P&L", "P&L %", "Closed", "Duration (min)",
         "SL Trails", "Last SL Update", "First Logged",
@@ -2400,6 +2400,12 @@ def _canonicalize_ledger_df(df):
 
     x["Entry Time"] = x.apply(valid_entry_time, axis=1)
 
+    if "LTP" not in x.columns:
+        x["LTP"] = x["Current"]
+    else:
+        x["LTP"] = pd.to_numeric(x["LTP"], errors="coerce")
+        x["LTP"] = x["LTP"].fillna(pd.to_numeric(x["Current"], errors="coerce"))
+
     # Historical report rows from the broken versions may contain entries
     # generated after NSE close. Remove them completely.
     def is_valid_row(row):
@@ -2562,7 +2568,8 @@ def _record_fresh_trade(trade, trade_price):
         "Mode": trade.get("Mode", ""),
         "Symbol": trade.get("Symbol", ""),
         "Direction": trade.get("Direction", ""),
-        "Trade Price": float(trade_price) if pd.notna(trade_price) else np.nan,
+        "Trade Price": float(trade.get("Entry", trade_price)) if pd.notna(trade.get("Entry", trade_price)) else np.nan,
+        "LTP": float(trade.get("Current", trade_price)) if pd.notna(trade.get("Current", trade_price)) else np.nan,
         "Signal Entry": trade.get("Signal Entry", np.nan),
         "Entry": trade.get("Entry", np.nan),
         "Initial SL": trade.get("Initial SL", np.nan),
@@ -2757,6 +2764,9 @@ def _restore_active_trades_from_ledger():
         }
         trade["Entry Time"] = entry_time
         trade["Opened"] = entry_time
+        trade["LTP"] = pd.to_numeric(row.get("LTP"), errors="coerce")
+        if pd.isna(trade["LTP"]):
+            trade["LTP"] = pd.to_numeric(row.get("Current"), errors="coerce")
 
         st.session_state.trade_book[key] = trade
 
@@ -2800,7 +2810,7 @@ def render_fresh_trades_module():
 
     display = df[[
         "Entry Time", "Symbol", "Mode", "Direction",
-        "Trade Price", "Initial SL", "SL", "Status",
+        "Trade Price", "LTP", "Initial SL", "SL", "Status",
     ]].copy()
 
     st.dataframe(
@@ -2809,7 +2819,10 @@ def render_fresh_trades_module():
         hide_index=True,
         column_config={
             "Trade Price": st.column_config.NumberColumn(
-                "Trade Price", format="%.2f"
+                "Entry Price", format="%.2f"
+            ),
+            "LTP": st.column_config.NumberColumn(
+                "LTP", format="%.2f"
             ),
             "Initial SL": st.column_config.NumberColumn(
                 "Initial SL", format="%.2f"
@@ -2885,6 +2898,7 @@ def render_trade_logs_module():
             "Mode",
             "Direction",
             "Trade Price",
+            "LTP",
             "Initial SL",
             "SL",
             "Status",
@@ -3249,6 +3263,8 @@ def manage_trade_book(module_name, mode, signal_rows):
 
             if pd.notna(ltp):
                 active["Current"] = float(ltp)
+                active["LTP"] = float(ltp)
+                _update_trade_ledger_row(active)
 
             trail_moved = False
 
@@ -4531,6 +4547,12 @@ elif page in ("Intraday", "Positional"):
         market_time = exchange_time_from_ltt(
             market_quote.get("last_trade_time", np.nan)
         )
+        quote_price = pd.to_numeric(
+            market_quote.get("last_price"),
+            errors="coerce",
+        )
+        if pd.notna(quote_price):
+            ltp = float(quote_price)
 
         try:
             oi_conf = {
@@ -4942,6 +4964,12 @@ elif page == "MCX Futures":
         market_time = exchange_time_from_ltt(
             market_quote.get("last_trade_time", np.nan)
         )
+        quote_price = pd.to_numeric(
+            market_quote.get("last_price"),
+            errors="coerce",
+        )
+        if pd.notna(quote_price):
+            ltp = float(quote_price)
 
         rec="DATA ERROR"; bias="UNAVAILABLE"; entry=np.nan; sl=np.nan; display_symbol=symbol
 
