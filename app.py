@@ -609,6 +609,40 @@ def future_universe(master, exchange="NSE"):
 # -----------------------------
 # Live LTP
 # -----------------------------
+
+@st.cache_data(ttl=5, show_spinner=False)
+def batch_quote(segment, ids):
+    body = api_post(
+        "/marketfeed/quote",
+        {segment: [int(x) for x in ids]},
+        f"{segment} Quote",
+    )
+    data = parse_data(body).get(segment, {})
+    out = {}
+    for k, v in data.items():
+        if not isinstance(v, dict):
+            continue
+        price = pd.to_numeric(v.get("last_price"), errors="coerce")
+        ltt = pd.to_numeric(v.get("last_trade_time"), errors="coerce")
+        out[int(k)] = {
+            "last_price": float(price) if pd.notna(price) else np.nan,
+            "last_trade_time": float(ltt) if pd.notna(ltt) else np.nan,
+        }
+    return out
+
+
+def exchange_time_from_ltt(ltt):
+    """Convert Dhan Last Trade Time (epoch seconds) to IST."""
+    if pd.isna(ltt):
+        return None
+    try:
+        return datetime.fromtimestamp(float(ltt), tz=LOCAL_TZ).strftime(
+            "%d-%b-%Y %H:%M:%S IST"
+        )
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=5, show_spinner=False)
 def batch_ltp(segment, ids):
     body = api_post(
@@ -2810,6 +2844,15 @@ def _trade_duration_minutes(opened_at, closed_at=None):
         return np.nan
 
 
+def _normalize_market_time(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "nat"}:
+        return None
+    return text
+
+
 def _upsert_trade_record(
     module_name,
     mode,
@@ -2818,6 +2861,7 @@ def _upsert_trade_record(
     signal_entry,
     actual_entry,
     sl,
+    market_time=None,
 ):
     key = _trade_key(module_name, mode, symbol)
     book = st.session_state.trade_book
@@ -2846,6 +2890,24 @@ def _upsert_trade_record(
     )
     initial_sl = float(sl) if pd.notna(sl) else np.nan
 
+    market_time = _normalize_market_time(market_time)
+    entry_time = market_time or opened.strftime("%d-%b-%Y %H:%M:%S IST")
+
+    # Never accept a bogus after-hours market time for NSE.
+    if module_name == "NSE":
+        try:
+            parsed_entry = datetime.strptime(
+                entry_time, "%d-%b-%Y %H:%M:%S IST"
+            )
+            if not (
+                datetime.strptime("09:15", "%H:%M").time()
+                <= parsed_entry.time()
+                <= datetime.strptime("15:40", "%H:%M").time()
+            ):
+                entry_time = opened.strftime("%d-%b-%Y %H:%M:%S IST")
+        except Exception:
+            entry_time = opened.strftime("%d-%b-%Y %H:%M:%S IST")
+
     trade = {
         "Trade ID": trade_id,
         "Date": opened.strftime("%d-%b-%Y"),
@@ -2863,7 +2925,7 @@ def _upsert_trade_record(
         "Exit Reason": "",
         "Points P&L": np.nan,
         "P&L %": np.nan,
-        "Entry Time": opened.strftime("%d-%b-%Y %H:%M:%S IST"),
+        "Entry Time": entry_time,
         "Opened": opened.strftime("%d-%b-%Y %H:%M:%S IST"),
         "Closed": "",
         "Duration (min)": np.nan,
@@ -3162,6 +3224,7 @@ def manage_trade_book(module_name, mode, signal_rows):
                 signal_entry,
                 ltp,
                 structural_sl,
+                market_time=row.get("Market Time"),
             )
 
             if created:
@@ -4290,6 +4353,14 @@ elif page in ("Intraday", "Positional"):
         sid = int(r["underlying_security_id"])
         fut_sid = int(r["security_id"])
         ltp = spot_map.get(sid, np.nan)
+        market_quote = {}
+        try:
+            market_quote = batch_quote("NSE_EQ", [sid]).get(sid, {})
+        except Exception:
+            market_quote = {}
+        market_time = exchange_time_from_ltt(
+            market_quote.get("last_trade_time", np.nan)
+        )
 
         try:
             oi_conf = {
@@ -4407,6 +4478,7 @@ elif page in ("Intraday", "Positional"):
             rows.append({
                 "Script": display_symbol,
                 "LTP": ltp,
+                "Market Time": market_time,
                 "Bias": bias,
                 "Pattern": p.get("pattern", "—") if mode == "Positional" else "—",
                 "OI Confirmation": oi_conf["label"],
@@ -4424,6 +4496,7 @@ elif page in ("Intraday", "Positional"):
             rows.append({
                 "Script": symbol,
                 "LTP": ltp,
+                "Market Time": market_time,
                 "Bias": "UNAVAILABLE",
                 "Pattern": "—",
                 "OI Confirmation": "DATA ERROR",
@@ -4691,6 +4764,14 @@ elif page == "MCX Futures":
         symbol=str(row["underlying_symbol"])
         sid=int(row["security_id"])
         ltp=ltp_map.get(sid,np.nan)
+        market_quote = {}
+        try:
+            market_quote = batch_quote("MCX_COMM", [sid]).get(sid, {})
+        except Exception:
+            market_quote = {}
+        market_time = exchange_time_from_ltt(
+            market_quote.get("last_trade_time", np.nan)
+        )
 
         rec="DATA ERROR"; bias="UNAVAILABLE"; entry=np.nan; sl=np.nan; display_symbol=symbol
 
@@ -4737,6 +4818,7 @@ elif page == "MCX Futures":
         rows.append({
             "Script":display_symbol,
             "LTP":ltp,
+            "Market Time":market_time,
             "Bias":bias,
             "Entry":entry,
             "SL":sl,

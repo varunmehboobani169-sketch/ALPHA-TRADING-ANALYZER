@@ -15,3 +15,10 @@ Changes from the working V10 base:
 ## Deployment
 Upload `app.py`, `requirements.txt`, and `alpha_analyzer_logo.png` to Streamlit.
 `README.md` is optional.
+
+
+## Entry Time rule
+Fresh Trade `Entry Time` uses Dhan market-data `last_trade_time` (LTT) from
+the quote feed when the signal is first detected. The dashboard refresh time
+is not used as the primary timestamp. NSE fresh entries are restricted to
+09:15–15:40 IST.
