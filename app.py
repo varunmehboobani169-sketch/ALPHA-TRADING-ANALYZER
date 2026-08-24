@@ -1,5 +1,6 @@
 
 import os
+import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -9,6 +10,7 @@ import requests
 import streamlit as st
 from zoneinfo import ZoneInfo
 ALPHA_LOGO_PATH = Path(__file__).resolve().parent / "alpha_analyzer_logo.png"
+TRADE_DB_PATH = Path(__file__).resolve().parent / "alpha_trade_history.db"
 
 st.set_page_config(page_title="ALPHA ANALYZER", page_icon="α", layout="wide")
 
@@ -36,6 +38,130 @@ if "trade_book" not in st.session_state:
 
 if "trade_sequence" not in st.session_state:
     st.session_state.trade_sequence = 0
+
+if "trade_history" not in st.session_state:
+    st.session_state.trade_history = []
+
+def _trade_db_connect():
+    conn = sqlite3.connect(str(TRADE_DB_PATH), timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner TEXT NOT NULL,
+            trade_id TEXT NOT NULL,
+            date TEXT NOT NULL,
+            module TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            signal_level REAL,
+            entry REAL,
+            initial_sl REAL,
+            current_sl REAL,
+            current REAL,
+            exit_price REAL,
+            status TEXT NOT NULL,
+            exit_reason TEXT,
+            points_pnl REAL,
+            pnl_pct REAL,
+            opened TEXT NOT NULL,
+            closed TEXT,
+            duration_min REAL,
+            sl_trails INTEGER DEFAULT 0,
+            last_sl_update TEXT
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def _persist_trade_insert(trade):
+    owner = str(st.session_state.get("client_id", "default") or "default")
+    conn = _trade_db_connect()
+    conn.execute(
+        """
+        INSERT INTO trades (
+            owner, trade_id, date, module, mode, symbol, direction,
+            signal_level, entry, initial_sl, current_sl, current,
+            exit_price, status, exit_reason, points_pnl, pnl_pct,
+            opened, closed, duration_min, sl_trails, last_sl_update
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            owner, trade["Trade ID"], trade["Date"], trade["Module"],
+            trade["Mode"], trade["Symbol"], trade["Direction"],
+            trade.get("Signal Level"), trade.get("Entry"),
+            trade.get("Initial SL"), trade.get("SL"),
+            trade.get("Current"), trade.get("Exit"),
+            trade.get("Status"), trade.get("Exit Reason", ""),
+            trade.get("Points P&L"), trade.get("P&L %"),
+            trade.get("Opened"), trade.get("Closed", ""),
+            trade.get("Duration (min)"), trade.get("SL Trails", 0),
+            trade.get("Last SL Update", ""),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _persist_trade_update(trade):
+    owner = str(st.session_state.get("client_id", "default") or "default")
+    conn = _trade_db_connect()
+    conn.execute(
+        """
+        UPDATE trades SET
+            current_sl=?, current=?, exit_price=?, status=?,
+            exit_reason=?, points_pnl=?, pnl_pct=?, closed=?,
+            duration_min=?, sl_trails=?, last_sl_update=?
+        WHERE owner=? AND trade_id=?
+        """,
+        (
+            trade.get("SL"), trade.get("Current"), trade.get("Exit"),
+            trade.get("Status"), trade.get("Exit Reason", ""),
+            trade.get("Points P&L"), trade.get("P&L %"),
+            trade.get("Closed", ""), trade.get("Duration (min)"),
+            trade.get("SL Trails", 0), trade.get("Last SL Update", ""),
+            owner, trade["Trade ID"],
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _load_trade_history(owner):
+    conn = _trade_db_connect()
+    rows = conn.execute(
+        """
+        SELECT trade_id,date,module,mode,symbol,direction,
+               signal_level,entry,initial_sl,current_sl,current,exit_price,
+               status,exit_reason,points_pnl,pnl_pct,opened,closed,
+               duration_min,sl_trails,last_sl_update
+        FROM trades
+        WHERE owner=?
+        ORDER BY opened DESC
+        """,
+        (str(owner or "default"),),
+    ).fetchall()
+    conn.close()
+
+    cols = [
+        "Trade ID", "Date", "Module", "Mode", "Symbol", "Direction",
+        "Signal Level", "Entry", "Initial SL", "SL", "Current", "Exit",
+        "Status", "Exit Reason", "Points P&L", "P&L %",
+        "Opened", "Closed", "Duration (min)", "SL Trails", "Last SL Update"
+    ]
+    return [dict(zip(cols, row)) for row in rows]
+
+
+def _reload_trade_history():
+    owner = str(st.session_state.get("client_id", "default") or "default")
+    if st.session_state.get("_trade_history_owner") != owner:
+        st.session_state.trade_history = _load_trade_history(owner)
+        st.session_state._trade_history_owner = owner
+
 
 with st.sidebar:
     logo_col, brand_col = st.columns([1, 3], gap="small")
@@ -69,6 +195,8 @@ with st.sidebar:
         type="password",
     ).strip()
 
+    _reload_trade_history()
+
     auto = st.checkbox("Auto Refresh", True)
     page = st.radio(
         "Module",
@@ -80,8 +208,24 @@ with st.sidebar:
             "Market Overview",
             "Sector Analysis",
             "RS Matrix",
+            "Fresh Trades",
+            "Trade Logs",
         ],
     )
+
+    _today_sidebar_report = today_trade_report_dataframe()
+    if not _today_sidebar_report.empty:
+        st.markdown(
+            '<div class="a-side-head">Today\'s Report</div>',
+            unsafe_allow_html=True,
+        )
+        st.download_button(
+            "⬇️ Download Trade Log",
+            data=_today_sidebar_report.to_csv(index=False).encode("utf-8"),
+            file_name=f"alpha_trades_{local_now().strftime('%Y-%m-%d')}.csv",
+            mime="text/csv",
+            key="sidebar_today_trade_report",
+        )
 
 
 # -----------------------------
@@ -2103,6 +2247,19 @@ def notify_option_warning(module_name, warning_key, message, active):
 # -----------------------------
 # Trade Book / Active Trade Manager
 # -----------------------------
+def _append_trade_history(trade):
+    """Keep every trade event in the same session, including repeat trades."""
+    st.session_state.trade_history.append(dict(trade))
+
+
+def _sync_trade_history_update(trade_id, trade):
+    """Update the history row when an active trade later closes."""
+    for i in range(len(st.session_state.trade_history) - 1, -1, -1):
+        if str(st.session_state.trade_history[i].get("Trade ID")) == str(trade_id):
+            st.session_state.trade_history[i] = dict(trade)
+            return
+
+
 def _trade_key(module_name, mode, symbol):
     return f"{module_name}|{mode}|{symbol}"
 
@@ -2130,7 +2287,7 @@ def _trade_duration_minutes(opened_at, closed_at=None):
         return np.nan
 
 
-def _upsert_trade_record(module_name, mode, symbol, direction, entry, sl):
+def _upsert_trade_record(module_name, mode, symbol, direction, signal_level, entry, sl):
     key = _trade_key(module_name, mode, symbol)
     book = st.session_state.trade_book
 
@@ -2152,9 +2309,13 @@ def _upsert_trade_record(module_name, mode, symbol, direction, entry, sl):
         "Mode": mode,
         "Symbol": symbol,
         "Direction": direction,
+        "Signal Level": float(signal_level) if pd.notna(signal_level) else np.nan,
         "Entry": float(entry) if pd.notna(entry) else np.nan,
+        "Initial SL": float(sl) if pd.notna(sl) else np.nan,
         "SL": float(sl) if pd.notna(sl) else np.nan,
         "Current": float(entry) if pd.notna(entry) else np.nan,
+        "SL Trails": 0,
+        "Last SL Update": "",
         "Exit": np.nan,
         "Status": "ACTIVE",
         "Exit Reason": "",
@@ -2165,6 +2326,8 @@ def _upsert_trade_record(module_name, mode, symbol, direction, entry, sl):
         "Duration (min)": np.nan,
     }
     book[key] = trade
+    _append_trade_history(trade)
+    _persist_trade_insert(trade)
     return trade, True
 
 
@@ -2194,6 +2357,8 @@ def _close_trade_record(trade, exit_price, reason):
         opened_dt,
         now,
     )
+    _sync_trade_history_update(trade["Trade ID"], trade)
+    _persist_trade_update(trade)
 
 
 def manage_trade_book(module_name, mode, signal_rows):
@@ -2235,18 +2400,69 @@ def manage_trade_book(module_name, mode, signal_rows):
         active = st.session_state.trade_book.get(key)
 
         # Existing active trade: manage it first.
-        if active and active.get("status") == "ACTIVE":
+        if active and active.get("Status", active.get("status")) == "ACTIVE":
             if pd.notna(ltp):
                 active["Current"] = float(ltp)
 
-            exit_reason = None
+            # UNIVERSAL P&F / STRUCTURE-BASED DYNAMIC SL
+            # Applies to every trade module and horizon:
+            #   NSE Intraday
+            #   NSE Positional
+            #   MCX Intraday
+            #   MCX Positional
+            #
+            # LONG  -> SL can move UP only (newer/higher structural support / DBS).
+            # SHORT -> SL can move DOWN only (newer/lower structural resistance / DTB).
+            # SL NEVER moves backwards or loosens.
+            structural_sl = pd.to_numeric(row.get("SL"), errors="coerce")
+            trail_moved = False
 
-            # Stop loss
+            if (
+                pd.notna(structural_sl)
+                and pd.notna(active.get("SL"))
+            ):
+                old_sl = float(active["SL"])
+                new_sl = float(structural_sl)
+
+                should_trail = (
+                    (active["Direction"] == "LONG" and new_sl > old_sl)
+                    or
+                    (active["Direction"] == "SHORT" and new_sl < old_sl)
+                )
+
+                if should_trail:
+                    active["SL"] = new_sl
+                    active["SL Trails"] = int(active.get("SL Trails", 0)) + 1
+                    active["Last SL Update"] = local_now().strftime(
+                        "%d-%b-%Y %H:%M:%S IST"
+                    )
+                    _sync_trade_history_update(active["Trade ID"], active)
+                    _persist_trade_update(active)
+                    trail_moved = True
+
+                    st.toast(
+                        f"🔒 {symbol} dynamic SL moved to {new_sl:.2f}",
+                        icon="🔒",
+                    )
+                    speak_client_alert(
+                        f"{symbol} dynamic stop moved to {new_sl:.2f}",
+                        prefix="Dynamic stop",
+                    )
+
+            # Check the current trailing SL.
             if pd.notna(ltp) and pd.notna(active.get("SL")):
                 if active["Direction"] == "LONG" and float(ltp) <= float(active["SL"]):
-                    exit_reason = "Stop Loss"
+                    exit_reason = (
+                        "Dynamic SL"
+                        if trail_moved or active.get("SL Trails", 0)
+                        else "Stop Loss"
+                    )
                 elif active["Direction"] == "SHORT" and float(ltp) >= float(active["SL"]):
-                    exit_reason = "Stop Loss"
+                    exit_reason = (
+                        "Dynamic SL"
+                        if trail_moved or active.get("SL Trails", 0)
+                        else "Stop Loss"
+                    )
 
             # Opposite valid signal
             if (
@@ -2277,12 +2493,16 @@ def manage_trade_book(module_name, mode, signal_rows):
             use_entry = entry if pd.notna(entry) else ltp
             use_sl = sl
 
+            signal_level = entry if pd.notna(entry) else ltp
+            actual_entry = ltp if pd.notna(ltp) else entry
+
             trade, created = _upsert_trade_record(
                 module_name,
                 mode,
                 symbol,
                 direction,
-                use_entry,
+                signal_level,
+                actual_entry,
                 use_sl,
             )
             if created:
@@ -2293,92 +2513,130 @@ def manage_trade_book(module_name, mode, signal_rows):
 
 
 def trade_report_dataframe():
-    rows = list(st.session_state.trade_book.values())
+    """Complete session history; does not overwrite repeated same-symbol trades."""
+    rows = [dict(x) for x in st.session_state.get("trade_history", [])]
+
+    # Safety net: include current active trades if any edge case missed history.
+    seen = {str(x.get("Trade ID")) for x in rows}
+    for trade in st.session_state.get("trade_book", {}).values():
+        tid = str(trade.get("Trade ID"))
+        if tid not in seen:
+            rows.append(dict(trade))
+
+    columns = [
+        "Trade ID","Date","Module","Mode","Symbol","Direction",
+        "Signal Level","Entry","Initial SL","SL","Current","Exit",
+        "Status","Exit Reason","Points P&L","P&L %",
+        "Opened","Closed","Duration (min)","SL Trails","Last SL Update"
+    ]
 
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "Trade ID","Date","Module","Mode","Symbol","Direction",
-                "Entry","SL","Current","Exit","Status","Exit Reason",
-                "Points P&L","P&L %","Opened","Closed","Duration (min)"
-            ]
-        )
+        return pd.DataFrame(columns=columns)
 
     df = pd.DataFrame(rows)
-    if "Opened" in df.columns:
-        df = df.sort_values("Opened", ascending=False)
-    return df.reset_index(drop=True)
+    for col in columns:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    df["_sort"] = pd.to_datetime(
+        df["Opened"].astype(str).str.replace(" IST","",regex=False),
+        format="%d-%b-%Y %H:%M:%S",
+        errors="coerce",
+    )
+    df = (
+        df.sort_values("_sort", ascending=False)
+        .drop(columns=["_sort"])
+        .reset_index(drop=True)
+    )
+    return df[columns]
 
 
-def render_trade_monitor(module_name=None, mode=None):
-    """Client-facing active/completed trade monitor + daily report download."""
+def today_trade_report_dataframe(module_name=None, mode=None):
     df = trade_report_dataframe()
+    if df.empty:
+        return df
+
+    today = local_now().strftime("%d-%b-%Y")
+    df = df[df["Date"].astype(str) == today]
 
     if module_name is not None:
         df = df[df["Module"] == module_name]
     if mode is not None:
         df = df[df["Mode"] == mode]
 
+    return df.reset_index(drop=True)
+
+
+
+def render_trade_monitor(module_name=None, mode=None):
+    """Show current active trades plus the complete same-day trade log."""
+    df = today_trade_report_dataframe(module_name, mode)
+
+    st.markdown("---")
+    st.markdown("### Trade Monitor")
+
     if df.empty:
+        c1, c2 = st.columns(2)
+        c1.metric("Today's Trades", 0)
+        c2.metric("Active Now", 0)
+        st.info("No trades generated for this module today.")
         return
 
     active = df[df["Status"] == "ACTIVE"].copy()
     closed = df[df["Status"] == "CLOSED"].copy()
 
-    st.markdown("---")
-    st.markdown("### Trade Monitor")
+    if not closed.empty:
+        winners = int(
+            (pd.to_numeric(closed["Points P&L"], errors="coerce") > 0).sum()
+        )
+        win_rate = 100.0 * winners / len(closed)
+        net_points = pd.to_numeric(
+            closed["Points P&L"], errors="coerce"
+        ).sum()
+    else:
+        win_rate = 0.0
+        net_points = 0.0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Active", int(len(active)))
-    c2.metric("Completed", int(len(closed)))
-
-    if not closed.empty:
-        winners = int((pd.to_numeric(closed["Points P&L"], errors="coerce") > 0).sum())
-        losers = int((pd.to_numeric(closed["Points P&L"], errors="coerce") < 0).sum())
-        win_rate = 100.0 * winners / len(closed)
-        total_points = pd.to_numeric(closed["Points P&L"], errors="coerce").sum()
-    else:
-        winners = losers = 0
-        win_rate = 0.0
-        total_points = 0.0
-
-    c3.metric("Win Rate", f"{win_rate:.1f}%")
-    c4.metric("Net Points", f"{total_points:.2f}")
+    c1.metric("Today's Trades", int(len(df)))
+    c2.metric("Active Now", int(len(active)))
+    c3.metric("Closed Win Rate", f"{win_rate:.1f}%")
+    c4.metric("Closed Net Points", f"{net_points:.2f}")
 
     if not active.empty:
         st.markdown("#### Active Trades")
         st.dataframe(
             active[
                 [
-                    "Symbol","Direction","Entry","SL","Current",
-                    "Opened","Status"
+                    "Trade ID","Symbol","Direction","Signal Level","Entry",
+                    "Initial SL","SL","Current","Opened","Status"
                 ]
             ],
             use_container_width=True,
             hide_index=True,
         )
 
-    if not closed.empty:
-        st.markdown("#### Recent Closed Trades")
-        st.dataframe(
-            closed.head(20)[
-                [
-                    "Symbol","Direction","Entry","Exit","Points P&L",
-                    "P&L %","Exit Reason","Opened","Closed"
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download Daily Trade Report",
-        data=csv_bytes,
-        file_name=f"alpha_trades_{local_now().strftime('%Y-%m-%d')}.csv",
-        mime="text/csv",
-        key=f"trade_report_{module_name}_{mode}",
+    st.markdown("#### Today's Trade Log")
+    st.dataframe(
+        df[
+            [
+                "Trade ID","Symbol","Direction","Signal Level","Entry",
+                "Initial SL","SL","Exit","Current","Status","Exit Reason",
+                "Points P&L","Opened","Closed","SL Trails"
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
     )
+
+    st.download_button(
+        "⬇️ Download Today's Trade Report",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name=f"alpha_trades_{local_now().strftime('%Y-%m-%d')}_{module_name or 'ALL'}_{mode or 'ALL'}.csv",
+        mime="text/csv",
+        key=f"trade_report_today_{module_name}_{mode}",
+    )
+
 
 
 def notify_trade_exits(exited_trades):
@@ -3130,6 +3388,22 @@ def render_global_option_warning_monitor():
 
 render_global_option_warning_monitor()
 
+
+# Same-day report shortcut.
+today_all = today_trade_report_dataframe()
+if not today_all.empty:
+    with st.sidebar:
+        st.markdown(
+            '<div class="a-side-head">Today\'s Report</div>',
+            unsafe_allow_html=True,
+        )
+        st.download_button(
+            "⬇️ Download Trade Log",
+            data=today_all.to_csv(index=False).encode("utf-8"),
+            file_name=f"alpha_trades_{local_now().strftime('%Y-%m-%d')}.csv",
+            mime="text/csv",
+            key="sidebar_today_trade_report",
+        )
 
 # Auto refresh is deliberately longer than the initial full-universe scan.
 # The full NSE scan can take longer than 1 minute, so a 1-minute rerun would
@@ -4297,6 +4571,144 @@ elif page == "Sector Analysis":
                     hide_index=True,
                 )
 
+
+elif page == "Fresh Trades":
+    render_page_hero(
+        "FRESH TRADES",
+        "New trades generated during today's session",
+        [("LIVE", "green")],
+    )
+
+    fresh = today_trade_report_dataframe()
+    if fresh.empty:
+        st.info("No fresh trades have occurred today.")
+    else:
+        st.dataframe(
+            fresh[
+                [
+                    "Trade ID","Module","Mode","Symbol","Direction",
+                    "Opened","Signal Level","Entry","Initial SL","SL","Status"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            "⬇️ Download Today's Fresh Trades",
+            data=fresh.to_csv(index=False).encode("utf-8"),
+            file_name=f"alpha_fresh_trades_{local_now().strftime('%Y-%m-%d')}.csv",
+            mime="text/csv",
+            key="fresh_trade_report",
+        )
+
+
+elif page == "Trade Logs":
+    render_page_hero(
+        "TRADE LOGS",
+        "Fresh trades, day-wise performance and historical lookup",
+        [("TODAY", "green"), ("HISTORY", "blue")],
+    )
+
+    full_log = trade_report_dataframe()
+
+    if full_log.empty:
+        st.info("No trade history is available yet.")
+    else:
+        parsed = pd.to_datetime(
+            full_log["Date"], format="%d-%b-%Y", errors="coerce"
+        ).dropna().dt.date
+        available_dates = sorted(parsed.unique(), reverse=True)
+
+        selected_date = st.date_input(
+            "Select trading date",
+            value=available_dates[0],
+            min_value=min(available_dates),
+            max_value=max(available_dates),
+            key="trade_log_selected_date",
+        )
+
+        selected = full_log[
+            pd.to_datetime(
+                full_log["Date"], format="%d-%b-%Y", errors="coerce"
+            ).dt.date == selected_date
+        ].copy()
+
+        active = selected[selected["Status"] == "ACTIVE"].copy()
+        closed = selected[selected["Status"] == "CLOSED"].copy()
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Trades", len(selected))
+        c2.metric("Active", len(active))
+
+        if not closed.empty:
+            cpnl = pd.to_numeric(closed["Points P&L"], errors="coerce")
+            c3.metric("Win Rate", f"{(cpnl > 0).mean()*100:.1f}%")
+            c4.metric("Net Points", f"{cpnl.sum():.2f}")
+        else:
+            c3.metric("Win Rate", "—")
+            c4.metric("Net Points", "—")
+
+        st.markdown("### Fresh Trades")
+        st.dataframe(
+            selected[
+                [
+                    "Trade ID","Module","Mode","Symbol","Direction",
+                    "Opened","Signal Level","Entry","Initial SL","SL","Status"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("### Day Performance")
+        day_pnl = (
+            pd.to_numeric(closed["Points P&L"], errors="coerce")
+            if not closed.empty else pd.Series(dtype=float)
+        )
+        perf = pd.DataFrame([{
+            "Date": selected_date.strftime("%d-%b-%Y"),
+            "Trades": len(selected),
+            "Closed": len(closed),
+            "Active": len(active),
+            "Wins": int((day_pnl > 0).sum()) if len(day_pnl) else 0,
+            "Losses": int((day_pnl < 0).sum()) if len(day_pnl) else 0,
+            "Net Points": float(day_pnl.sum()) if len(day_pnl) else 0.0,
+            "Stop / Dynamic SL Exits": (
+                int(
+                    closed["Exit Reason"].astype(str).isin(
+                        ["Stop Loss","Dynamic SL"]
+                    ).sum()
+                )
+                if not closed.empty else 0
+            ),
+            "SL Trails": (
+                int(selected["SL Trails"].fillna(0).sum())
+                if "SL Trails" in selected.columns else 0
+            ),
+        }])
+        st.dataframe(perf, use_container_width=True, hide_index=True)
+
+        st.markdown("### Detailed Trade History")
+        st.dataframe(
+            selected[
+                [
+                    "Trade ID","Module","Mode","Symbol","Direction",
+                    "Signal Level","Entry","Initial SL","SL","Exit","Current",
+                    "Status","Exit Reason","Points P&L","P&L %",
+                    "Opened","Closed","SL Trails","Last SL Update"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "⬇️ Download Selected Day Report",
+            data=selected.to_csv(index=False).encode("utf-8"),
+            file_name=f"alpha_trade_report_{selected_date.strftime('%Y-%m-%d')}.csv",
+            mime="text/csv",
+            key=f"selected_day_report_{selected_date}",
+        )
 
 elif page == "RS Matrix":
     st.markdown(
