@@ -69,16 +69,6 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    if st.session_state.get("trade_book"):
-        report_all = trade_report_dataframe()
-        st.download_button(
-            "⬇️ Download Daily Report",
-            data=report_all.to_csv(index=False).encode("utf-8"),
-            file_name=f"alpha_trades_{local_now().strftime('%Y-%m-%d')}.csv",
-            mime="text/csv",
-            key="sidebar_daily_report",
-        )
-
     auto = st.checkbox("Auto Refresh", True)
     page = st.radio(
         "Module",
@@ -2928,6 +2918,218 @@ except Exception as e:
     st.stop()
 
 render_notification_panel()
+
+# The report button is rendered only after trade-report helpers are defined.
+if st.session_state.get("trade_book"):
+    report_all = trade_report_dataframe()
+    with st.sidebar:
+        st.markdown(
+            '<div class="a-side-head">Reports</div>',
+            unsafe_allow_html=True,
+        )
+        st.download_button(
+            "⬇️ Download Daily Report",
+            data=report_all.to_csv(index=False).encode("utf-8"),
+            file_name=f"alpha_trades_{local_now().strftime('%Y-%m-%d')}.csv",
+            mime="text/csv",
+            key="sidebar_daily_report",
+        )
+
+
+# -----------------------------
+# Global Option Seller Warning Monitor
+# -----------------------------
+def _global_option_warning_snapshot():
+    """
+    Lightweight option-risk monitor for the three supported NSE indices.
+    It is intentionally independent of the selected page/module.
+    """
+    out = []
+
+    for index_name in INDEX_NAMES:
+        try:
+            index_sid = resolve_index_instrument(master, index_name)
+            expiries = option_expiry_list_v2(index_sid)
+
+            if not expiries:
+                continue
+
+            selected_expiry = select_option_expiry_v2(expiries, "Intraday")
+            raw_chain = option_chain_request_v2(index_sid, selected_expiry)
+            raw_data = parse_data(raw_chain)
+
+            spot = (
+                pd.to_numeric(
+                    raw_data.get("last_price"),
+                    errors="coerce",
+                )
+                if isinstance(raw_data, dict)
+                else np.nan
+            )
+
+            chain_df = parse_option_chain_v2(raw_chain)
+            chain_df = filter_atm_strike_window(
+                chain_df,
+                spot,
+                strikes_each_side=20,
+            )
+
+            analysis = option_seller_analysis_v2(
+                chain_df,
+                spot,
+                "Intraday",
+            )
+
+            session_state = option_session_state(
+                index_name,
+                selected_expiry,
+                analysis["atm_iv"],
+            )
+
+            iv_risk = option_iv_risk(
+                analysis["atm_iv"],
+                session_state,
+            )
+            oi_risk = option_oi_risk(
+                chain_df,
+                spot,
+            )
+
+            if bool(iv_risk.get("alert")):
+                out.append({
+                    "index": index_name,
+                    "key": "iv_expansion",
+                    "message": (
+                        f"{index_name} IV is expanding sharply."
+                        if iv_risk.get("level") == "HIGH"
+                        else f"{index_name} IV is rising."
+                    ),
+                    "severity": "HIGH"
+                    if iv_risk.get("level") == "HIGH"
+                    else "MEDIUM",
+                })
+
+            if bool(oi_risk.get("alert")):
+                side_word = (
+                    "call"
+                    if oi_risk.get("side") == "CALL"
+                    else "put"
+                )
+                out.append({
+                    "index": index_name,
+                    "key": "oi_buildup",
+                    "message": (
+                        f"{index_name} heavy {side_word} side "
+                        "positioning buildup."
+                    ),
+                    "severity": "HIGH",
+                })
+
+        except Exception:
+            # Global monitor must never interrupt the client's selected module.
+            continue
+
+    return out
+
+
+def render_global_option_warning_monitor():
+    """
+    Runs independently from the selected module using Streamlit fragments.
+    This keeps option warnings alive even while the user is on NSE/MCX/RS/etc.
+    """
+    try:
+        fragment = getattr(st, "fragment", None)
+        if fragment is None:
+            return
+
+        @fragment(run_every="60s")
+        def _warning_fragment():
+            warnings = _global_option_warning_snapshot()
+
+            active_keys = {
+                f"{w['index']}|{w['key']}"
+                for w in warnings
+            }
+
+            if "global_option_warning_states" not in st.session_state:
+                st.session_state.global_option_warning_states = {}
+
+            previous_states = st.session_state.global_option_warning_states
+
+            for warning in warnings:
+                state_key = (
+                    f"{warning['index']}|{warning['key']}"
+                )
+                was_active = bool(
+                    previous_states.get(state_key, False)
+                )
+
+                if not was_active:
+                    st.toast(
+                        f"⚠️ Option warning: {warning['message']}",
+                        icon="⚠️",
+                    )
+                    speak_option_alert(
+                        f"Warning. {warning['message']}"
+                    )
+
+                previous_states[state_key] = True
+
+            # Clear warnings that are no longer active.
+            for key in list(previous_states):
+                if key not in active_keys:
+                    previous_states[key] = False
+
+            with st.sidebar:
+                st.markdown(
+                    '<div class="a-side-head">Option Seller Risk</div>',
+                    unsafe_allow_html=True,
+                )
+
+                if not warnings:
+                    st.markdown(
+                        """
+                        <div class="alpha-alert">
+                            <div class="alpha-alert-symbol">✓ Option risk normal</div>
+                            <div class="alpha-alert-meta">
+                                Monitoring continues in the background
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    for warning in warnings:
+                        color = "#ff5364"
+                        st.markdown(
+                            f"""
+                            <div class="alpha-alert"
+                                 style="border-color:rgba(255,83,100,.30);
+                                        background:rgba(255,83,100,.06);">
+                                <div class="alpha-alert-time">
+                                    ⚠ {warning["severity"]}
+                                </div>
+                                <div class="alpha-alert-symbol">
+                                    {warning["index"]} • OPTION WARNING
+                                </div>
+                                <div class="alpha-alert-meta">
+                                    {warning["message"]}
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+        _warning_fragment()
+
+    except Exception:
+        # Never break the selected page because the background warning monitor
+        # is unavailable.
+        pass
+
+
+render_global_option_warning_monitor()
+
 
 # Auto refresh is deliberately longer than the initial full-universe scan.
 # The full NSE scan can take longer than 1 minute, so a 1-minute rerun would

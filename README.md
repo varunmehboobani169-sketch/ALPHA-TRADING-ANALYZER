@@ -1,14 +1,17 @@
-# ALPHA ANALYZER — CLIENT PRO V6
+# ALPHA ANALYZER — V8 ERROR FIX
 
-Reference-style visual redesign only.
+Fixed the startup NameError shown in the screenshot.
 
-Presentation updates:
-- darker professional terminal background
-- compact live top bar
-- stronger left-side brand/account area
-- polished hero cards from V5
-- improved section hierarchy
-- upgraded trade/alert card styling
-- cleaner tables, buttons and controls
+Cause:
+The sidebar daily-report button called `trade_report_dataframe()` before the
+function was defined.
 
-Trading and data logic remains unchanged.
+Fix:
+The report button is now rendered after the trade-report helper is defined.
+
+All V7 functionality remains:
+- global option warning monitor
+- background warning notifications/sound
+- trade logging
+- IST timestamps
+- NSE/MCX/Option Seller/Market/RS/Sector modules
