@@ -2129,18 +2129,96 @@ def _fresh_trade_columns():
     ]
 
 
+def _dedupe_trade_rows(rows):
+    """
+    Keep exactly one Fresh Trade per Module + Mode + Symbol + Date.
+
+    This is deliberately stricter than Trade ID because the client wants
+    one signal = one logged trade for a symbol/day. Existing duplicate rows
+    caused by earlier refreshes are collapsed here.
+    """
+    if not rows:
+        return []
+
+    df = pd.DataFrame(rows)
+    for col in _fresh_trade_columns():
+        if col not in df.columns:
+            df[col] = np.nan
+
+    # Entry Time is immutable. Recover it from older fields only when available.
+    def _clean_time(row):
+        for key in ("Entry Time", "First Logged", "Opened"):
+            value = row.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text and text.lower() not in {"nan", "none", "nat"}:
+                return text
+        return ""
+
+    df["Entry Time"] = df.apply(_clean_time, axis=1)
+
+    # Normalize fields used for the one-trade-per-symbol/day rule.
+    df["_date_key"] = df["Date"].astype(str).str.strip()
+    df["_module_key"] = df["Module"].astype(str).str.upper().str.strip()
+    df["_mode_key"] = df["Mode"].astype(str).str.upper().str.strip()
+    df["_symbol_key"] = df["Symbol"].astype(str).str.upper().str.strip()
+
+    # Prefer the currently ACTIVE record. Among same-status duplicates,
+    # keep the earliest immutable Entry Time.
+    df["_active_rank"] = (
+        (df["Status"].astype(str).str.upper() == "ACTIVE")
+        .astype(int)
+    )
+    df["_entry_sort"] = pd.to_datetime(
+        df["Entry Time"],
+        format="%d-%b-%Y %H:%M:%S IST",
+        errors="coerce",
+    )
+
+    df = df.sort_values(
+        [
+            "_date_key", "_module_key", "_mode_key", "_symbol_key",
+            "_active_rank", "_entry_sort",
+        ],
+        ascending=[True, True, True, True, False, True],
+        na_position="last",
+    )
+
+    df = df.drop_duplicates(
+        subset=["_date_key", "_module_key", "_mode_key", "_symbol_key"],
+        keep="first",
+    )
+
+    return df[_fresh_trade_columns()].to_dict("records")
+
+
 def _load_day_trade_rows(day):
     path = _fresh_trade_path(day)
     if not path.exists():
         return []
+
     try:
         df = pd.read_csv(path)
+
         for col in _fresh_trade_columns():
             if col not in df.columns:
                 df[col] = np.nan
-        return df[_fresh_trade_columns()].to_dict("records")
+
+        rows = df[_fresh_trade_columns()].to_dict("records")
+        cleaned = _dedupe_trade_rows(rows)
+
+        # Persist cleanup so old duplicate entries disappear permanently.
+        pd.DataFrame(
+            cleaned,
+            columns=_fresh_trade_columns(),
+        ).to_csv(path, index=False)
+
+        return cleaned
+
     except Exception:
         return []
+
 
 
 def _load_fresh_trades_today():
@@ -2230,7 +2308,11 @@ def _record_fresh_trade(trade, trade_price):
     if trade_id in known:
         return
 
-    entry_time = str(trade.get("Entry Time", trade.get("Opened", "")))
+    entry_time = str(
+        trade.get("Entry Time")
+        or trade.get("Opened")
+        or local_now().strftime("%d-%b-%Y %H:%M:%S IST")
+    )
 
     row = {
         "Trade ID": trade_id,
@@ -2297,6 +2379,26 @@ def fresh_trades_dataframe():
     if df.empty:
         return df
 
+    # Immutable Entry Time: never use the page-refresh time as a substitute.
+    for col in ("Entry Time", "First Logged"):
+        if col not in df.columns:
+            df[col] = ""
+
+    def _time_value(row):
+        for key in ("Entry Time", "First Logged"):
+            text = str(row.get(key, "")).strip()
+            if text and text.lower() not in {"nan", "none", "nat"}:
+                return text
+        return "TIME UNAVAILABLE (LEGACY)"
+
+    df["Entry Time"] = df.apply(_time_value, axis=1)
+
+    # One ledger row per symbol per module/mode/day.
+    df = pd.DataFrame(
+        _dedupe_trade_rows(df.to_dict("records")),
+        columns=_fresh_trade_columns(),
+    )
+
     for col in [
         "Trade Price", "Signal Entry", "Entry", "Initial SL", "SL",
         "Current", "Exit", "Points P&L", "P&L %",
@@ -2305,6 +2407,7 @@ def fresh_trades_dataframe():
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     return df.reset_index(drop=True)
+
 
 
 def trade_report_dataframe(selected_date=None):
@@ -2390,7 +2493,12 @@ def _restore_active_trades_from_ledger():
         if key in st.session_state.trade_book:
             continue
 
-        entry_time = str(row.get("Entry Time", ""))
+        entry_time = str(
+            row.get("Entry Time")
+            or row.get("First Logged")
+            or row.get("Opened")
+            or ""
+        )
         trade = {
             col: row.get(col, np.nan)
             for col in [
@@ -2444,9 +2552,9 @@ def render_fresh_trades_module():
         return
 
     display = df[[
-        "Entry Time", "Module", "Mode", "Symbol", "Direction",
-        "Trade Price", "Signal Entry", "Entry", "Initial SL", "SL",
-        "Current", "Exit", "Status", "Exit Reason", "SL Trails",
+        "Entry Time", "Symbol", "Direction",
+        "Trade Price", "Signal Entry", "Initial SL",
+        "SL", "Status", "Exit",
     ]].copy()
 
     st.dataframe(
@@ -2455,13 +2563,10 @@ def render_fresh_trades_module():
         hide_index=True,
         column_config={
             "Trade Price": st.column_config.NumberColumn(
-                "Actual Entry Price", format="%.2f"
+                "Entry Price", format="%.2f"
             ),
             "Signal Entry": st.column_config.NumberColumn(
-                "P&F Signal Entry", format="%.2f"
-            ),
-            "Entry": st.column_config.NumberColumn(
-                "Recorded Entry", format="%.2f"
+                "Entry", format="%.2f"
             ),
             "Initial SL": st.column_config.NumberColumn(
                 "Initial SL", format="%.2f"
@@ -2527,9 +2632,9 @@ def render_trade_logs_module():
         st.dataframe(
             df[
                 [
-                    "Trade ID", "Entry Time", "Module", "Mode", "Symbol",
-                    "Direction", "Trade Price", "Signal Entry", "Entry",
-                    "Initial SL", "SL", "Exit", "Status", "Exit Reason",
+                    "Entry Time", "Symbol", "Module", "Mode", "Direction",
+                    "Trade Price", "Signal Entry", "Initial SL",
+                    "SL", "Exit", "Status",
                 ]
             ],
             use_container_width=True,
@@ -2752,6 +2857,30 @@ def _can_create_fresh_trade(module_name, mode):
 
     return True
 
+def _trade_already_logged_today(module_name, mode, symbol):
+    """Return True when this symbol already has a trade in today's ledger."""
+    _load_fresh_trades_today()
+
+    target = (
+        local_now().strftime("%d-%b-%Y"),
+        str(module_name).upper().strip(),
+        str(mode).upper().strip(),
+        str(symbol).upper().strip(),
+    )
+
+    for row in st.session_state.get("fresh_trade_log", []):
+        current = (
+            str(row.get("Date", "")).strip(),
+            str(row.get("Module", "")).upper().strip(),
+            str(row.get("Mode", "")).upper().strip(),
+            str(row.get("Symbol", "")).upper().strip(),
+        )
+        if current == target:
+            return True
+
+    return False
+
+
 
 def manage_trade_book(module_name, mode, signal_rows):
     """
@@ -2943,6 +3072,11 @@ def manage_trade_book(module_name, mode, signal_rows):
             and _can_create_fresh_trade(
                 module_name,
                 mode,
+            )
+            and not _trade_already_logged_today(
+                module_name,
+                mode,
+                symbol,
             )
         ):
             trade, created = _upsert_trade_record(
