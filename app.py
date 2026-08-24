@@ -4903,8 +4903,7 @@ elif page in ("Momentum", "Positional"):
         st.dataframe(
             long_df[
                 [
-                    "Script", "Entry Date/Time", "LTP",
-                    "Bias", "Entry", "SL", "Recommendation"
+                    "Script", "LTP", "Bias", "Entry", "SL", "Recommendation"
                 ]
             ],
             use_container_width=True,
@@ -4921,8 +4920,7 @@ elif page in ("Momentum", "Positional"):
         st.dataframe(
             short_df[
                 [
-                    "Script", "Entry Date/Time", "LTP",
-                    "Bias", "Entry", "SL", "Recommendation"
+                    "Script", "LTP", "Bias", "Entry", "SL", "Recommendation"
                 ]
             ],
             use_container_width=True,

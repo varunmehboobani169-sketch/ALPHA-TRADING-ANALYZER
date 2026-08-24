@@ -69,3 +69,9 @@ market-hours rules, trade logging, and dynamic SL logic are unchanged.
 ## Final Positional Table
 The NSE Positional LONG/SHORT table does not display Entry Date/Time.
 Entry Time remains available in Fresh Trades and Trade Logs.
+
+
+## KeyError Fix
+Removed the stale `Entry Date/Time` column reference from the NSE Positional
+LONG/SHORT display. The Positional table is now exactly:
+Script, LTP, Bias, Entry, SL, Recommendation.
