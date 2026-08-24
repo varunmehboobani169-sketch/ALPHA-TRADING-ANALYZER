@@ -2355,26 +2355,138 @@ def _save_fresh_trades_today():
         pass
 
 
+def _canonicalize_ledger_df(df):
+    """Normalize old ledgers and enforce one actual trade per symbol/day."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=_fresh_trade_columns())
+
+    x = df.copy()
+
+    for col in _fresh_trade_columns():
+        if col not in x.columns:
+            x[col] = np.nan
+
+    # Recover a missing Entry Time from First Logged only when it represents
+    # a valid market-hours timestamp. Never manufacture an after-hours
+    # timestamp from a refresh.
+    def valid_entry_time(row):
+        raw_entry = str(row.get("Entry Time", "")).strip()
+        raw_first = str(row.get("First Logged", "")).strip()
+
+        for raw in (raw_entry, raw_first):
+            if not raw or raw.lower() in {"nan", "none", "nat"}:
+                continue
+            parsed = pd.to_datetime(
+                raw,
+                format="%d-%b-%Y %H:%M:%S IST",
+                errors="coerce",
+            )
+            if pd.isna(parsed):
+                continue
+
+            module = str(row.get("Module", "")).upper().strip()
+            if module == "NSE":
+                t = parsed.time()
+                if not (
+                    datetime.strptime("09:15", "%H:%M").time()
+                    <= t
+                    <= datetime.strptime("15:40", "%H:%M").time()
+                ):
+                    continue
+
+            return raw
+
+        return "TIME UNAVAILABLE"
+
+    x["Entry Time"] = x.apply(valid_entry_time, axis=1)
+
+    # Historical report rows from the broken versions may contain entries
+    # generated after NSE close. Remove them completely.
+    def is_valid_row(row):
+        module = str(row.get("Module", "")).upper().strip()
+        if module != "NSE":
+            return True
+
+        parsed = pd.to_datetime(
+            str(row.get("Entry Time", "")),
+            format="%d-%b-%Y %H:%M:%S IST",
+            errors="coerce",
+        )
+        if pd.isna(parsed):
+            # Do not throw away a future/unknown trade merely because the
+            # exchange timestamp is unavailable.
+            return True
+
+        t = parsed.time()
+        return (
+            datetime.strptime("09:15", "%H:%M").time()
+            <= t
+            <= datetime.strptime("15:40", "%H:%M").time()
+        )
+
+    x = x[x.apply(is_valid_row, axis=1)].copy()
+
+    # One actual trade = one row per symbol/day.
+    x["_date_key"] = x["Date"].astype(str).str.strip()
+    x["_symbol_key"] = x["Symbol"].astype(str).str.upper().str.strip()
+
+    x["_active_rank"] = (
+        x["Status"].astype(str).str.upper().eq("ACTIVE").astype(int)
+    )
+    x["_time_sort"] = pd.to_datetime(
+        x["Entry Time"],
+        format="%d-%b-%Y %H:%M:%S IST",
+        errors="coerce",
+    )
+
+    x = x.sort_values(
+        ["_date_key", "_symbol_key", "_active_rank", "_time_sort"],
+        ascending=[True, True, False, True],
+        na_position="last",
+    )
+
+    # Prefer the earliest legitimate record for the one real trade.
+    x = x.drop_duplicates(
+        subset=["_date_key", "_symbol_key"],
+        keep="first",
+    )
+
+    return x[_fresh_trade_columns()].reset_index(drop=True)
+
+
 def _all_trade_ledger_dataframe():
     frames = []
+
     for path in sorted(FRESH_TRADE_DIR.glob("fresh_trades_*.csv")):
         try:
             df = pd.read_csv(path)
         except Exception:
             continue
-        for col in _fresh_trade_columns():
-            if col not in df.columns:
-                df[col] = np.nan
-        frames.append(df[_fresh_trade_columns()])
+        frames.append(df)
 
     if not frames:
         return pd.DataFrame(columns=_fresh_trade_columns())
 
     out = pd.concat(frames, ignore_index=True)
-    if "Trade ID" in out.columns:
-        out["Trade ID"] = out["Trade ID"].astype(str)
-        out = out.drop_duplicates("Trade ID", keep="last")
+    out = _canonicalize_ledger_df(out)
+
+    # Persist canonical cleanup for each day file. This makes the downloaded
+    # report clean from then on as well.
+    if not out.empty and "Date" in out.columns:
+        for day_value in sorted(out["Date"].astype(str).unique()):
+            day_path = FRESH_TRADE_DIR / (
+                f"fresh_trades_{pd.to_datetime(day_value, format='%d-%b-%Y', errors='coerce').strftime('%Y-%m-%d')}.csv"
+            )
+            if str(day_path).endswith("NaT.csv"):
+                continue
+            day_df = out[out["Date"].astype(str) == day_value].copy()
+            try:
+                day_df.to_csv(day_path, index=False)
+            except Exception:
+                pass
+
     return out.reset_index(drop=True)
+
 
 
 def _update_trade_ledger_row(trade):
@@ -2435,7 +2547,6 @@ def _record_fresh_trade(trade, trade_price):
 
     entry_time = str(
         trade.get("Entry Time")
-        or trade.get("Opened")
         or ""
     ).strip()
 
@@ -2546,7 +2657,7 @@ def fresh_trades_dataframe():
 
 
 def trade_report_dataframe(selected_date=None):
-    df = _all_trade_ledger_dataframe()
+    df = _canonicalize_ledger_df(_all_trade_ledger_dataframe())
     if df.empty:
         return df
 
@@ -2942,7 +3053,7 @@ def _upsert_trade_record(
     initial_sl = float(sl) if pd.notna(sl) else np.nan
 
     market_time = _normalize_market_time(market_time)
-    entry_time = market_time or opened.strftime("%d-%b-%Y %H:%M:%S IST")
+    entry_time = market_time or "TIME UNAVAILABLE"
 
     # Never accept a bogus after-hours market time for NSE.
     if module_name == "NSE":
@@ -2957,7 +3068,7 @@ def _upsert_trade_record(
             ):
                 entry_time = opened.strftime("%d-%b-%Y %H:%M:%S IST")
         except Exception:
-            entry_time = opened.strftime("%d-%b-%Y %H:%M:%S IST")
+            entry_time = "TIME UNAVAILABLE"
 
     trade = {
         "Trade ID": trade_id,
