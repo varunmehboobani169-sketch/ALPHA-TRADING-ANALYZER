@@ -6,10 +6,17 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="ALPHA ANALYZER", page_icon="α", layout="wide")
 
 API = "https://api.dhan.co/v2"
+LOCAL_TZ = ZoneInfo("Asia/Kolkata")
+
+def local_now():
+    """Application display time: India Standard Time (IST)."""
+    return datetime.now(LOCAL_TZ)
+
 
 # -----------------------------
 # Session credentials
@@ -20,6 +27,13 @@ if "access_token" not in st.session_state:
     st.session_state.access_token = ""
 if "api_log" not in st.session_state:
     st.session_state.api_log = []
+
+# Per-session trade book. It survives Streamlit reruns and is downloadable.
+if "trade_book" not in st.session_state:
+    st.session_state.trade_book = {}
+
+if "trade_sequence" not in st.session_state:
+    st.session_state.trade_sequence = 0
 
 with st.sidebar:
     st.title("ALPHA ANALYZER")
@@ -38,6 +52,16 @@ with st.sidebar:
         value=st.session_state.access_token,
         type="password",
     ).strip()
+
+    if st.session_state.get("trade_book"):
+        report_all = trade_report_dataframe()
+        st.download_button(
+            "⬇️ Download Daily Report",
+            data=report_all.to_csv(index=False).encode("utf-8"),
+            file_name=f"alpha_trades_{local_now().strftime('%Y-%m-%d')}.csv",
+            mime="text/csv",
+            key="sidebar_daily_report",
+        )
 
     auto = st.checkbox("Auto Refresh", True)
     page = st.radio(
@@ -70,6 +94,253 @@ st.markdown(
 )
 
 
+
+# -----------------------------
+# ALPHA ANALYZER PRO TERMINAL UI
+# -----------------------------
+st.markdown(
+    """
+    <style>
+    :root {
+        --alpha-bg: #070d18;
+        --alpha-panel: #0d1524;
+        --alpha-panel-2: #111c2e;
+        --alpha-border: rgba(255,255,255,.08);
+        --alpha-text: #f5f7fb;
+        --alpha-muted: rgba(255,255,255,.55);
+        --alpha-green: #29d77a;
+        --alpha-red: #ff5362;
+        --alpha-blue: #2e8cff;
+        --alpha-yellow: #ffd45c;
+    }
+
+    .stApp {
+        background:
+            radial-gradient(circle at 0% 0%, rgba(46,140,255,.12), transparent 24%),
+            radial-gradient(circle at 100% 0%, rgba(41,215,122,.08), transparent 20%),
+            linear-gradient(180deg, #060b14 0%, #07101d 100%);
+        color: var(--alpha-text);
+    }
+
+    .block-container {
+        max-width: 1550px;
+        padding-top: 1.15rem;
+        padding-left: 1.05rem;
+        padding-right: 1.05rem;
+        padding-bottom: 2.2rem;
+    }
+
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #08101d 0%, #060c16 100%);
+        border-right: 1px solid var(--alpha-border);
+    }
+
+    section[data-testid="stSidebar"] .block-container {
+        padding-top: .95rem;
+    }
+
+    /* Hide the extra Streamlit top chrome feeling by keeping our header compact */
+    .alpha-terminal-bar {
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:16px;
+        padding:10px 14px;
+        margin-bottom:16px;
+        border:1px solid rgba(255,255,255,.07);
+        border-radius:12px;
+        background:linear-gradient(90deg, rgba(255,255,255,.035), rgba(255,255,255,.015));
+        box-shadow:0 10px 26px rgba(0,0,0,.16);
+    }
+
+    .alpha-terminal-left {
+        display:flex;
+        align-items:center;
+        gap:9px;
+        font-weight:800;
+        font-size:.82rem;
+        letter-spacing:.045em;
+    }
+
+    .alpha-pulse {
+        width:8px;
+        height:8px;
+        border-radius:50%;
+        background:#29d77a;
+        box-shadow:0 0 14px rgba(41,215,122,.65);
+    }
+
+    .alpha-terminal-right {
+        color:rgba(255,255,255,.55);
+        font-size:.72rem;
+        letter-spacing:.025em;
+    }
+
+    .alpha-hero {
+        padding:18px 20px;
+        margin-bottom:15px;
+        border-radius:18px;
+        background:
+            linear-gradient(135deg, rgba(46,140,255,.11), rgba(255,255,255,.025)),
+            #0c1422;
+        border:1px solid rgba(255,255,255,.075);
+        box-shadow:0 14px 36px rgba(0,0,0,.18);
+    }
+
+    .alpha-hero-title {
+        font-size:1.55rem;
+        font-weight:850;
+        letter-spacing:-.025em;
+        margin-bottom:3px;
+    }
+
+    .alpha-hero-sub {
+        color:var(--alpha-muted);
+        font-size:.82rem;
+    }
+
+    .alpha-badge {
+        display:inline-block;
+        margin-top:10px;
+        padding:5px 9px;
+        border-radius:999px;
+        font-size:.67rem;
+        font-weight:800;
+        letter-spacing:.06em;
+        background:rgba(41,215,122,.10);
+        color:#7feeb2;
+        border:1px solid rgba(41,215,122,.20);
+    }
+
+    .alpha-card {
+        border:1px solid var(--alpha-border);
+        border-radius:14px;
+        background:linear-gradient(145deg, rgba(255,255,255,.04), rgba(255,255,255,.015));
+        box-shadow:0 10px 26px rgba(0,0,0,.12);
+        padding:14px 15px;
+    }
+
+    .alpha-kicker {
+        color:var(--alpha-muted);
+        font-size:.68rem;
+        letter-spacing:.08em;
+        text-transform:uppercase;
+        margin-bottom:6px;
+    }
+
+    .alpha-value {
+        font-size:1.18rem;
+        font-weight:820;
+    }
+
+    .alpha-positive { color:var(--alpha-green); }
+    .alpha-negative { color:var(--alpha-red); }
+    .alpha-neutral { color:var(--alpha-yellow); }
+
+    div[data-testid="stMetric"] {
+        background:linear-gradient(145deg, rgba(255,255,255,.04), rgba(255,255,255,.015));
+        border:1px solid var(--alpha-border);
+        border-radius:14px;
+        box-shadow:0 10px 24px rgba(0,0,0,.12);
+    }
+
+    div[data-testid="stDataFrame"] {
+        border-radius:14px;
+        overflow:hidden;
+        border:1px solid var(--alpha-border);
+        box-shadow:0 10px 26px rgba(0,0,0,.12);
+    }
+
+    .stButton > button {
+        border-radius:10px;
+        font-weight:750;
+        border:1px solid rgba(255,255,255,.08);
+        background:linear-gradient(135deg, #2e8cff, #4a69d8);
+        box-shadow:0 8px 20px rgba(46,140,255,.18);
+    }
+
+    .stDownloadButton > button {
+        border-radius:10px;
+        font-weight:750;
+    }
+
+    div[data-baseweb="input"] > div,
+    div[data-baseweb="select"] > div {
+        border-radius:10px !important;
+        background:rgba(255,255,255,.025) !important;
+        border-color:rgba(255,255,255,.08) !important;
+    }
+
+    div[data-testid="stAlert"] {
+        border-radius:12px;
+    }
+
+    div[data-testid="stExpander"] {
+        border-radius:12px;
+        border:1px solid var(--alpha-border);
+        background:rgba(255,255,255,.02);
+    }
+
+    hr {
+        border-color:rgba(255,255,255,.065);
+        margin-top:1.1rem;
+        margin-bottom:1.1rem;
+    }
+
+    .alpha-section {
+        display:flex;
+        align-items:center;
+        gap:10px;
+        margin:10px 0 9px 0;
+        font-size:1.24rem;
+        font-weight:820;
+        letter-spacing:-.02em;
+    }
+
+    .alpha-section-dot {
+        width:11px;
+        height:11px;
+        border-radius:50%;
+        flex:0 0 auto;
+    }
+
+    .alpha-table-note {
+        color:rgba(255,255,255,.48);
+        font-size:.73rem;
+        margin-top:4px;
+    }
+
+    @media (max-width: 900px) {
+        .block-container {
+            padding-left:.65rem;
+            padding-right:.65rem;
+        }
+        .alpha-terminal-right {
+            display:none;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    f"""
+    <div class="alpha-terminal-bar">
+        <div class="alpha-terminal-left">
+            <span class="alpha-pulse"></span>
+            <span>ALPHA ANALYZER</span>
+            <span style="opacity:.35;">•</span>
+            <span style="font-weight:650;opacity:.58;">LIVE MARKET DASHBOARD</span>
+        </div>
+        <div class="alpha-terminal-right">
+            {local_now().strftime("%d-%b-%Y %H:%M:%S IST")}
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 def headers():
     if not st.session_state.client_id or not st.session_state.access_token:
         raise RuntimeError("Enter your login credentials.")
@@ -88,7 +359,7 @@ def api_post(path, payload, label):
         body = {"raw": r.text}
     st.session_state.api_log.append(
         {
-            "time": datetime.now().strftime("%H:%M:%S"),
+            "time": local_now().strftime("%H:%M:%S IST"),
             "label": label,
             "endpoint": path,
             "status": r.status_code,
@@ -1771,6 +2042,302 @@ def notify_option_warning(module_name, warning_key, message, active):
 
 
 
+
+# -----------------------------
+# Trade Book / Active Trade Manager
+# -----------------------------
+def _trade_key(module_name, mode, symbol):
+    return f"{module_name}|{mode}|{symbol}"
+
+
+def _trade_points_pnl(direction, entry, exit_price):
+    if pd.isna(entry) or pd.isna(exit_price):
+        return np.nan
+    if direction == "LONG":
+        return float(exit_price) - float(entry)
+    return float(entry) - float(exit_price)
+
+
+def _trade_pct_pnl(direction, entry, exit_price):
+    if pd.isna(entry) or pd.isna(exit_price) or float(entry) == 0:
+        return np.nan
+    points = _trade_points_pnl(direction, entry, exit_price)
+    return 100.0 * points / float(entry)
+
+
+def _trade_duration_minutes(opened_at, closed_at=None):
+    try:
+        end = closed_at or datetime.now()
+        return round((end - opened_at).total_seconds() / 60.0, 1)
+    except Exception:
+        return np.nan
+
+
+def _upsert_trade_record(module_name, mode, symbol, direction, entry, sl):
+    key = _trade_key(module_name, mode, symbol)
+    book = st.session_state.trade_book
+
+    # Only one active trade per module/mode/symbol.
+    existing = book.get(key)
+
+    if existing and existing.get("status") == "ACTIVE":
+        return existing, False
+
+    st.session_state.trade_sequence += 1
+    trade_id = f"T{st.session_state.trade_sequence:05d}"
+
+    opened = local_now()
+
+    trade = {
+        "Trade ID": trade_id,
+        "Date": opened.strftime("%d-%b-%Y"),
+        "Module": module_name,
+        "Mode": mode,
+        "Symbol": symbol,
+        "Direction": direction,
+        "Entry": float(entry) if pd.notna(entry) else np.nan,
+        "SL": float(sl) if pd.notna(sl) else np.nan,
+        "Current": float(entry) if pd.notna(entry) else np.nan,
+        "Exit": np.nan,
+        "Status": "ACTIVE",
+        "Exit Reason": "",
+        "Points P&L": np.nan,
+        "P&L %": np.nan,
+        "Opened": opened.strftime("%d-%b-%Y %H:%M:%S IST"),
+        "Closed": "",
+        "Duration (min)": np.nan,
+    }
+    book[key] = trade
+    return trade, True
+
+
+def _close_trade_record(trade, exit_price, reason):
+    now = local_now()
+    trade["Exit"] = float(exit_price) if pd.notna(exit_price) else np.nan
+    trade["Current"] = trade["Exit"]
+    trade["Status"] = "CLOSED"
+    trade["Exit Reason"] = str(reason)
+    trade["Points P&L"] = _trade_points_pnl(
+        trade["Direction"],
+        trade["Entry"],
+        trade["Exit"],
+    )
+    trade["P&L %"] = _trade_pct_pnl(
+        trade["Direction"],
+        trade["Entry"],
+        trade["Exit"],
+    )
+    trade["Closed"] = now.strftime("%d-%b-%Y %H:%M:%S IST")
+    opened_text = str(trade.get("Opened", "")).replace(" IST", "")
+    opened_dt = datetime.strptime(
+        opened_text,
+        "%d-%b-%Y %H:%M:%S",
+    ).replace(tzinfo=LOCAL_TZ)
+    trade["Duration (min)"] = _trade_duration_minutes(
+        opened_dt,
+        now,
+    )
+
+
+def manage_trade_book(module_name, mode, signal_rows):
+    """
+    Convert momentary scan signals into persistent ACTIVE trades.
+
+    A trade stays ACTIVE after a signal disappears. It exits only on:
+    - Stop loss
+    - Opposite valid signal
+    - Intraday end-of-day time exit (15:20 for NSE)
+    """
+    opened = []
+    exited = []
+
+    rows = signal_rows.copy() if signal_rows is not None else pd.DataFrame()
+
+    # Keys present in this scan for duplicate protection.
+    current_symbols = set()
+
+    for _, row in rows.iterrows():
+        symbol = str(row.get("Script", "")).replace("★★ ", "").replace("★ ", "").strip()
+        if not symbol:
+            continue
+
+        rec = str(row.get("Recommendation", ""))
+        ltp = pd.to_numeric(row.get("LTP"), errors="coerce")
+        entry = pd.to_numeric(row.get("Entry"), errors="coerce")
+        sl = pd.to_numeric(row.get("SL"), errors="coerce")
+
+        direction = None
+        if rec in ("🟢 BUY", "🟢 LONG"):
+            direction = "LONG"
+        elif rec in ("🔴 SELL", "🔴 SHORT"):
+            direction = "SHORT"
+
+        key = _trade_key(module_name, mode, symbol)
+        current_symbols.add(symbol)
+
+        active = st.session_state.trade_book.get(key)
+
+        # Existing active trade: manage it first.
+        if active and active.get("status") == "ACTIVE":
+            if pd.notna(ltp):
+                active["Current"] = float(ltp)
+
+            exit_reason = None
+
+            # Stop loss
+            if pd.notna(ltp) and pd.notna(active.get("SL")):
+                if active["Direction"] == "LONG" and float(ltp) <= float(active["SL"]):
+                    exit_reason = "Stop Loss"
+                elif active["Direction"] == "SHORT" and float(ltp) >= float(active["SL"]):
+                    exit_reason = "Stop Loss"
+
+            # Opposite valid signal
+            if (
+                exit_reason is None
+                and direction is not None
+                and direction != active["Direction"]
+            ):
+                exit_reason = "Reverse Signal"
+
+            # NSE intraday time exit
+            if (
+                exit_reason is None
+                and module_name == "NSE"
+                and mode == "Intraday"
+                and datetime.now().time() >= datetime.strptime("15:20", "%H:%M").time()
+                and pd.notna(ltp)
+            ):
+                exit_reason = "End of Day"
+
+            if exit_reason:
+                _close_trade_record(active, ltp, exit_reason)
+                exited.append(active.copy())
+
+            continue
+
+        # No active trade: open only on a valid signal.
+        if direction is not None and pd.notna(ltp):
+            use_entry = entry if pd.notna(entry) else ltp
+            use_sl = sl
+
+            trade, created = _upsert_trade_record(
+                module_name,
+                mode,
+                symbol,
+                direction,
+                use_entry,
+                use_sl,
+            )
+            if created:
+                trade["Current"] = float(ltp)
+                opened.append(trade.copy())
+
+    return opened, exited
+
+
+def trade_report_dataframe():
+    rows = list(st.session_state.trade_book.values())
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "Trade ID","Date","Module","Mode","Symbol","Direction",
+                "Entry","SL","Current","Exit","Status","Exit Reason",
+                "Points P&L","P&L %","Opened","Closed","Duration (min)"
+            ]
+        )
+
+    df = pd.DataFrame(rows)
+    if "Opened" in df.columns:
+        df = df.sort_values("Opened", ascending=False)
+    return df.reset_index(drop=True)
+
+
+def render_trade_monitor(module_name=None, mode=None):
+    """Client-facing active/completed trade monitor + daily report download."""
+    df = trade_report_dataframe()
+
+    if module_name is not None:
+        df = df[df["Module"] == module_name]
+    if mode is not None:
+        df = df[df["Mode"] == mode]
+
+    if df.empty:
+        return
+
+    active = df[df["Status"] == "ACTIVE"].copy()
+    closed = df[df["Status"] == "CLOSED"].copy()
+
+    st.markdown("---")
+    st.markdown("### Trade Monitor")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Active", int(len(active)))
+    c2.metric("Completed", int(len(closed)))
+
+    if not closed.empty:
+        winners = int((pd.to_numeric(closed["Points P&L"], errors="coerce") > 0).sum())
+        losers = int((pd.to_numeric(closed["Points P&L"], errors="coerce") < 0).sum())
+        win_rate = 100.0 * winners / len(closed)
+        total_points = pd.to_numeric(closed["Points P&L"], errors="coerce").sum()
+    else:
+        winners = losers = 0
+        win_rate = 0.0
+        total_points = 0.0
+
+    c3.metric("Win Rate", f"{win_rate:.1f}%")
+    c4.metric("Net Points", f"{total_points:.2f}")
+
+    if not active.empty:
+        st.markdown("#### Active Trades")
+        st.dataframe(
+            active[
+                [
+                    "Symbol","Direction","Entry","SL","Current",
+                    "Opened","Status"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if not closed.empty:
+        st.markdown("#### Recent Closed Trades")
+        st.dataframe(
+            closed.head(20)[
+                [
+                    "Symbol","Direction","Entry","Exit","Points P&L",
+                    "P&L %","Exit Reason","Opened","Closed"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download Daily Trade Report",
+        data=csv_bytes,
+        file_name=f"alpha_trades_{local_now().strftime('%Y-%m-%d')}.csv",
+        mime="text/csv",
+        key=f"trade_report_{module_name}_{mode}",
+    )
+
+
+def notify_trade_exits(exited_trades):
+    for trade in exited_trades:
+        symbol = trade["Symbol"]
+        reason = trade["Exit Reason"]
+        st.toast(
+            f"Trade exit: {symbol} • {reason}",
+            icon="✅" if reason != "Stop Loss" else "⚠️",
+        )
+        speak_client_alert(
+            f"{symbol} trade exited because {reason}",
+            prefix="Trade exit",
+        )
+
+
 # -----------------------------
 # Notification Panel
 # -----------------------------
@@ -1779,7 +2346,9 @@ def record_trade_notifications(module_name, mode, symbols):
     Store the latest new-trade timestamps for the client notification panel.
     Keeps a small rolling history per module/mode.
     """
-    now_text = datetime.now().strftime("%d-%b-%Y %H:%M:%S")
+    now_local = local_now()
+    now_text = now_local.strftime("%d-%b-%Y %H:%M:%S IST")
+    now_sort = now_local.isoformat()
 
     if "notification_history" not in st.session_state:
         st.session_state.notification_history = {}
@@ -1798,6 +2367,7 @@ def record_trade_notifications(module_name, mode, symbols):
             0,
             {
                 "time": now_text,
+                "sort_time": now_sort,
                 "module": module_name,
                 "mode": mode,
                 "symbol": clean,
@@ -1816,7 +2386,7 @@ def render_notification_panel():
 
     history = sorted(
         history,
-        key=lambda x: x["time"],
+        key=lambda x: x.get("sort_time", ""),
         reverse=True,
     )[:10]
 
@@ -1829,9 +2399,9 @@ def render_notification_panel():
 
         for item in history[:5]:
             st.markdown(
-                f"**{item['symbol']}**  \n"
-                f"{item['module']} • {item['mode']}  \n"
-                f"`{item['time']}`"
+                f"**{item['symbol']}**  \\n"
+                f"{item['module']} • {item['mode']}  \\n"
+                f"🕒 {item['time']}"
             )
             st.divider()
 
@@ -2323,7 +2893,16 @@ if auto:
         pass
 
 if page == "Market Overview":
-    st.title("MARKET OVERVIEW")
+    st.markdown(
+        """
+        <div class="alpha-hero">
+            <div class="alpha-hero-title">MARKET OVERVIEW</div>
+            <div class="alpha-hero-sub">Current market pulse</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
     st.caption("Market Pulse")
 
     def market_bias_from_history(sec_id, segment, instrument):
@@ -2421,8 +3000,17 @@ if page == "Market Overview":
 
 elif page in ("Intraday", "Positional"):
     mode = page
-    st.title(mode)
-    st.caption("Live trade monitor.")
+    st.markdown(
+        f"""
+        <div class="alpha-hero">
+            <div class="alpha-hero-title">NSE {mode}</div>
+            <div class="alpha-hero-sub">Live trade monitoring & signal tracking</div>
+            <span class="alpha-badge">LIVE</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
 
     fut = future_universe(master, "NSE")
     if fut.empty:
@@ -2765,24 +3353,22 @@ elif page in ("Intraday", "Positional"):
                 res.at[idx_row, "Script"] = symbol_clean
 
 
-    if mode == "Intraday":
+    opened_trades, exited_trades = manage_trade_book(
+        "NSE",
+        mode,
+        res,
+    )
+
+    if opened_trades:
         notify_new_trades(
             "NSE",
-            "Intraday",
-            res.loc[
-                res["Recommendation"].isin(["🟢 BUY", "🔴 SELL"]),
-                "Script",
-            ].tolist(),
+            mode,
+            [t["Symbol"] for t in opened_trades],
         )
-    else:
-        notify_new_trades(
-            "NSE",
-            "Positional",
-            res.loc[
-                res["Recommendation"].isin(["🟢 LONG", "🔴 SHORT"]),
-                "Script",
-            ].tolist(),
-        )
+
+    if exited_trades:
+        notify_trade_exits(exited_trades)
+
 
     if mode == "Intraday":
         long_df = res[res["Recommendation"] == "🟢 BUY"].copy()
@@ -2823,10 +3409,13 @@ elif page in ("Intraday", "Positional"):
         return styles
 
     if mode == "Positional":
-        st.caption("★ / ★★ indicate stronger internal confirmation.")
+        st.caption("Active trades remain visible until the system records an exit.")
 
     st.markdown("---")
-    st.markdown("## 🟢 BULLISH / LONG")
+    st.markdown(
+        '<div class="alpha-section"><span class="alpha-section-dot" style="background:#29d77a;"></span>BULLISH / LONG</div>',
+        unsafe_allow_html=True,
+    )
     if long_df.empty:
         st.info("No active bullish positions currently.")
     else:
@@ -2838,7 +3427,10 @@ elif page in ("Intraday", "Positional"):
             hide_index=True,
         )
 
-    st.markdown("## 🔴 BEARISH / SHORT")
+    st.markdown(
+        '<div class="alpha-section"><span class="alpha-section-dot" style="background:#ff5362;"></span>BEARISH / SHORT</div>',
+        unsafe_allow_html=True,
+    )
     if short_df.empty:
         st.info("No active bearish positions currently.")
     else:
@@ -2850,7 +3442,10 @@ elif page in ("Intraday", "Positional"):
             hide_index=True,
         )
 
-    st.markdown("## ⚪ OTHER")
+    st.markdown(
+        '<div class="alpha-section"><span class="alpha-section-dot" style="background:#ffd45c;"></span>OTHER</div>',
+        unsafe_allow_html=True,
+    )
     sideways_df = res[res["Recommendation"] == "NO POSITION"].copy()
     if sideways_df.empty:
         st.info("No sideways instruments currently.")
@@ -2863,10 +3458,22 @@ elif page in ("Intraday", "Positional"):
             hide_index=True,
         )
 
+    render_trade_monitor("NSE", mode)
+
 
 
 elif page == "MCX Futures":
-    st.title("MCX FUTURES")
+    st.markdown(
+        """
+        <div class="alpha-hero">
+            <div class="alpha-hero-title">MCX FUTURES</div>
+            <div class="alpha-hero-sub">Live commodity futures monitoring</div>
+            <span class="alpha-badge">LIVE</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
     st.caption("GOLD • SILVER • COPPER • CRUDEOIL • NATURALGAS • ZINC • LEAD • NICKEL • ALUMINIUM")
 
     mode=st.radio("Horizon",["Intraday","Positional"],horizontal=True,key="mcx_futures_mode")
@@ -3021,7 +3628,17 @@ elif page == "MCX Futures":
 
 
 elif page == "Option Seller":
-    st.title("OPTION SELLER")
+    st.markdown(
+        """
+        <div class="alpha-hero">
+            <div class="alpha-hero-title">OPTION SELLER</div>
+            <div class="alpha-hero-sub">Live option market monitoring</div>
+            <span class="alpha-badge">LIVE</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
     st.caption("NIFTY • BANKNIFTY • SENSEX")
 
     index_name = st.selectbox(
@@ -3344,7 +3961,16 @@ elif page == "Option Seller":
 
 
 elif page == "Sector Analysis":
-    st.title("SECTOR ANALYSIS")
+    st.markdown(
+        """
+        <div class="alpha-hero">
+            <div class="alpha-hero-title">SECTOR ANALYSIS</div>
+            <div class="alpha-hero-sub">Sector strength monitor</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
     st.caption(
         "Sector market view • Manual refresh only"
     )
@@ -3404,7 +4030,16 @@ elif page == "Sector Analysis":
 
 
 elif page == "RS Matrix":
-    st.title("RS MATRIX")
+    st.markdown(
+        """
+        <div class="alpha-hero">
+            <div class="alpha-hero-title">RS MATRIX</div>
+            <div class="alpha-hero-sub">Relative market strength monitor</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
     st.caption(
         "Relative strength market view • Manual refresh only"
     )
@@ -3445,4 +4080,4 @@ else:
     st.title("System Status")
     st.info("System is running.")
 
-st.caption(f"Last refresh: {datetime.now().strftime('%d-%b-%Y %H:%M:%S')}")
+st.caption(f"Last refresh: {local_now().strftime('%d-%b-%Y %H:%M:%S IST')}")

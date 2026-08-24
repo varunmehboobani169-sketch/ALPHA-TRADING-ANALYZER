@@ -1,9 +1,13 @@
-# ALPHA ANALYZER — CLIENT PRO V2
+# ALPHA ANALYZER — CLIENT PRO V5 TERMINAL
 
-UI-only improvement:
-- Removes the large top brand header that could be clipped by Streamlit's
-  top toolbar.
-- Replaces it with a compact, clean live status bar.
-- Adds more top padding to the main content area.
-- Keeps the full ALPHA ANALYZER brand prominent in the sidebar.
-- Preserves all trading/data/refresh logic unchanged.
+UI upgrade inspired by the reference trading dashboard.
+
+- Compact live terminal header with IST time
+- Stronger page hero sections
+- Professional navy/black trading-terminal palette
+- Polished trade section headings
+- Consistent cards, tables, buttons and alerts
+- Keeps the existing V4 IST timestamps, trade logging, active-trade
+  management, notifications, PCR, NSE/MCX, sector and RS functionality.
+
+No trading methodology or API logic was intentionally changed.
