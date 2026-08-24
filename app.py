@@ -2410,8 +2410,22 @@ def _canonicalize_ledger_df(df):
     # generated after NSE close. Remove them completely.
     def is_valid_row(row):
         module = str(row.get("Module", "")).upper().strip()
+
         if module != "NSE":
-            return True
+            parsed = pd.to_datetime(
+                str(row.get("Entry Time", "")),
+                format="%d-%b-%Y %H:%M:%S IST",
+                errors="coerce",
+            )
+            return bool(
+                pd.notna(parsed)
+                and pd.notna(
+                    pd.to_numeric(
+                        row.get("Initial SL"),
+                        errors="coerce",
+                    )
+                )
+            )
 
         parsed = pd.to_datetime(
             str(row.get("Entry Time", "")),
@@ -2419,15 +2433,19 @@ def _canonicalize_ledger_df(df):
             errors="coerce",
         )
         if pd.isna(parsed):
-            # Do not throw away a future/unknown trade merely because the
-            # exchange timestamp is unavailable.
-            return True
+            return False
 
         t = parsed.time()
-        return (
+        if not (
             datetime.strptime("09:15", "%H:%M").time()
             <= t
             <= datetime.strptime("15:40", "%H:%M").time()
+        ):
+            return False
+
+        # A genuine NSE trade must have an initial SL.
+        return pd.notna(
+            pd.to_numeric(row.get("Initial SL"), errors="coerce")
         )
 
     x = x[x.apply(is_valid_row, axis=1)].copy()
@@ -2569,7 +2587,7 @@ def _record_fresh_trade(trade, trade_price):
         "Symbol": trade.get("Symbol", ""),
         "Direction": trade.get("Direction", ""),
         "Trade Price": float(trade.get("Entry", trade_price)) if pd.notna(trade.get("Entry", trade_price)) else np.nan,
-        "LTP": float(trade.get("Current", trade_price)) if pd.notna(trade.get("Current", trade_price)) else np.nan,
+        "LTP": float(trade.get("LTP", trade.get("Current", trade_price))) if pd.notna(trade.get("LTP", trade.get("Current", trade_price))) else np.nan,
         "Signal Entry": trade.get("Signal Entry", np.nan),
         "Entry": trade.get("Entry", np.nan),
         "Initial SL": trade.get("Initial SL", np.nan),
@@ -3020,6 +3038,28 @@ def _trade_duration_minutes(opened_at, closed_at=None):
         return np.nan
 
 
+def _valid_nse_market_timestamp(value):
+    """Return True only for a real NSE market timestamp in the trade window."""
+    text = _normalize_market_time(value)
+    if not text:
+        return False
+    try:
+        parsed = datetime.strptime(text, "%d-%b-%Y %H:%M:%S IST")
+    except Exception:
+        return False
+    return (
+        datetime.strptime("09:15", "%H:%M").time()
+        <= parsed.time()
+        <= datetime.strptime("15:40", "%H:%M").time()
+    )
+
+
+def _valid_trade_timestamp(module_name, value):
+    if module_name == "NSE":
+        return _valid_nse_market_timestamp(value)
+    return bool(_normalize_market_time(value))
+
+
 def _normalize_market_time(value):
     if value is None:
         return None
@@ -3046,43 +3086,43 @@ def _upsert_trade_record(
     if existing and existing.get("Status", existing.get("status")) == "ACTIVE":
         return existing, False
 
-    st.session_state.trade_sequence += 1
-    opened = local_now()
-
-    trade_id = (
-        f"T{opened.strftime('%Y%m%d%H%M%S')}-"
-        f"{st.session_state.trade_sequence:03d}"
-    )
+    # Hard validation: a Fresh Trade is created only when all required
+    # live-market fields are present.
+    market_time = _normalize_market_time(market_time)
+    if not _valid_trade_timestamp(module_name, market_time):
+        return None, False
 
     actual_entry = (
         float(actual_entry)
         if pd.notna(actual_entry)
         else np.nan
     )
+    initial_sl = (
+        float(sl)
+        if pd.notna(sl)
+        else np.nan
+    )
+
+    if not pd.notna(actual_entry):
+        return None, False
+
+    # We do not log a complete trade without an initial structural SL.
+    if not pd.notna(initial_sl):
+        return None, False
+
+    opened = local_now()
+    st.session_state.trade_sequence += 1
+
+    trade_id = (
+        f"T{opened.strftime('%Y%m%d%H%M%S')}-"
+        f"{st.session_state.trade_sequence:03d}"
+    )
+
     signal_entry = (
         float(signal_entry)
         if pd.notna(signal_entry)
         else np.nan
     )
-    initial_sl = float(sl) if pd.notna(sl) else np.nan
-
-    market_time = _normalize_market_time(market_time)
-    entry_time = market_time or "TIME UNAVAILABLE"
-
-    # Never accept a bogus after-hours market time for NSE.
-    if module_name == "NSE":
-        try:
-            parsed_entry = datetime.strptime(
-                entry_time, "%d-%b-%Y %H:%M:%S IST"
-            )
-            if not (
-                datetime.strptime("09:15", "%H:%M").time()
-                <= parsed_entry.time()
-                <= datetime.strptime("15:40", "%H:%M").time()
-            ):
-                entry_time = opened.strftime("%d-%b-%Y %H:%M:%S IST")
-        except Exception:
-            entry_time = "TIME UNAVAILABLE"
 
     trade = {
         "Trade ID": trade_id,
@@ -3096,12 +3136,13 @@ def _upsert_trade_record(
         "Initial SL": initial_sl,
         "SL": initial_sl,
         "Current": actual_entry,
+        "LTP": actual_entry,
         "Exit": np.nan,
         "Status": "ACTIVE",
         "Exit Reason": "",
         "Points P&L": np.nan,
         "P&L %": np.nan,
-        "Entry Time": entry_time,
+        "Entry Time": market_time,
         "Opened": opened.strftime("%d-%b-%Y %H:%M:%S IST"),
         "Closed": "",
         "Duration (min)": np.nan,
@@ -3111,6 +3152,7 @@ def _upsert_trade_record(
 
     book[key] = trade
     return trade, True
+
 
 
 def _close_trade_record(trade, exit_price, reason):
@@ -3389,13 +3431,14 @@ def manage_trade_book(module_name, mode, signal_rows):
         # ---------------------------
         # NEW TRADE
         # ---------------------------
+        market_time = _normalize_market_time(row.get("Market Time"))
+
         if (
             direction is not None
             and pd.notna(ltp)
-            and _can_create_fresh_trade(
-                module_name,
-                mode,
-            )
+            and pd.notna(structural_sl)
+            and _can_create_fresh_trade(module_name, mode)
+            and _valid_trade_timestamp(module_name, market_time)
             and not _trade_already_logged_today(
                 module_name,
                 mode,
@@ -3410,10 +3453,10 @@ def manage_trade_book(module_name, mode, signal_rows):
                 signal_entry,
                 ltp,
                 structural_sl,
-                market_time=row.get("Market Time"),
+                market_time=market_time,
             )
 
-            if created:
+            if created and trade is not None:
                 _record_fresh_trade(
                     trade,
                     ltp,
