@@ -1,13 +1,14 @@
-# ALPHA ANALYZER — CLIENT PRO V5 TERMINAL
+# ALPHA ANALYZER — CLIENT PRO V6
 
-UI upgrade inspired by the reference trading dashboard.
+Reference-style visual redesign only.
 
-- Compact live terminal header with IST time
-- Stronger page hero sections
-- Professional navy/black trading-terminal palette
-- Polished trade section headings
-- Consistent cards, tables, buttons and alerts
-- Keeps the existing V4 IST timestamps, trade logging, active-trade
-  management, notifications, PCR, NSE/MCX, sector and RS functionality.
+Presentation updates:
+- darker professional terminal background
+- compact live top bar
+- stronger left-side brand/account area
+- polished hero cards from V5
+- improved section hierarchy
+- upgraded trade/alert card styling
+- cleaner tables, buttons and controls
 
-No trading methodology or API logic was intentionally changed.
+Trading and data logic remains unchanged.

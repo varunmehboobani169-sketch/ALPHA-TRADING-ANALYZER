@@ -36,13 +36,19 @@ if "trade_sequence" not in st.session_state:
     st.session_state.trade_sequence = 0
 
 with st.sidebar:
-    st.title("ALPHA ANALYZER")
-    st.caption("Professional market dashboard")
     st.markdown(
-        "<div style='margin:4px 0 14px 0;opacity:.48;font-size:.72rem;"
-        "letter-spacing:.08em;'>MARKET INTELLIGENCE</div>",
+        """
+        <div class="a-brand">
+            <div class="a-mark">A</div>
+            <div>
+                <div class="a-brand-name">ALPHA ANALYZER</div>
+                <div class="a-brand-sub">Professional Market Dashboard</div>
+            </div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
+    st.markdown('<div class="a-side-head">Account</div>', unsafe_allow_html=True)
     st.session_state.client_id = st.text_input(
         "User Name",
         value=st.session_state.client_id,
@@ -52,6 +58,16 @@ with st.sidebar:
         value=st.session_state.access_token,
         type="password",
     ).strip()
+
+    st.markdown(
+        """
+        <div class="a-account">
+            <div class="a-account-label">Connection</div>
+            <div class="a-account-value">Dhan • Live Session</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     if st.session_state.get("trade_book"):
         report_all = trade_report_dataframe()
@@ -96,228 +112,278 @@ st.markdown(
 
 
 # -----------------------------
-# ALPHA ANALYZER PRO TERMINAL UI
+# ALPHA ANALYZER — REFERENCE DASHBOARD UI
 # -----------------------------
 st.markdown(
     """
     <style>
-    :root {
-        --alpha-bg: #070d18;
-        --alpha-panel: #0d1524;
-        --alpha-panel-2: #111c2e;
-        --alpha-border: rgba(255,255,255,.08);
-        --alpha-text: #f5f7fb;
-        --alpha-muted: rgba(255,255,255,.55);
-        --alpha-green: #29d77a;
-        --alpha-red: #ff5362;
-        --alpha-blue: #2e8cff;
-        --alpha-yellow: #ffd45c;
+    :root{
+        --bg:#070d16;
+        --panel:#0c1522;
+        --line:rgba(255,255,255,.075);
+        --text:#f4f7fb;
+        --muted:#7f8ca0;
+        --green:#22d77c;
+        --red:#ff5364;
+        --yellow:#f3c95c;
+        --blue:#3d8dff;
     }
 
-    .stApp {
+    .stApp{
         background:
-            radial-gradient(circle at 0% 0%, rgba(46,140,255,.12), transparent 24%),
-            radial-gradient(circle at 100% 0%, rgba(41,215,122,.08), transparent 20%),
-            linear-gradient(180deg, #060b14 0%, #07101d 100%);
-        color: var(--alpha-text);
+            radial-gradient(circle at 82% -5%, rgba(40,105,194,.15), transparent 27%),
+            linear-gradient(180deg,#060b14 0%,#07101a 100%);
     }
 
-    .block-container {
-        max-width: 1550px;
-        padding-top: 1.15rem;
-        padding-left: 1.05rem;
-        padding-right: 1.05rem;
-        padding-bottom: 2.2rem;
+    .block-container{
+        max-width:1580px;
+        padding-top:1rem;
+        padding-left:.9rem;
+        padding-right:.9rem;
+        padding-bottom:2rem;
     }
 
-    section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #08101d 0%, #060c16 100%);
-        border-right: 1px solid var(--alpha-border);
+    section[data-testid="stSidebar"]{
+        background:linear-gradient(180deg,#09111c 0%,#060c15 100%);
+        border-right:1px solid var(--line);
     }
 
-    section[data-testid="stSidebar"] .block-container {
-        padding-top: .95rem;
+    section[data-testid="stSidebar"] .block-container{
+        padding:.75rem .70rem 1rem .70rem;
     }
 
-    /* Hide the extra Streamlit top chrome feeling by keeping our header compact */
-    .alpha-terminal-bar {
-        display:flex;
-        align-items:center;
-        justify-content:space-between;
-        gap:16px;
-        padding:10px 14px;
-        margin-bottom:16px;
-        border:1px solid rgba(255,255,255,.07);
-        border-radius:12px;
-        background:linear-gradient(90deg, rgba(255,255,255,.035), rgba(255,255,255,.015));
-        box-shadow:0 10px 26px rgba(0,0,0,.16);
-    }
-
-    .alpha-terminal-left {
-        display:flex;
-        align-items:center;
-        gap:9px;
-        font-weight:800;
-        font-size:.82rem;
-        letter-spacing:.045em;
-    }
-
-    .alpha-pulse {
-        width:8px;
-        height:8px;
-        border-radius:50%;
-        background:#29d77a;
-        box-shadow:0 0 14px rgba(41,215,122,.65);
-    }
-
-    .alpha-terminal-right {
-        color:rgba(255,255,255,.55);
-        font-size:.72rem;
-        letter-spacing:.025em;
-    }
-
-    .alpha-hero {
-        padding:18px 20px;
-        margin-bottom:15px;
-        border-radius:18px;
-        background:
-            linear-gradient(135deg, rgba(46,140,255,.11), rgba(255,255,255,.025)),
-            #0c1422;
-        border:1px solid rgba(255,255,255,.075);
-        box-shadow:0 14px 36px rgba(0,0,0,.18);
-    }
-
-    .alpha-hero-title {
-        font-size:1.55rem;
-        font-weight:850;
-        letter-spacing:-.025em;
-        margin-bottom:3px;
-    }
-
-    .alpha-hero-sub {
-        color:var(--alpha-muted);
-        font-size:.82rem;
-    }
-
-    .alpha-badge {
-        display:inline-block;
-        margin-top:10px;
-        padding:5px 9px;
-        border-radius:999px;
-        font-size:.67rem;
-        font-weight:800;
-        letter-spacing:.06em;
-        background:rgba(41,215,122,.10);
-        color:#7feeb2;
-        border:1px solid rgba(41,215,122,.20);
-    }
-
-    .alpha-card {
-        border:1px solid var(--alpha-border);
-        border-radius:14px;
-        background:linear-gradient(145deg, rgba(255,255,255,.04), rgba(255,255,255,.015));
-        box-shadow:0 10px 26px rgba(0,0,0,.12);
-        padding:14px 15px;
-    }
-
-    .alpha-kicker {
-        color:var(--alpha-muted);
-        font-size:.68rem;
-        letter-spacing:.08em;
-        text-transform:uppercase;
-        margin-bottom:6px;
-    }
-
-    .alpha-value {
-        font-size:1.18rem;
-        font-weight:820;
-    }
-
-    .alpha-positive { color:var(--alpha-green); }
-    .alpha-negative { color:var(--alpha-red); }
-    .alpha-neutral { color:var(--alpha-yellow); }
-
-    div[data-testid="stMetric"] {
-        background:linear-gradient(145deg, rgba(255,255,255,.04), rgba(255,255,255,.015));
-        border:1px solid var(--alpha-border);
-        border-radius:14px;
-        box-shadow:0 10px 24px rgba(0,0,0,.12);
-    }
-
-    div[data-testid="stDataFrame"] {
-        border-radius:14px;
-        overflow:hidden;
-        border:1px solid var(--alpha-border);
-        box-shadow:0 10px 26px rgba(0,0,0,.12);
-    }
-
-    .stButton > button {
-        border-radius:10px;
-        font-weight:750;
-        border:1px solid rgba(255,255,255,.08);
-        background:linear-gradient(135deg, #2e8cff, #4a69d8);
-        box-shadow:0 8px 20px rgba(46,140,255,.18);
-    }
-
-    .stDownloadButton > button {
-        border-radius:10px;
-        font-weight:750;
-    }
-
-    div[data-baseweb="input"] > div,
-    div[data-baseweb="select"] > div {
-        border-radius:10px !important;
-        background:rgba(255,255,255,.025) !important;
-        border-color:rgba(255,255,255,.08) !important;
-    }
-
-    div[data-testid="stAlert"] {
-        border-radius:12px;
-    }
-
-    div[data-testid="stExpander"] {
-        border-radius:12px;
-        border:1px solid var(--alpha-border);
-        background:rgba(255,255,255,.02);
-    }
-
-    hr {
-        border-color:rgba(255,255,255,.065);
-        margin-top:1.1rem;
-        margin-bottom:1.1rem;
-    }
-
-    .alpha-section {
+    .a-brand{
         display:flex;
         align-items:center;
         gap:10px;
-        margin:10px 0 9px 0;
-        font-size:1.24rem;
-        font-weight:820;
-        letter-spacing:-.02em;
+        margin:3px 3px 11px;
     }
 
-    .alpha-section-dot {
-        width:11px;
-        height:11px;
-        border-radius:50%;
-        flex:0 0 auto;
+    .a-mark{
+        width:38px;
+        height:38px;
+        border-radius:10px;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        background:linear-gradient(145deg,#1f7ef0,#7188ff);
+        color:#fff;
+        font-size:18px;
+        font-weight:900;
+        box-shadow:0 8px 22px rgba(31,126,240,.25);
     }
 
-    .alpha-table-note {
-        color:rgba(255,255,255,.48);
+    .a-brand-name{
+        font-size:1.03rem;
+        font-weight:900;
+        letter-spacing:.03em;
+    }
+
+    .a-brand-sub{
+        font-size:.62rem;
+        color:var(--muted);
+        margin-top:2px;
+    }
+
+    .a-side-head{
+        margin:12px 3px 6px;
+        color:var(--muted);
+        font-size:.60rem;
+        font-weight:800;
+        letter-spacing:.10em;
+        text-transform:uppercase;
+    }
+
+    .a-account{
+        border:1px solid var(--line);
+        border-radius:11px;
+        padding:9px 10px;
+        margin-bottom:8px;
+        background:rgba(255,255,255,.018);
+    }
+
+    .a-account-label{
+        color:var(--muted);
+        font-size:.60rem;
+        letter-spacing:.07em;
+        text-transform:uppercase;
+    }
+
+    .a-account-value{
+        font-weight:800;
+        font-size:.84rem;
+        margin-top:2px;
+    }
+
+    .a-topbar{
+        display:flex;
+        justify-content:space-between;
+        align-items:center;
+        padding:8px 12px;
+        margin-bottom:11px;
+        border:1px solid var(--line);
+        border-radius:11px;
+        background:rgba(255,255,255,.016);
+    }
+
+    .a-top-left{
+        display:flex;
+        align-items:center;
+        gap:8px;
         font-size:.73rem;
-        margin-top:4px;
+        font-weight:820;
+        letter-spacing:.04em;
     }
 
-    @media (max-width: 900px) {
-        .block-container {
-            padding-left:.65rem;
-            padding-right:.65rem;
-        }
-        .alpha-terminal-right {
-            display:none;
-        }
+    .a-live-dot{
+        width:7px;
+        height:7px;
+        border-radius:50%;
+        background:var(--green);
+        box-shadow:0 0 12px rgba(34,215,124,.65);
+    }
+
+    .a-top-time{
+        color:var(--muted);
+        font-size:.66rem;
+    }
+
+    .alpha-hero{
+        border:1px solid var(--line);
+        border-radius:17px;
+        padding:16px 18px;
+        margin-bottom:13px;
+        background:
+            linear-gradient(135deg,rgba(42,112,205,.11),rgba(255,255,255,.014)),
+            var(--panel);
+        box-shadow:0 12px 32px rgba(0,0,0,.15);
+    }
+
+    .alpha-hero-title{
+        font-size:1.55rem;
+        font-weight:900;
+        letter-spacing:-.03em;
+        line-height:1.05;
+    }
+
+    .alpha-hero-sub{
+        margin-top:4px;
+        color:var(--muted);
+        font-size:.75rem;
+    }
+
+    .alpha-badge{
+        display:inline-block;
+        margin-top:9px;
+        padding:4px 8px;
+        border-radius:999px;
+        font-size:.60rem;
+        font-weight:850;
+        letter-spacing:.06em;
+        color:#8df1bc;
+        border:1px solid rgba(34,215,124,.17);
+        background:rgba(34,215,124,.07);
+    }
+
+    .alpha-kpi{
+        border:1px solid var(--line);
+        border-radius:12px;
+        padding:11px 12px;
+        background:linear-gradient(145deg,rgba(255,255,255,.032),rgba(255,255,255,.012));
+    }
+
+    .alpha-section{
+        display:flex;
+        align-items:center;
+        gap:8px;
+        margin:15px 0 8px;
+        font-size:1rem;
+        font-weight:880;
+    }
+
+    .alpha-section-dot{
+        width:10px;
+        height:10px;
+        border-radius:50%;
+    }
+
+    .alpha-alert{
+        border:1px solid var(--line);
+        border-radius:10px;
+        padding:8px 9px;
+        margin-bottom:6px;
+        background:rgba(255,255,255,.017);
+    }
+
+    .alpha-alert-time{
+        font-size:.58rem;
+        color:var(--muted);
+    }
+
+    .alpha-alert-symbol{
+        margin-top:2px;
+        font-size:.76rem;
+        font-weight:850;
+    }
+
+    .alpha-alert-meta{
+        margin-top:2px;
+        font-size:.59rem;
+        color:var(--muted);
+    }
+
+    div[data-testid="stDataFrame"]{
+        border:1px solid var(--line);
+        border-radius:13px;
+        overflow:hidden;
+        box-shadow:0 10px 24px rgba(0,0,0,.11);
+    }
+
+    div[data-testid="stMetric"]{
+        border:1px solid var(--line);
+        border-radius:12px;
+        background:rgba(255,255,255,.02);
+    }
+
+    .stButton > button,
+    .stDownloadButton > button{
+        min-height:2.3rem;
+        border-radius:9px;
+        font-weight:800;
+        border:1px solid rgba(255,255,255,.07);
+    }
+
+    .stButton > button{
+        background:linear-gradient(135deg,#2f89ff,#4f67db);
+        box-shadow:0 7px 18px rgba(47,137,255,.14);
+    }
+
+    .stDownloadButton > button{
+        background:#101b2b;
+    }
+
+    div[data-baseweb="input"] > div,
+    div[data-baseweb="select"] > div{
+        border-radius:9px !important;
+        background:rgba(255,255,255,.018) !important;
+        border-color:var(--line) !important;
+    }
+
+    div[data-testid="stAlert"],
+    div[data-testid="stExpander"]{
+        border-radius:11px;
+    }
+
+    div[data-testid="stExpander"]{
+        border:1px solid var(--line);
+        background:rgba(255,255,255,.014);
+    }
+
+    hr{border-color:var(--line);}
+
+    @media(max-width:900px){
+        .a-top-time{display:none;}
+        .alpha-hero-title{font-size:1.35rem;}
     }
     </style>
     """,
@@ -326,20 +392,21 @@ st.markdown(
 
 st.markdown(
     f"""
-    <div class="alpha-terminal-bar">
-        <div class="alpha-terminal-left">
-            <span class="alpha-pulse"></span>
+    <div class="a-topbar">
+        <div class="a-top-left">
+            <span class="a-live-dot"></span>
             <span>ALPHA ANALYZER</span>
-            <span style="opacity:.35;">•</span>
-            <span style="font-weight:650;opacity:.58;">LIVE MARKET DASHBOARD</span>
+            <span style="opacity:.30;">•</span>
+            <span style="color:#7f8ca0;font-weight:650;">LIVE MARKET DASHBOARD</span>
         </div>
-        <div class="alpha-terminal-right">
+        <div class="a-top-time">
             {local_now().strftime("%d-%b-%Y %H:%M:%S IST")}
         </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
+
 
 def headers():
     if not st.session_state.client_id or not st.session_state.access_token:
@@ -3606,7 +3673,7 @@ elif page == "MCX Futures":
             return ["background-color:#f8d7da;color:#8a1c1c;font-weight:700"]*len(row)
         return [""]*len(row)
 
-    st.markdown("## 🟢 BULLISH / LONG")
+    st.markdown('<div class="alpha-section"><span class="alpha-section-dot" style="background:#22d77c;"></span>BULLISH / LONG</div>', unsafe_allow_html=True)
     if long_df.empty:
         st.info("No bullish/long MCX trades currently.")
     else:
@@ -3616,7 +3683,7 @@ elif page == "MCX Futures":
             hide_index=True,
         )
 
-    st.markdown("## 🔴 BEARISH / SHORT")
+    st.markdown('<div class="alpha-section"><span class="alpha-section-dot" style="background:#ff5364;"></span>BEARISH / SHORT</div>', unsafe_allow_html=True)
     if short_df.empty:
         st.info("No bearish/short MCX trades currently.")
     else:
