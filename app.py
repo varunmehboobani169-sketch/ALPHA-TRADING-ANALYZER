@@ -14,6 +14,48 @@ st.set_page_config(page_title="ALPHA ANALYZER V9", page_icon="α", layout="wide"
 API = "https://api.dhan.co/v2"
 LOCAL_TZ = ZoneInfo("Asia/Kolkata")
 
+
+def _trade_entry_window(module_name, mode):
+    """Return allowed NEW-entry and forced-exit windows in IST."""
+    now = local_now().time()
+    if module_name == "NSE":
+        return (
+            datetime.strptime("09:15", "%H:%M").time(),
+            datetime.strptime("15:40", "%H:%M").time(),
+        )
+    if module_name == "MCX":
+        return (
+            datetime.strptime("09:00", "%H:%M").time(),
+            datetime.strptime("23:30", "%H:%M").time(),
+        )
+    return (
+        datetime.strptime("00:00", "%H:%M").time(),
+        datetime.strptime("23:59", "%H:%M").time(),
+    )
+
+
+def _trade_entry_allowed(module_name, mode):
+    """
+    Strict NEW-TRADE gate.
+    NSE Intraday: 09:15 through 15:40.
+    NSE Positional: 09:15 through 15:40 for a fresh signal as well.
+    MCX: its normal live window.
+    """
+    now = local_now().time()
+
+    if module_name == "NSE":
+        start = datetime.strptime("09:15", "%H:%M").time()
+        end = datetime.strptime("15:40", "%H:%M").time()
+        return start <= now <= end
+
+    if module_name == "MCX":
+        start = datetime.strptime("09:00", "%H:%M").time()
+        end = datetime.strptime("23:30", "%H:%M").time()
+        return start <= now <= end
+
+    return True
+
+
 def local_now():
     """Application display time: India Standard Time (IST)."""
     return datetime.now(LOCAL_TZ)
@@ -2206,9 +2248,42 @@ def _load_day_trade_rows(day):
                 df[col] = np.nan
 
         rows = df[_fresh_trade_columns()].to_dict("records")
-        cleaned = _dedupe_trade_rows(rows)
 
-        # Persist cleanup so old duplicate entries disappear permanently.
+        # Remove impossible NSE entries created outside the actual market window.
+        # This fixes historical bogus rows such as 16:40 for NSE Intraday.
+        clean_rows = []
+        for row in rows:
+            module = str(row.get("Module", "")).upper().strip()
+            mode = str(row.get("Mode", "")).upper().strip()
+            if module == "NSE":
+                raw_time = str(row.get("Entry Time", "")).strip()
+                parsed_time = pd.to_datetime(
+                    raw_time,
+                    format="%d-%b-%Y %H:%M:%S IST",
+                    errors="coerce",
+                )
+                if mode == "INTRADAY" and pd.notna(parsed_time):
+                    t = parsed_time.time()
+                    if not (
+                        datetime.strptime("09:15", "%H:%M").time()
+                        <= t
+                        <= datetime.strptime("15:40", "%H:%M").time()
+                    ):
+                        continue
+                # Positional fresh entries are also only created in the live window.
+                if mode == "POSITIONAL" and pd.notna(parsed_time):
+                    t = parsed_time.time()
+                    if not (
+                        datetime.strptime("09:15", "%H:%M").time()
+                        <= t
+                        <= datetime.strptime("15:40", "%H:%M").time()
+                    ):
+                        continue
+            clean_rows.append(row)
+
+        cleaned = _dedupe_trade_rows(clean_rows)
+
+        # Persist cleanup so old duplicate/invalid entries disappear permanently.
         pd.DataFrame(
             cleaned,
             columns=_fresh_trade_columns(),
@@ -2475,7 +2550,8 @@ def _restore_active_trades_from_ledger():
         )
 
         # Intraday trades should not leak into the next trading day.
-        # Positional trades may remain overnight.
+        # Positional trades may remain overnight, but only valid live-market
+        # entry timestamps are eligible to be restored.
         if (
             mode == "Intraday"
             and (
@@ -2521,7 +2597,7 @@ def render_fresh_trades_module():
 
     st.markdown(
         '<div class="alpha-hero"><div class="alpha-hero-title">FRESH TRADES</div>'
-        '<div class="alpha-hero-sub">New trades detected today • immutable actual entry time and market price</div>'
+        '<div class="alpha-hero-sub">New trades detected today • exact signal-detection time and actual entry price</div>'
         '<span class="alpha-badge">AUTO LOGGED</span></div>',
         unsafe_allow_html=True,
     )
@@ -2553,8 +2629,7 @@ def render_fresh_trades_module():
 
     display = df[[
         "Entry Time", "Symbol", "Direction",
-        "Trade Price", "Signal Entry", "Initial SL",
-        "SL", "Status", "Exit",
+        "Entry", "Initial SL", "SL", "Exit", "Status",
     ]].copy()
 
     st.dataframe(
@@ -2562,10 +2637,7 @@ def render_fresh_trades_module():
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Trade Price": st.column_config.NumberColumn(
-                "Entry Price", format="%.2f"
-            ),
-            "Signal Entry": st.column_config.NumberColumn(
+            "Entry": st.column_config.NumberColumn(
                 "Entry", format="%.2f"
             ),
             "Initial SL": st.column_config.NumberColumn(
@@ -2573,6 +2645,9 @@ def render_fresh_trades_module():
             ),
             "SL": st.column_config.NumberColumn(
                 "Dynamic SL", format="%.2f"
+            ),
+            "Exit": st.column_config.NumberColumn(
+                "Exit", format="%.2f"
             ),
         },
     )
@@ -2845,7 +2920,7 @@ def _can_create_fresh_trade(module_name, mode):
         return (
             datetime.strptime("09:15", "%H:%M").time()
             <= now_t
-            <= datetime.strptime("15:20", "%H:%M").time()
+            <= datetime.strptime("15:40", "%H:%M").time()
         )
 
     if module_name == "MCX":
