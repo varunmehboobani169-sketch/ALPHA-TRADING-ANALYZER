@@ -150,3 +150,11 @@ Latest Matrix modifications included:
 - Clean client-facing Matrix display
 
 The ALPHA AI STRATEGIST / machine-learning module is intentionally NOT included.
+
+
+## Final Error Fixes
+- Fixed Matrix KeyError caused by obsolete hidden 0.25% helper columns.
+- Matrix highlighting remains strictly +16 perfect bullish / -16 perfect bearish.
+- Preserved Matrix row/column separators.
+- Hardened ALPHA PRO SELLER P&F event calculation so the box-size constant is globally available and locally guarded.
+- Machine-learning module is NOT included.

@@ -7,6 +7,14 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+
+# ALPHA PRO SELLER strategy constants (global so live page execution is safe)
+ALPHA_PRO_BOX_PCT = 0.02
+ALPHA_PRO_ENTRY_REVERSAL = 3
+ALPHA_PRO_EXIT_REVERSAL = 4
+ALPHA_PRO_MAX_TRADES_PER_DAY = 2
+ALPHA_PRO_FORCE_EXIT = datetime.strptime("15:05", "%H:%M").time()
+
 from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="ALPHA ANALYZER V9", page_icon="α", layout="wide")
@@ -4558,11 +4566,6 @@ if not st.session_state.get("_trade_book_restored"):
 # -----------------------------
 # ALPHA PRO SELLER — dedicated intraday theta engine
 # -----------------------------
-ALPHA_PRO_BOX_PCT = 0.02
-ALPHA_PRO_ENTRY_REVERSAL = 3
-ALPHA_PRO_EXIT_REVERSAL = 4
-ALPHA_PRO_MAX_TRADES_PER_DAY = 2
-ALPHA_PRO_FORCE_EXIT = datetime.strptime("15:05", "%H:%M").time()
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -4700,7 +4703,10 @@ def alpha_pro_events(prices):
     prices = [float(p) for p in prices if pd.notna(p) and float(p) > 0]
     if len(prices) < 2:
         return []
-    lb = math.log1p(ALPHA_PRO_BOX_PCT)
+    box_pct = float(globals().get("ALPHA_PRO_BOX_PCT", 0.02))
+    entry_reversal = int(globals().get("ALPHA_PRO_ENTRY_REVERSAL", 3))
+    exit_reversal = int(globals().get("ALPHA_PRO_EXIT_REVERSAL", 4))
+    lb = math.log1p(box_pct)
     base = math.floor(math.log(prices[0]) / lb)
     direction = None
     high = low = base
@@ -4716,7 +4722,7 @@ def alpha_pro_events(prices):
         if direction == "X":
             if level > high:
                 high = level
-            if level <= high - ALPHA_PRO_ENTRY_REVERSAL:
+            if level <= high - entry_reversal:
                 prior_high = high
                 direction, low = "O", level
                 events.append({
@@ -4728,7 +4734,7 @@ def alpha_pro_events(prices):
         else:
             if level < low:
                 low = level
-            if level >= low + ALPHA_PRO_EXIT_REVERSAL:
+            if level >= low + exit_reversal:
                 direction, high = "X", level
                 events.append({
                     "i": i,
@@ -6093,12 +6099,10 @@ elif page == "RS Matrix":
 
 
                 shown = display[core_cols].copy()
-                style_base = display[core_cols].copy()
-                # add hidden helper columns only for style application
-                style_base["_0.25 Signal"] = display["_0.25 Signal"].values
-                style_base["_0.25 Perfect"] = display["_0.25 Perfect"].values
 
-                styled = style_base.style.apply(highlight_matrix_row, axis=1)
+                # Style directly from the visible Matrix data.
+                # No obsolete hidden 0.25% helper columns are referenced.
+                styled = shown.style.apply(highlight_matrix_row, axis=1)
 
                 # Add clear horizontal + vertical separators so each stock row
                 # and each score column is visually distinct.
