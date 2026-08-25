@@ -113,6 +113,7 @@ with st.sidebar:
             "Fresh Trades",
             "Trade Logs",
             "Option Seller",
+            "ALPHA PRO SELLER",
             "Momentum",
             "Positional",
             "MCX Futures",
@@ -3860,6 +3861,150 @@ def run_sector_analysis_manual(fut):
     return summary, stock_df
 
 
+
+def matrix_pf_score(close_series, box_pct):
+    """
+    Source-inspired P&F Performance + Ranking scoring.
+
+    Performance:
+      DTB/new X breakout = +2
+      DTB retracement/X-column continuation state = +1
+      DBS/new O breakdown = -2
+      DBS retracement/O-column continuation state = -1
+      otherwise = 0
+
+    Ranking:
+      current active X-column box count = positive magnitude
+      current active O-column box count = negative magnitude
+    """
+    s=pd.to_numeric(close_series, errors="coerce").dropna()
+    cols=build_pnf(s, box_pct, 3)
+    if len(cols)<3:
+        return {"performance":0, "ranking":0, "pattern":"NEUTRAL", "column":"—"}
+
+    c1,c2,c3=cols[-3:]
+
+    performance=0
+    pattern="NEUTRAL"
+
+    if c1["type"]=="X" and c2["type"]=="O" and c3["type"]=="X":
+        if c3["high"]>c1["high"]:
+            performance=2
+            pattern="DTB BUY"
+        else:
+            performance=1
+            pattern="DTB RETRACEMENT"
+    elif c1["type"]=="O" and c2["type"]=="X" and c3["type"]=="O":
+        if c3["low"]<c1["low"]:
+            performance=-2
+            pattern="DBS SELL"
+        else:
+            performance=-1
+            pattern="DBS RETRACEMENT"
+
+    current_type=c3["type"]
+    box_count=int(c3.get("boxes",0))
+    ranking=box_count if current_type=="X" else -box_count
+
+    return {
+        "performance":performance,
+        "ranking":ranking,
+        "pattern":pattern,
+        "column":current_type,
+        "boxes":box_count,
+    }
+
+
+def run_pf_fusion_matrix_manual(fut):
+    """
+    Fusion Matrix based on the uploaded source's scoring concept:
+    Price P&F + Relative Strength P&F across 3%, 2%, 1%, 0.25%.
+    """
+    nifty_id=resolve_nse_index_security_id(master,"NIFTY")
+    if nifty_id is None:
+        return pd.DataFrame()
+
+    nifty=manual_index_daily(nifty_id)
+    if nifty.empty or "close" not in nifty.columns:
+        return pd.DataFrame()
+
+    nifty=nifty[["datetime","close"]].copy()
+    nifty["date"]=pd.to_datetime(nifty["datetime"],errors="coerce").dt.date
+    nifty["close"]=pd.to_numeric(nifty["close"],errors="coerce")
+    nifty=nifty.dropna(subset=["date","close"]).groupby("date")["close"].last()
+
+    rows=[]
+    progress=st.progress(0,text="Building P&F Fusion Matrix...")
+    total=len(fut)
+
+    boxes=[("3%",0.03),("2%",0.02),("1%",0.01),("0.25%",0.0025)]
+
+    for i,(_,r) in enumerate(fut.iterrows(),1):
+        symbol=str(r["underlying_symbol"])
+        try:
+            h=manual_daily_close(int(r["underlying_security_id"]))
+        except Exception:
+            h=pd.DataFrame()
+
+        if h is None or h.empty or "close" not in h.columns:
+            progress.progress(i/max(total,1),text=f"Matrix: {symbol}")
+            continue
+
+        stock=h[["datetime","close"]].copy()
+        stock["date"]=pd.to_datetime(stock["datetime"],errors="coerce").dt.date
+        stock["close"]=pd.to_numeric(stock["close"],errors="coerce")
+        stock=stock.dropna(subset=["date","close"]).groupby("date")["close"].last()
+
+        common=stock.index.intersection(nifty.index)
+        if len(common)<3:
+            progress.progress(i/max(total,1),text=f"Matrix: {symbol}")
+            continue
+
+        price_rows={"Stock":symbol}
+        price_perf_total=0
+        price_rank_total=0
+        rs_perf_total=0
+        rs_rank_total=0
+
+        ratio=(stock.loc[common].astype(float)/nifty.loc[common].astype(float)).dropna()
+
+        for label,box in boxes:
+            p=matrix_pf_score(stock.loc[common],box)
+            rs=matrix_pf_score(ratio,box)
+
+            price_rows[f"P Perf {label}"]=p["performance"]
+            price_rows[f"P Rank {label}"]=p["ranking"]
+            price_rows[f"RS Perf {label}"]=rs["performance"]
+            price_rows[f"RS Rank {label}"]=rs["ranking"]
+
+            price_perf_total += p["performance"]
+            price_rank_total += p["ranking"]
+            rs_perf_total += rs["performance"]
+            rs_rank_total += rs["ranking"]
+
+        price_rows["Price Performance"]=price_perf_total
+        price_rows["Price Ranking"]=price_rank_total
+        price_rows["RS Performance"]=rs_perf_total
+        price_rows["RS Ranking"]=rs_rank_total
+        price_rows["Total Performance"]=price_perf_total+rs_perf_total
+        price_rows["Total Ranking"]=price_rank_total+rs_rank_total
+        price_rows["Net Performance"]=rs_perf_total-price_perf_total
+        price_rows["Net Ranking"]=rs_rank_total-price_rank_total
+
+        # Useful quick state fields; core detail stays available for ranking.
+        price_rows["Price State"]="BULLISH" if price_perf_total>0 else "BEARISH" if price_perf_total<0 else "NEUTRAL"
+        price_rows["RS State"]="BULLISH" if rs_perf_total>0 else "BEARISH" if rs_perf_total<0 else "NEUTRAL"
+
+        rows.append(price_rows)
+        progress.progress(i/max(total,1),text=f"Matrix: {symbol}")
+
+    progress.empty()
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
+
 def run_rs_matrix_manual(fut):
     """
     Relative Strength Matrix versus NIFTY 50.
@@ -4406,6 +4551,326 @@ if auto:
 
 if not st.session_state.get("_trade_book_restored"):
     _restore_active_trades_from_ledger()
+
+
+
+# -----------------------------
+# ALPHA PRO SELLER — dedicated intraday theta engine
+# -----------------------------
+ALPHA_PRO_BOX_PCT = 0.02
+ALPHA_PRO_ENTRY_REVERSAL = 3
+ALPHA_PRO_EXIT_REVERSAL = 4
+ALPHA_PRO_MAX_TRADES_PER_DAY = 2
+ALPHA_PRO_FORCE_EXIT = datetime.strptime("15:05", "%H:%M").time()
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def alpha_pro_option_minute_history(security_id):
+    today = local_now().date()
+    now = local_now()
+    payload = {
+        "securityId": str(int(security_id)),
+        "exchangeSegment": "NSE_FNO",
+        "instrument": "OPTIDX",
+        "interval": "1",
+        "oi": False,
+        "fromDate": f"{today} 09:15:00",
+        "toDate": now.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    body = api_post("/charts/intraday", payload, "Alpha Pro option 1m")
+    data = parse_data(body)
+    if not isinstance(data, dict) or "close" not in data:
+        return pd.DataFrame()
+    n = len(data.get("close", []))
+    if n == 0:
+        return pd.DataFrame()
+    out = pd.DataFrame({
+        "close": pd.to_numeric(pd.Series(data.get("close", [])), errors="coerce"),
+        "timestamp": pd.to_numeric(pd.Series(data.get("timestamp", [np.nan] * n)), errors="coerce"),
+    })
+    unit = "ms" if out["timestamp"].dropna().median() > 10**12 else "s"
+    out["datetime"] = pd.to_datetime(
+        out["timestamp"], unit=unit, utc=True, errors="coerce"
+    ).dt.tz_convert(LOCAL_TZ)
+    out = out.dropna(subset=["close", "datetime"]).sort_values("datetime")
+    out = out.drop_duplicates("datetime").reset_index(drop=True)
+    return out[out["datetime"] < local_now().replace(second=0, microsecond=0)].copy()
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def alpha_pro_index_minute_history(security_id):
+    today = local_now().date()
+    now = local_now()
+    payload = {
+        "securityId": str(int(security_id)),
+        "exchangeSegment": "IDX_I",
+        "instrument": "INDEX",
+        "interval": "1",
+        "oi": False,
+        "fromDate": f"{today} 09:15:00",
+        "toDate": now.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    body = api_post("/charts/intraday", payload, "Alpha Pro index 1m")
+    data = parse_data(body)
+    if not isinstance(data, dict) or "close" not in data:
+        return pd.DataFrame()
+    n = len(data.get("close", []))
+    if n == 0:
+        return pd.DataFrame()
+    out = pd.DataFrame({
+        "close": pd.to_numeric(pd.Series(data.get("close", [])), errors="coerce"),
+        "timestamp": pd.to_numeric(pd.Series(data.get("timestamp", [np.nan] * n)), errors="coerce"),
+    })
+    unit = "ms" if out["timestamp"].dropna().median() > 10**12 else "s"
+    out["datetime"] = pd.to_datetime(
+        out["timestamp"], unit=unit, utc=True, errors="coerce"
+    ).dt.tz_convert(LOCAL_TZ)
+    return out.dropna(subset=["close", "datetime"]).sort_values("datetime").drop_duplicates("datetime").reset_index(drop=True)
+
+
+def alpha_pro_get_916_spot(index_sid):
+    h = alpha_pro_index_minute_history(index_sid)
+    if h.empty:
+        return np.nan
+    target = h[h["datetime"].dt.time >= datetime.strptime("09:16", "%H:%M").time()]
+    if target.empty:
+        return np.nan
+    return float(target.iloc[0]["close"])
+
+
+def alpha_pro_find_contracts(chain, atm):
+    if chain is None or chain.empty or pd.isna(atm):
+        return {}
+    x = chain.copy()
+    x["Strike"] = pd.to_numeric(x["Strike"], errors="coerce")
+    x["Security ID"] = pd.to_numeric(x["Security ID"], errors="coerce")
+    x = x.dropna(subset=["Strike", "Security ID"])
+    x = x[np.isclose(x["Strike"].astype(float), float(atm))]
+    out = {}
+    for side, key in [("CE", "ce_sid"), ("PE", "pe_sid")]:
+        r = x[x["Side"] == side]
+        if not r.empty:
+            out[key] = int(r.iloc[0]["Security ID"])
+            out[f"{key}_strike"] = float(r.iloc[0]["Strike"])
+    return out
+
+
+def alpha_pro_lock_atm(index_sid, expiry):
+    spot = alpha_pro_get_916_spot(index_sid)
+    if pd.isna(spot):
+        return None
+    raw = option_chain_request_v2(index_sid, expiry)
+    chain = parse_option_chain_v2(raw)
+    strikes = sorted(pd.to_numeric(chain["Strike"], errors="coerce").dropna().unique())
+    if not strikes:
+        return None
+    atm = min(strikes, key=lambda x: abs(float(x) - float(spot)))
+    contracts = alpha_pro_find_contracts(chain, atm)
+    if "ce_sid" not in contracts or "pe_sid" not in contracts:
+        return None
+    return {
+        "date": local_now().date().isoformat(),
+        "spot_916": float(spot),
+        "atm": float(atm),
+        "expiry": expiry.isoformat(),
+        **contracts,
+        "locked_at": local_now().strftime("%d-%b-%Y %H:%M:%S IST"),
+    }
+
+
+def alpha_pro_straddle_series(lock):
+    ce = alpha_pro_option_minute_history(lock["ce_sid"])
+    pe = alpha_pro_option_minute_history(lock["pe_sid"])
+    if ce.empty or pe.empty:
+        return pd.DataFrame()
+    ce = ce.rename(columns={"close": "ce_close"})[["datetime", "ce_close"]]
+    pe = pe.rename(columns={"close": "pe_close"})[["datetime", "pe_close"]]
+    x = pd.merge(ce, pe, on="datetime", how="inner")
+    if x.empty:
+        return x
+    x["straddle_close"] = (
+        pd.to_numeric(x["ce_close"], errors="coerce")
+        + pd.to_numeric(x["pe_close"], errors="coerce")
+    )
+    return x.dropna(subset=["straddle_close"]).sort_values("datetime").reset_index(drop=True)
+
+
+def alpha_pro_events(prices):
+    prices = [float(p) for p in prices if pd.notna(p) and float(p) > 0]
+    if len(prices) < 2:
+        return []
+    lb = math.log1p(ALPHA_PRO_BOX_PCT)
+    base = math.floor(math.log(prices[0]) / lb)
+    direction = None
+    high = low = base
+    events = []
+    for i, price in enumerate(prices[1:], 1):
+        level = math.floor(math.log(price) / lb)
+        if direction is None:
+            if level >= high + 1:
+                direction, high = "X", level
+            elif level <= low - 1:
+                direction, low = "O", level
+            continue
+        if direction == "X":
+            if level > high:
+                high = level
+            if level <= high - ALPHA_PRO_ENTRY_REVERSAL:
+                prior_high = high
+                direction, low = "O", level
+                events.append({
+                    "i": i,
+                    "event": "ENTRY",
+                    "price": price,
+                    "sl": math.exp(prior_high * lb),
+                })
+        else:
+            if level < low:
+                low = level
+            if level >= low + ALPHA_PRO_EXIT_REVERSAL:
+                direction, high = "X", level
+                events.append({
+                    "i": i,
+                    "event": "EXIT",
+                    "price": price,
+                    "sl": np.nan,
+                })
+    return events
+
+
+def render_alpha_pro_seller():
+    st.markdown(
+        """
+        <div class="alpha-hero">
+            <div class="alpha-hero-title">ALPHA PRO SELLER</div>
+            <div class="alpha-hero-sub">Mechanical theta-decay straddle engine</div>
+            <span class="alpha-badge">PRO</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if local_now().time() < datetime.strptime("09:16", "%H:%M").time():
+        st.info("Waiting for 09:16 AM to freeze today's ATM.")
+        return
+
+    index_sid = resolve_index_instrument(master, "NIFTY")
+    expiries = option_expiry_list_v2(index_sid)
+    expiry = select_option_expiry_v2(expiries, "Intraday")
+
+    if (
+        "alpha_pro_lock" not in st.session_state
+        or st.session_state.alpha_pro_lock.get("date") != local_now().date().isoformat()
+    ):
+        try:
+            st.session_state.alpha_pro_lock = alpha_pro_lock_atm(index_sid, expiry)
+        except Exception:
+            st.session_state.alpha_pro_lock = None
+
+    lock = st.session_state.get("alpha_pro_lock")
+    if not lock:
+        st.error("Unable to lock the 09:16 ATM contracts.")
+        return
+
+    if "alpha_pro_state" not in st.session_state:
+        st.session_state.alpha_pro_state = {
+            "date": local_now().date().isoformat(),
+            "trades_today": 0,
+            "active": None,
+            "last_candle": None,
+        }
+
+    state = st.session_state.alpha_pro_state
+    if state.get("date") != local_now().date().isoformat():
+        state = {
+            "date": local_now().date().isoformat(),
+            "trades_today": 0,
+            "active": None,
+            "last_candle": None,
+        }
+
+    series = alpha_pro_straddle_series(lock)
+    last_ltp = (
+        float(series.iloc[-1]["straddle_close"])
+        if not series.empty else np.nan
+    )
+
+    if not series.empty:
+        events = alpha_pro_events(series["straddle_close"].tolist())
+        processed = state.get("last_candle")
+
+        for event in events:
+            event_time = series.iloc[event["i"]]["datetime"]
+            event_key = str(event_time)
+            if processed and event_key <= processed:
+                continue
+
+            if event["event"] == "ENTRY":
+                if (
+                    state["active"] is None
+                    and state["trades_today"] < ALPHA_PRO_MAX_TRADES_PER_DAY
+                    and event_time.time() < ALPHA_PRO_FORCE_EXIT
+                ):
+                    state["trades_today"] += 1
+                    state["active"] = {
+                        "trade_no": state["trades_today"],
+                        "entry": float(event["price"]),
+                        "sl": float(event["sl"]),
+                        "entry_time": event_time.strftime("%d-%b-%Y %H:%M:%S IST"),
+                    }
+
+            elif event["event"] == "EXIT" and state["active"] is not None:
+                tr = state["active"]
+                # Structural SL takes precedence if the exit close is already above it.
+                state["active"] = None
+
+            if state["active"] is not None and event["event"] == "ENTRY":
+                # Stop can only be evaluated from subsequent completed candles.
+                pass
+
+            state["last_candle"] = event_key
+
+        # Check structural SL on the latest completed candle.
+        if state["active"] is not None and pd.notna(last_ltp):
+            if float(last_ltp) >= float(state["active"]["sl"]):
+                state["active"] = None
+
+        # Hard 15:05 exit.
+        if (
+            state["active"] is not None
+            and local_now().time() >= ALPHA_PRO_FORCE_EXIT
+        ):
+            state["active"] = None
+
+    st.session_state.alpha_pro_state = state
+
+    a, b, c, d = st.columns(4)
+    a.metric("Fixed ATM", int(lock["atm"]))
+    b.metric("Straddle", f"{last_ltp:.2f}" if pd.notna(last_ltp) else "—")
+    c.metric("Trades", f"{state['trades_today']}/2")
+    d.metric("Status", "ACTIVE" if state["active"] else "WAIT")
+
+    if state["active"]:
+        tr = state["active"]
+        st.success(
+            f"🟢 SELL NIFTY {int(lock['atm'])} CE + {int(lock['atm'])} PE"
+        )
+        x1, x2, x3, x4 = st.columns(4)
+        x1.metric("Entry Premium", f"{tr['entry']:.2f}")
+        x2.metric("Structural SL", f"{tr['sl']:.2f}")
+        pnl = tr["entry"] - last_ltp if pd.notna(last_ltp) else np.nan
+        x3.metric("Current P&L", f"{pnl:.2f}" if pd.notna(pnl) else "—")
+        x4.metric("Trade", f"#{tr['trade_no']}")
+        st.caption(f"Entry: {tr['entry_time']} • Mandatory exit: 15:05 IST")
+    else:
+        if local_now().time() >= ALPHA_PRO_FORCE_EXIT:
+            st.info("WAIT — trading session closed at 15:05.")
+        elif state["trades_today"] >= ALPHA_PRO_MAX_TRADES_PER_DAY:
+            st.info("WAIT — maximum 2 trades reached today.")
+        else:
+            st.info("WAIT — no fresh Alpha Pro Seller entry is active.")
+
+
 
 if page == "Fresh Trades":
     render_fresh_trades_module()
@@ -5235,6 +5700,9 @@ elif page == "MCX Futures":
         )
 
 
+elif page == "ALPHA PRO SELLER":
+    render_alpha_pro_seller()
+
 elif page == "Option Seller":
     st.markdown(
         """
@@ -5505,44 +5973,87 @@ elif page == "RS Matrix":
     st.markdown(
         """
         <div class="alpha-hero">
-            <div class="alpha-hero-title">RS MATRIX</div>
-            <div class="alpha-hero-sub">Relative market strength monitor</div>
+            <div class="alpha-hero-title">P&F FUSION MATRIX</div>
+            <div class="alpha-hero-sub">Price + Relative Strength ranking</div>
+            <span class="alpha-badge">MATRIX</span>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    
+
     st.caption(
-        "Relative strength market view • Manual refresh only"
+        "Performance + Ranking scores • Relative Strength vs NIFTY 50"
     )
 
-    fut = future_universe(master, "NSE")
+    fut=future_universe(master,"NSE")
 
     if fut.empty:
         st.error("No NSE F&O universe available.")
     else:
-        if st.button(
-            "🔄 Calculate / Refresh RS Matrix",
-            key="rs_manual_refresh",
-        ):
-            st.cache_data.clear()
-            st.session_state.rs_matrix_result = run_rs_matrix_manual(fut)
+        c1,c2,c3=st.columns(3)
 
-        result = st.session_state.get(
-            "rs_matrix_result",
+        with c1:
+            if st.button(
+                "🔄 Calculate / Refresh Matrix",
+                key="fusion_matrix_refresh",
+            ):
+                st.cache_data.clear()
+                st.session_state.pf_fusion_matrix_result=run_pf_fusion_matrix_manual(fut)
+
+        current=st.session_state.get(
+            "pf_fusion_matrix_result",
             pd.DataFrame(),
         )
 
-        if result.empty:
-            st.info("Press the button above to calculate relative strength.")
-        else:
-            display_result = result.drop(
-                columns=["_score"],
-                errors="ignore",
+        with c2:
+            sort_col=None
+            if not current.empty:
+                numeric_cols=[
+                    c for c in current.columns
+                    if c!="Stock" and pd.api.types.is_numeric_dtype(current[c])
+                ]
+                sort_options=numeric_cols
+                if sort_options:
+                    sort_col=st.selectbox(
+                        "Rank by",
+                        sort_options,
+                        index=sort_options.index("Total Performance")
+                        if "Total Performance" in sort_options else 0,
+                        key="fusion_matrix_sort_col",
+                    )
+
+        with c3:
+            order=st.selectbox(
+                "Order",
+                ["High → Low","Low → High"],
+                key="fusion_matrix_order",
             )
 
+        if current.empty:
+            st.info("Press 'Calculate / Refresh Matrix' to build the Fusion Matrix.")
+        else:
+            display=current.copy()
+
+            # Main client-facing ranking table.
+            core_cols=[
+                "Stock",
+                "Price Performance","Price Ranking",
+                "RS Performance","RS Ranking",
+                "Total Performance","Total Ranking",
+                "Net Performance","Net Ranking",
+                "Price State","RS State",
+            ]
+            core_cols=[c for c in core_cols if c in display.columns]
+
+            if sort_col and sort_col in display.columns:
+                display=display.sort_values(
+                    sort_col,
+                    ascending=(order=="Low → High"),
+                    kind="stable",
+                ).reset_index(drop=True)
+
             st.dataframe(
-                display_result,
+                display[core_cols],
                 use_container_width=True,
                 hide_index=True,
             )

@@ -85,3 +85,36 @@ create a replacement trade. Duplicate prevention remains one symbol per day.
 
 ## Option Seller UI
 Detailed IV/OI/chain/diagnostic calculations are backend-only. The client sees only the decision, ATM, premium, mode, active status, entry/current premium, P&L and concise risk status.
+
+
+## ALPHA PRO SELLER
+Separate NIFTY intraday theta-decay strategy module.
+
+Rules:
+- Freeze NIFTY ATM using the 09:16 index price for the whole day.
+- Freeze the exact ATM CE + PE contracts.
+- Build the synthetic straddle from 1-minute option closes.
+- 2% P&F box size, 3-box reversal.
+- Fresh X-to-O reversal = SELL ATM straddle.
+- Structural SL = preceding X-column high.
+- Maximum 2 trades per day.
+- 4-box X reversal or structural SL = exit.
+- 15:05 IST = mandatory hard exit.
+
+The existing general Option Seller module remains separate.
+
+
+## P&F Fusion Matrix
+The existing Matrix has been upgraded using the source-inspired scoring concept:
+- Performance score: DTB +2, DTB retracement +1, DBS -2, DBS retracement -1, otherwise 0.
+- Ranking score: current active P&F column box magnitude; X positive, O negative.
+- Separate Price and Relative Strength scores.
+- Total Performance/Ranking = Price + RS.
+- Net Performance/Ranking = RS - Price.
+- User can rank any numeric column High → Low or Low → High.
+- Detailed per-box scores are available in an expander.
+
+
+## Display Cleanup
+Core P&F calculations remain in the backend, but the client-facing Matrix no
+longer displays "P&F" terminology or the detailed per-box score expander.
