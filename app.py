@@ -3996,19 +3996,6 @@ def run_pf_fusion_matrix_manual(fut, boxes=None):
         price_rows["Price State"]="BULLISH" if price_perf_total>0 else "BEARISH" if price_perf_total<0 else "NEUTRAL"
         price_rows["RS State"]="BULLISH" if rs_perf_total>0 else "BEARISH" if rs_perf_total<0 else "NEUTRAL"
 
-        # Current 0.25% price-chart signal is used only for row highlighting.
-        zero25 = next((box_label for box_label, box_value in boxes if abs(box_value-0.0025) < 1e-9), None)
-        if zero25 is not None:
-            latest_zero25 = matrix_pf_score(stock.loc[common], 0.0025)
-            price_rows["_0.25 Signal"] = latest_zero25["pattern"]
-            price_rows["_0.25 Perfect"] = (
-                latest_zero25["performance"] == 2
-                or latest_zero25["performance"] == -2
-            )
-        else:
-            price_rows["_0.25 Signal"] = "N/A"
-            price_rows["_0.25 Perfect"] = False
-
         rows.append(price_rows)
         progress.progress(i/max(total,1),text=f"Matrix: {symbol}")
 
@@ -6083,15 +6070,27 @@ elif page == "RS Matrix":
 
                 # Green: current 0.25% Price P&F has a fresh perfect DTB score (+2).
                 # Red: current 0.25% Price P&F has a fresh perfect DBS score (-2).
+                # Highlight only a perfect TOTAL Performance score:
+                # +16 = 4 box sizes x +2 (perfect bullish)
+                # -16 = 4 box sizes x -2 (perfect bearish)
                 def highlight_matrix_row(row):
-                    signal = str(row.get("_0.25 Signal", ""))
-                    perfect = bool(row.get("_0.25 Perfect", False))
+                    try:
+                        total_perf = float(row.get("Total Performance", np.nan))
+                    except Exception:
+                        total_perf = np.nan
 
-                    if perfect and signal == "DTB BUY":
-                        return ["background-color: #d9f2d9; color: #0b5d1e; font-weight: 700"] * len(row)
-                    if perfect and signal == "DBS SELL":
-                        return ["background-color: #f8d7da; color: #8a1c1c; font-weight: 700"] * len(row)
+                    if total_perf == 16:
+                        return [
+                            "background-color: #d9f2d9; color: #0b5d1e; font-weight: 700"
+                        ] * len(row)
+
+                    if total_perf == -16:
+                        return [
+                            "background-color: #f8d7da; color: #8a1c1c; font-weight: 700"
+                        ] * len(row)
+
                     return [""] * len(row)
+
 
                 shown = display[core_cols].copy()
                 style_base = display[core_cols].copy()
@@ -6100,7 +6099,32 @@ elif page == "RS Matrix":
                 style_base["_0.25 Perfect"] = display["_0.25 Perfect"].values
 
                 styled = style_base.style.apply(highlight_matrix_row, axis=1)
-                styled = styled.hide(subset=["_0.25 Signal", "_0.25 Perfect"], axis="columns")
+
+                # Add clear horizontal + vertical separators so each stock row
+                # and each score column is visually distinct.
+                styled = (
+                    styled
+                    .set_properties(**{
+                        "border-bottom": "1px solid #475569",
+                        "border-right": "1px solid #334155",
+                    })
+                    .set_table_styles([
+                        {
+                            "selector": "th",
+                            "props": [
+                                ("border-right", "1px solid #475569"),
+                                ("border-bottom", "2px solid #64748b"),
+                            ],
+                        },
+                        {
+                            "selector": "tbody tr:last-child td",
+                            "props": [
+                                ("border-bottom", "2px solid #64748b"),
+                            ],
+                        },
+                    ])
+                    .hide(subset=["_0.25 Signal", "_0.25 Perfect"], axis="columns")
+                )
 
                 st.dataframe(
                     styled,
@@ -6109,8 +6133,8 @@ elif page == "RS Matrix":
                 )
 
                 st.caption(
-                    "🟢 Green = latest 0.25% DTB with perfect +2 score • "
-                    "🔴 Red = latest 0.25% DBS with perfect -2 score"
+                    "🟢 Green = perfect +16 Total Performance • "
+                    "🔴 Red = perfect -16 Total Performance"
                 )
 
 

@@ -126,3 +126,17 @@ longer displays "P&F" terminology or the detailed per-box score expander.
 - The latest 0.25% price-chart DTB with a perfect +2 score is highlighted green.
 - The latest 0.25% price-chart DBS with a perfect -2 score is highlighted red.
 - Core calculations remain backend-driven.
+
+
+## Perfect Score Highlight
+Rows are highlighted ONLY when `Total Performance` is exactly:
+- +16 = perfect bullish score across all four configured box sizes
+- -16 = perfect bearish score across all four configured box sizes
+
+The previous 0.25%-only highlight rule has been removed.
+
+
+## Matrix Display Cleanup
+Added clear horizontal separators between stock rows and vertical separators
+between columns, including a stronger header divider. Perfect +16 / -16
+highlighting remains unchanged.
