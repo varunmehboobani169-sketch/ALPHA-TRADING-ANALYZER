@@ -75,3 +75,9 @@ Entry Time remains available in Fresh Trades and Trade Logs.
 Removed the stale `Entry Date/Time` column reference from the NSE Positional
 LONG/SHORT display. The Positional table is now exactly:
 Script, LTP, Bias, Entry, SL, Recommendation.
+
+
+## Momentum Sticky Trade State
+A logged Momentum trade stays visible in the active LONG/SHORT table until an
+actual exit is recorded. A temporary loss of the live signal does not hide or
+create a replacement trade. Duplicate prevention remains one symbol per day.

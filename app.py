@@ -3245,6 +3245,79 @@ def _trade_already_logged_today(module_name, mode, symbol):
 
 
 
+
+def _sticky_active_rows_for_display(module_name, mode, res):
+    """
+    Return active logged trades that should remain visible even when the
+    current signal scanner has become neutral.
+
+    A logged trade is sticky until the trade manager records an exit.
+    """
+    today = local_now().strftime("%d-%b-%Y")
+    existing = set()
+
+    if res is not None and not res.empty and "Script" in res.columns:
+        existing = {
+            str(x).replace("★★ ", "").replace("★ ", "").strip().upper()
+            for x in res["Script"].tolist()
+        }
+
+    rows = []
+
+    for trade in st.session_state.get("trade_book", {}).values():
+        if (
+            str(trade.get("Module", "")).upper().strip() != str(module_name).upper().strip()
+            or str(trade.get("Mode", "")).upper().strip() != str(mode).upper().strip()
+            or str(trade.get("Status", "")).upper().strip() != "ACTIVE"
+            or str(trade.get("Date", "")).strip() != today
+        ):
+            continue
+
+        symbol = str(trade.get("Symbol", "")).upper().strip()
+        if not symbol or symbol in existing:
+            continue
+
+        direction = str(trade.get("Direction", "")).upper().strip()
+        rec = "🟢 BUY" if direction == "LONG" else "🔴 SELL"
+
+        rows.append({
+            "Script": symbol,
+            "LTP": trade.get("LTP", trade.get("Current", np.nan)),
+            "Bias": "ACTIVE TRADE",
+            "Pattern": "LOGGED",
+            "OI Confirmation": "ACTIVE TRADE",
+            "OI Δ%": np.nan,
+            "Entry": trade.get("Entry", np.nan),
+            "SL": trade.get("SL", np.nan),
+            "Recommendation": rec,
+            "_OI Rank": 9999,
+            "_Sector Confirmed": False,
+            "_Sector": sector_of(symbol),
+            "_Sector Breadth %": np.nan,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def _is_active_logged_trade(module_name, mode, symbol):
+    today = local_now().strftime("%d-%b-%Y")
+    target = str(symbol).upper().strip()
+    try:
+        df = _all_trade_ledger_dataframe()
+        if df.empty:
+            return False
+        hit = df[
+            (df["Date"].astype(str).str.strip() == today)
+            & (df["Module"].astype(str).str.upper().str.strip() == str(module_name).upper().strip())
+            & (df["Mode"].astype(str).str.upper().str.strip() == str(mode).upper().strip())
+            & (df["Symbol"].astype(str).str.upper().str.strip() == target)
+            & (df["Status"].astype(str).str.upper().str.strip() == "ACTIVE")
+        ]
+        return not hit.empty
+    except Exception:
+        return False
+
+
 def manage_trade_book(module_name, mode, signal_rows):
     """
     Persistent NSE/MCX trade manager.
@@ -3294,6 +3367,12 @@ def manage_trade_book(module_name, mode, signal_rows):
 
         key = _trade_key(module_name, mode, symbol)
         active = st.session_state.trade_book.get(key)
+
+        if active is None and _is_active_logged_trade(
+            module_name, mode, symbol
+        ):
+            _restore_active_trades_from_ledger()
+            active = st.session_state.trade_book.get(key)
 
         # ---------------------------
         # EXISTING ACTIVE TRADE
@@ -4854,6 +4933,20 @@ elif page in ("Momentum", "Positional"):
         long_df = res[res["Recommendation"] == "🟢 BUY"].copy()
         short_df = res[res["Recommendation"] == "🔴 SELL"].copy()
         setup_df = res[res["Recommendation"] == "🟡 SETUP"].copy()
+
+    # MOMENTUM STICKY TRADES:
+    # Once a trade is logged, keep it visible until an actual exit is recorded.
+    if mode == "Intraday":
+        sticky = _sticky_active_rows_for_display("NSE", "Intraday", res)
+        if not sticky.empty:
+            long_df = pd.concat(
+                [long_df, sticky[sticky["Recommendation"] == "🟢 BUY"]],
+                ignore_index=True,
+            )
+            short_df = pd.concat(
+                [short_df, sticky[sticky["Recommendation"] == "🔴 SELL"]],
+                ignore_index=True,
+            )
     else:
         long_df = res[res["Recommendation"] == "🟢 LONG"].copy()
         short_df = res[res["Recommendation"] == "🔴 SHORT"].copy()
@@ -5094,6 +5187,24 @@ elif page == "MCX Futures":
 
     long_df=res[res["Recommendation"]==long_rec].copy()
     short_df=res[res["Recommendation"]==short_rec].copy()
+
+    if mode=="Intraday":
+        sticky = _sticky_active_rows_for_display("MCX", "Intraday", res)
+        if not sticky.empty:
+            # MCX uses the same compact trade display, but preserve the current
+            # table's recommendation labels.
+            sticky["Recommendation"] = sticky["Recommendation"].replace({
+                "🟢 BUY": "🟢 BUY",
+                "🔴 SELL": "🔴 SELL",
+            })
+            long_df = pd.concat(
+                [long_df, sticky[sticky["Recommendation"]=="🟢 BUY"]],
+                ignore_index=True,
+            )
+            short_df = pd.concat(
+                [short_df, sticky[sticky["Recommendation"]=="🔴 SELL"]],
+                ignore_index=True,
+            )
 
     def mcx_style(row):
         rec=str(row["Recommendation"])
