@@ -7,14 +7,6 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-
-# ALPHA PRO SELLER strategy constants (global so live page execution is safe)
-ALPHA_PRO_BOX_PCT = 0.02
-ALPHA_PRO_ENTRY_REVERSAL = 3
-ALPHA_PRO_EXIT_REVERSAL = 4
-ALPHA_PRO_MAX_TRADES_PER_DAY = 2
-ALPHA_PRO_FORCE_EXIT = datetime.strptime("15:05", "%H:%M").time()
-
 from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="ALPHA ANALYZER V9", page_icon="α", layout="wide")
@@ -4566,6 +4558,11 @@ if not st.session_state.get("_trade_book_restored"):
 # -----------------------------
 # ALPHA PRO SELLER — dedicated intraday theta engine
 # -----------------------------
+ALPHA_PRO_BOX_PCT = 0.02
+ALPHA_PRO_ENTRY_REVERSAL = 3
+ALPHA_PRO_EXIT_REVERSAL = 4
+ALPHA_PRO_MAX_TRADES_PER_DAY = 2
+ALPHA_PRO_FORCE_EXIT = datetime.strptime("15:05", "%H:%M").time()
 
 
 @st.cache_data(ttl=5, show_spinner=False)
@@ -4703,9 +4700,10 @@ def alpha_pro_events(prices):
     prices = [float(p) for p in prices if pd.notna(p) and float(p) > 0]
     if len(prices) < 2:
         return []
-    box_pct = float(globals().get("ALPHA_PRO_BOX_PCT", 0.02))
-    entry_reversal = int(globals().get("ALPHA_PRO_ENTRY_REVERSAL", 3))
-    exit_reversal = int(globals().get("ALPHA_PRO_EXIT_REVERSAL", 4))
+
+    box_pct = 0.02
+    entry_reversal = 3
+    exit_reversal = 4
     lb = math.log1p(box_pct)
     base = math.floor(math.log(prices[0]) / lb)
     direction = None
@@ -6100,12 +6098,10 @@ elif page == "RS Matrix":
 
                 shown = display[core_cols].copy()
 
-                # Style directly from the visible Matrix data.
-                # No obsolete hidden 0.25% helper columns are referenced.
+                # Highlight only the visible Total Performance score.
                 styled = shown.style.apply(highlight_matrix_row, axis=1)
 
-                # Add clear horizontal + vertical separators so each stock row
-                # and each score column is visually distinct.
+                # Clear row and column separators.
                 styled = (
                     styled
                     .set_properties(**{
@@ -6120,14 +6116,7 @@ elif page == "RS Matrix":
                                 ("border-bottom", "2px solid #64748b"),
                             ],
                         },
-                        {
-                            "selector": "tbody tr:last-child td",
-                            "props": [
-                                ("border-bottom", "2px solid #64748b"),
-                            ],
-                        },
                     ])
-                    .hide(subset=["_0.25 Signal", "_0.25 Perfect"], axis="columns")
                 )
 
                 st.dataframe(

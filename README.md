@@ -152,9 +152,8 @@ Latest Matrix modifications included:
 The ALPHA AI STRATEGIST / machine-learning module is intentionally NOT included.
 
 
-## Final Error Fixes
-- Fixed Matrix KeyError caused by obsolete hidden 0.25% helper columns.
-- Matrix highlighting remains strictly +16 perfect bullish / -16 perfect bearish.
-- Preserved Matrix row/column separators.
-- Hardened ALPHA PRO SELLER P&F event calculation so the box-size constant is globally available and locally guarded.
-- Machine-learning module is NOT included.
+## V3 Runtime Fixes
+- Removed all stale RS Matrix `_0.25 Signal` / `_0.25 Perfect` references.
+- Restored +16 / -16 highlighting and row/column separators.
+- Made Alpha Pro Seller P&F events self-contained (2% box, 3-box entry reversal, 4-box exit reversal).
+- Machine learning is excluded.
