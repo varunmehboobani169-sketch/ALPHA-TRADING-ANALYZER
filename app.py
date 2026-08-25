@@ -5240,105 +5240,57 @@ elif page == "Option Seller":
         """
         <div class="alpha-hero">
             <div class="alpha-hero-title">OPTION SELLER</div>
-            <div class="alpha-hero-sub">Live option market monitoring</div>
+            <div class="alpha-hero-sub">Theta collection • Fixed ATM • Live decision engine</div>
             <span class="alpha-badge">LIVE</span>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    
-    st.caption("NIFTY • BANKNIFTY • SENSEX")
 
-    index_name = st.selectbox(
-        "Index",
-        INDEX_NAMES,
-        key="option_index",
-    )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        index_name = st.selectbox("Index", INDEX_NAMES, key="option_index")
+    with c2:
+        horizon_display = st.radio(
+            "Mode",
+            ["Momentum", "Positional"],
+            horizontal=True,
+            key="option_horizon_display",
+        )
+    with c3:
+        st.metric("Market", "LIVE")
 
-    horizon = st.radio(
-        "Horizon",
-        ["Intraday", "Positional"],
-        horizontal=True,
-        key="option_horizon",
-    )
+    horizon = "Intraday" if horizon_display == "Momentum" else "Positional"
 
     try:
         index_sid = resolve_index_instrument(master, index_name)
-
-        # Dhan v2: fetch active expiries for the selected index.
         expiries = option_expiry_list_v2(index_sid)
+        selected_expiry = select_option_expiry_v2(expiries, horizon)
 
-        expiry_options = [
-            d.strftime("%d-%b-%Y") for d in expiries
-        ]
-
-        default_expiry = select_option_expiry_v2(expiries, horizon)
-        default_index = (
-            expiries.index(default_expiry)
-            if default_expiry in expiries else 0
-        )
-
-        selected_expiry_label = st.selectbox(
-            "Expiry",
-            expiry_options,
-            index=default_index,
-            key=f"expiry_{index_name}_{horizon}",
-        )
-        selected_expiry = expiries[expiry_options.index(selected_expiry_label)]
-
-        # Dhan v2: fetch the selected expiry option chain.
         raw_chain = option_chain_request_v2(index_sid, selected_expiry)
         raw_data = parse_data(raw_chain)
-
-        # Dhan option-chain response contains the underlying last_price.
         spot = (
             pd.to_numeric(raw_data.get("last_price"), errors="coerce")
-            if isinstance(raw_data, dict)
-            else np.nan
+            if isinstance(raw_data, dict) else np.nan
         )
 
-        chain_df = parse_option_chain_v2(raw_chain)
-        # All strategy, IV and OI analysis is restricted to ATM +/- 20 strikes.
         chain_df = filter_atm_strike_window(
-            chain_df,
-            spot,
-            strikes_each_side=20,
+            parse_option_chain_v2(raw_chain), spot, strikes_each_side=20
         )
 
-
-        analysis = option_seller_analysis_v2(
-            chain_df,
-            spot,
-            horizon,
-        )
-
-        session_state = option_session_state(
-            index_name,
-            selected_expiry,
-            analysis["atm_iv"],
-        )
-
-        iv_risk = option_iv_risk(
-            analysis["atm_iv"],
-            session_state,
-        )
-
-        oi_risk = option_oi_risk(
-            chain_df,
-            spot,
-        )
+        # BACKEND ONLY - all detailed option calculations remain hidden.
+        analysis = option_seller_analysis_v2(chain_df, spot, horizon)
+        session_state = option_session_state(index_name, selected_expiry, analysis["atm_iv"])
+        iv_risk = option_iv_risk(analysis["atm_iv"], session_state)
+        oi_risk = option_oi_risk(chain_df, spot)
 
         notify_option_warning(
-            index_name,
-            "iv_expansion",
-            f"{index_name} IV is expanding sharply.",
-            bool(iv_risk["alert"]),
+            index_name, "iv_expansion",
+            f"{index_name} IV is expanding sharply.", bool(iv_risk["alert"])
         )
         notify_option_warning(
-            index_name,
-            "oi_buildup",
-            f"{index_name} has unusual one-sided OI buildup.",
-            bool(oi_risk["alert"]),
+            index_name, "oi_buildup",
+            f"{index_name} has unusual one-sided OI buildup.", bool(oi_risk["alert"])
         )
 
         strategy_name, strategy_reason = simple_option_decision(
@@ -5354,217 +5306,129 @@ elif page == "Option Seller":
             oi_alert=oi_risk,
         )
 
-        a, b, c, d = st.columns(4)
-        a.metric("Index", index_name)
-        b.metric("Spot", f"{spot:,.2f}" if pd.notna(spot) else "—")
-        c.metric(
-            "ATM IV",
-            f"{analysis['atm_iv']:.2f}%"
-            if pd.notna(analysis["atm_iv"])
-            else "—",
+        if "option_trade_state" not in st.session_state:
+            st.session_state.option_trade_state = {}
+
+        state_key = f"{index_name}|{selected_expiry.isoformat()}|{horizon}"
+        current_state = st.session_state.option_trade_state.get(
+            state_key,
+            {"status": "WAIT", "entry_premium": np.nan, "entry_at": None},
         )
-        d.metric(
-            "ATM Premium",
-            f"{analysis['ce_ltp'] + analysis['pe_ltp']:.2f}"
+
+        current_premium = (
+            analysis["ce_ltp"] + analysis["pe_ltp"]
             if pd.notna(analysis["ce_ltp"]) and pd.notna(analysis["pe_ltp"])
-            else "—",
+            else np.nan
         )
 
-        st.markdown("### Recommendation")
-        st.subheader(analysis["recommendation"])
-        st.write(analysis["reason"])
+        signal = (
+            "SELL STRADDLE"
+            if analysis["recommendation"] == "🟢 SELL STRADDLE"
+            and strategy_name == "SELL STRADDLE"
+            else "WAIT"
+        )
 
-        if analysis["recommendation"] == "🟢 SELL STRADDLE":
+        if signal == "SELL STRADDLE" and current_state["status"] != "ACTIVE":
+            current_state = {
+                "status": "ACTIVE",
+                "entry_premium": current_premium,
+                "entry_at": local_now().strftime("%d-%b-%Y %H:%M:%S IST"),
+            }
+            st.session_state.option_trade_state[state_key] = current_state
+
+        if (
+            horizon == "Intraday"
+            and current_state["status"] == "ACTIVE"
+            and local_now().time() >= datetime.strptime("15:05", "%H:%M").time()
+        ):
+            current_state = {
+                "status": "CLOSED",
+                "entry_premium": current_state.get("entry_premium", np.nan),
+                "entry_at": current_state.get("entry_at"),
+            }
+            st.session_state.option_trade_state[state_key] = current_state
+
+        # CLEAN CLIENT-FACING DISPLAY ONLY
+        active = current_state["status"] == "ACTIVE"
+        if active:
+            st.success("🟢 SELL STRADDLE")
+        else:
+            st.info("🟡 WAIT")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("ATM", f"{int(analysis['atm'])}" if pd.notna(analysis["atm"]) else "—")
+        m2.metric("Straddle", f"{current_premium:.2f}" if pd.notna(current_premium) else "—")
+        m3.metric("Mode", "Momentum" if horizon == "Intraday" else "Positional")
+        m4.metric("Status", "ACTIVE" if active else "WAIT")
+
+        if active:
             st.success(
                 f"SELL {index_name} {int(analysis['atm'])} CE + "
                 f"{int(analysis['atm'])} PE"
             )
+
+            e1, e2, e3 = st.columns(3)
+            e1.metric(
+                "Entry Premium",
+                f"{current_state['entry_premium']:.2f}"
+                if pd.notna(current_state.get("entry_premium")) else "—",
+            )
+            e2.metric(
+                "Current Premium",
+                f"{current_premium:.2f}" if pd.notna(current_premium) else "—",
+            )
+            pnl_pts = (
+                current_state["entry_premium"] - current_premium
+                if pd.notna(current_state.get("entry_premium"))
+                and pd.notna(current_premium)
+                else np.nan
+            )
+            e3.metric("Straddle P&L", f"{pnl_pts:.2f}" if pd.notna(pnl_pts) else "—")
+
+            st.caption(
+                f"Entry: {current_state.get('entry_at') or '—'}"
+                + (" • Mandatory exit: 15:05" if horizon == "Intraday" else "")
+            )
+        else:
+            st.caption("Waiting for the backend option-selling conditions to align.")
+
+        if analysis["recommendation"] == "🟢 SELL STRADDLE" and strategy_name == "SELL STRADDLE":
+            st.success("Conditions aligned for theta collection.")
         elif analysis["recommendation"] == "🟡 CAUTION":
-            st.warning("Wait for better conditions.")
+            st.warning("Market conditions are not ideal for fresh short-vol exposure.")
         else:
-            st.error("Do not sell under current conditions.")
+            st.info("No fresh short-vol trade is active.")
 
-        st.markdown("### Strategy")
-        if strategy_name == "SELL STRADDLE":
-            st.success(f"SELL {index_name} ATM CE + ATM PE")
-        elif strategy_name == "SELL PUT":
-            st.success(f"SELL {index_name} PUT")
-        elif strategy_name == "SELL CALL":
-            st.success(f"SELL {index_name} CALL")
+        if iv_risk["alert"] or oi_risk["alert"]:
+            st.warning("⚠️ Risk alert active - short-vol conditions are being monitored.")
         else:
-            st.warning("WAIT")
+            st.success("Risk checks clear.")
 
-        st.caption(f"Why: {strategy_reason}")
-
-        st.markdown("### Risk Alerts")
-        risk_df = pd.DataFrame([
-            {
-                "Risk": "Volatility",
-                "Status": "🔴 ALERT" if iv_risk["alert"] else "🟢 NORMAL",
-                "Message": iv_risk["text"],
-            },
-            {
-                "Risk": "Positioning",
-                "Status": "🔴 ALERT" if oi_risk["alert"] else "🟢 NORMAL",
-                "Message": oi_risk["text"],
-            },
-        ])
-        st.dataframe(
-            risk_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
+        # Alerts remain fully active in the backend.
         if "option_alert_states" not in st.session_state:
             st.session_state.option_alert_states = {}
 
         alert_key = f"{index_name}|{horizon}|{selected_expiry}"
         old_state = st.session_state.option_alert_states.get(
-            alert_key,
-            {"iv": False, "oi": False},
+            alert_key, {"iv": False, "oi": False}
         )
-        new_state = {
-            "iv": bool(iv_risk["alert"]),
-            "oi": bool(oi_risk["alert"]),
-        }
+        new_state = {"iv": bool(iv_risk["alert"]), "oi": bool(oi_risk["alert"])}
 
         if new_state["iv"] and not old_state["iv"]:
             warning_text = f"{index_name} implied volatility is rising."
-            st.toast(
-                f"⚠️ Option warning: {warning_text}",
-                icon="⚠️",
-            )
-            speak_option_alert(
-                f"Warning. {warning_text}"
-            )
+            st.toast(f"⚠️ Option warning: {warning_text}", icon="⚠️")
+            speak_option_alert(f"Warning. {warning_text}")
 
         if new_state["oi"] and not old_state["oi"]:
             side_word = "call" if oi_risk["side"] == "CALL" else "put"
-            warning_text = (
-                f"{index_name} heavy {side_word} side positioning buildup."
-            )
-            st.toast(
-                f"⚠️ Option warning: {warning_text}",
-                icon="⚠️",
-            )
-            speak_option_alert(
-                f"Warning. {warning_text}"
-            )
+            warning_text = f"{index_name} heavy {side_word} side positioning buildup."
+            st.toast(f"⚠️ Option warning: {warning_text}", icon="⚠️")
+            speak_option_alert(f"Warning. {warning_text}")
 
         st.session_state.option_alert_states[alert_key] = new_state
 
-        st.markdown("### Selected Straddle")
-        st.dataframe(
-            pd.DataFrame([{
-                "Index": index_name,
-                "Expiry": selected_expiry.strftime("%d-%b-%Y"),
-                "Call Strike": int(analysis["atm"]) if pd.notna(analysis["atm"]) else "—",
-                "Call Premium": analysis["ce_ltp"],
-                "Put Strike": int(analysis["atm"]) if pd.notna(analysis["atm"]) else "—",
-                "Put Premium": analysis["pe_ltp"],
-                "Combined Premium": (
-                    analysis["ce_ltp"] + analysis["pe_ltp"]
-                    if pd.notna(analysis["ce_ltp"]) and pd.notna(analysis["pe_ltp"])
-                    else np.nan
-                ),
-            }]),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.markdown("---")
-        st.markdown("### Option Chain")
-
-        # Dhan-style two-sided layout:
-        # CALLS | STRIKE | PUTS
-        chain_view = chain_df.copy()
-        chain_view["Strike"] = pd.to_numeric(chain_view["Strike"], errors="coerce")
-        chain_view = chain_view.dropna(subset=["Strike"])
-
-        calls = chain_view[chain_view["Side"] == "CE"].set_index("Strike").sort_index()
-        puts = chain_view[chain_view["Side"] == "PE"].set_index("Strike").sort_index()
-
-        strikes = sorted(set(calls.index.tolist()) | set(puts.index.tolist()))
-
-        rows = []
-        for strike in strikes:
-            ce = calls.loc[strike] if strike in calls.index else pd.Series(dtype=float)
-            pe = puts.loc[strike] if strike in puts.index else pd.Series(dtype=float)
-
-            def num(series, key):
-                if key not in series.index:
-                    return np.nan
-                return pd.to_numeric(series[key], errors="coerce")
-
-            rows.append({
-                "CE OI": num(ce, "OI"),
-                "CE ΔOI": num(ce, "Change OI"),
-                "CE Volume": num(ce, "Volume"),
-                "CE IV": num(ce, "IV"),
-                "CE LTP": num(ce, "LTP"),
-                "CE Δ": num(ce, "Delta"),
-                "STRIKE": strike,
-                "PE Δ": num(pe, "Delta"),
-                "PE LTP": num(pe, "LTP"),
-                "PE IV": num(pe, "IV"),
-                "PE Volume": num(pe, "Volume"),
-                "PE ΔOI": num(pe, "Change OI"),
-                "PE OI": num(pe, "OI"),
-            })
-
-        dhan_chain = pd.DataFrame(rows)
-
-        atm_strike = analysis["atm"]
-
-        def highlight_atm(row):
-            if pd.notna(atm_strike) and row["STRIKE"] == atm_strike:
-                return [
-                    "background-color: #174c38; color: white; font-weight: 700"
-                ] * len(row)
-            return [""] * len(row)
-
-        st.dataframe(
-            dhan_chain.style.apply(highlight_atm, axis=1),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "CE OI": st.column_config.NumberColumn("OI", format="%.0f"),
-                "CE ΔOI": st.column_config.NumberColumn("Δ OI", format="%.0f"),
-                "CE Volume": st.column_config.NumberColumn("Volume", format="%.0f"),
-                "CE IV": st.column_config.NumberColumn("IV", format="%.2f"),
-                "CE LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
-                "CE Δ": st.column_config.NumberColumn("Delta", format="%.2f"),
-                "STRIKE": st.column_config.NumberColumn("STRIKE", format="%.0f"),
-                "PE Δ": st.column_config.NumberColumn("Delta", format="%.2f"),
-                "PE LTP": st.column_config.NumberColumn("LTP", format="%.2f"),
-                "PE IV": st.column_config.NumberColumn("IV", format="%.2f"),
-                "PE Volume": st.column_config.NumberColumn("Volume", format="%.0f"),
-                "PE ΔOI": st.column_config.NumberColumn("Δ OI", format="%.0f"),
-                "PE OI": st.column_config.NumberColumn("OI", format="%.0f"),
-            },
-        )
-
-        st.caption(
-            "Calls on the left, strike prices in the centre, puts on the right. "
-            "ATM is highlighted."
-        )
-
-        pcr_now=option_pcr_snapshot(chain_df,spot,strikes_each_side=20)
-        pcr_key=f"pcr_history|{index_name}|{selected_expiry.strftime('%Y-%m-%d')}|{horizon}"
-        if "pcr_history" not in st.session_state:
-            st.session_state.pcr_history={}
-        pcr_history=st.session_state.pcr_history.setdefault(pcr_key,[])
-        if pd.notna(pcr_now):
-            now_ts=datetime.now()
-            if not pcr_history or (now_ts-pcr_history[-1][0]).total_seconds()>=45:
-                pcr_history.append((now_ts,float(pcr_now)))
-        pcr_history[:]=pcr_history[-120:]
-        st.markdown("### Positioning Trend")
-        render_pcr_positioning_chart([v for _,v in pcr_history])
-
-
     except Exception:
-        st.error("Option data is currently unavailable.")
+        st.error("Option seller data is currently unavailable.")
         st.info("Please refresh or try again later.")
 
 

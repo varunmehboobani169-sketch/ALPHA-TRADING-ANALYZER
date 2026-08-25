@@ -81,3 +81,7 @@ Script, LTP, Bias, Entry, SL, Recommendation.
 A logged Momentum trade stays visible in the active LONG/SHORT table until an
 actual exit is recorded. A temporary loss of the live signal does not hide or
 create a replacement trade. Duplicate prevention remains one symbol per day.
+
+
+## Option Seller UI
+Detailed IV/OI/chain/diagnostic calculations are backend-only. The client sees only the decision, ATM, premium, mode, active status, entry/current premium, P&L and concise risk status.
