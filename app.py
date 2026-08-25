@@ -3915,7 +3915,7 @@ def matrix_pf_score(close_series, box_pct):
     }
 
 
-def run_pf_fusion_matrix_manual(fut):
+def run_pf_fusion_matrix_manual(fut, boxes=None):
     """
     Fusion Matrix based on the uploaded source's scoring concept:
     Price P&F + Relative Strength P&F across 3%, 2%, 1%, 0.25%.
@@ -3937,7 +3937,8 @@ def run_pf_fusion_matrix_manual(fut):
     progress=st.progress(0,text="Building P&F Fusion Matrix...")
     total=len(fut)
 
-    boxes=[("3%",0.03),("2%",0.02),("1%",0.01),("0.25%",0.0025)]
+    if boxes is None:
+        boxes=[("3%",0.03),("2%",0.02),("1%",0.01),("0.25%",0.0025)]
 
     for i,(_,r) in enumerate(fut.iterrows(),1):
         symbol=str(r["underlying_symbol"])
@@ -3994,6 +3995,19 @@ def run_pf_fusion_matrix_manual(fut):
         # Useful quick state fields; core detail stays available for ranking.
         price_rows["Price State"]="BULLISH" if price_perf_total>0 else "BEARISH" if price_perf_total<0 else "NEUTRAL"
         price_rows["RS State"]="BULLISH" if rs_perf_total>0 else "BEARISH" if rs_perf_total<0 else "NEUTRAL"
+
+        # Current 0.25% price-chart signal is used only for row highlighting.
+        zero25 = next((box_label for box_label, box_value in boxes if abs(box_value-0.0025) < 1e-9), None)
+        if zero25 is not None:
+            latest_zero25 = matrix_pf_score(stock.loc[common], 0.0025)
+            price_rows["_0.25 Signal"] = latest_zero25["pattern"]
+            price_rows["_0.25 Perfect"] = (
+                latest_zero25["performance"] == 2
+                or latest_zero25["performance"] == -2
+            )
+        else:
+            price_rows["_0.25 Signal"] = "N/A"
+            price_rows["_0.25 Perfect"] = False
 
         rows.append(price_rows)
         progress.progress(i/max(total,1),text=f"Matrix: {symbol}")
@@ -5973,7 +5987,7 @@ elif page == "RS Matrix":
     st.markdown(
         """
         <div class="alpha-hero">
-            <div class="alpha-hero-title">P&F FUSION MATRIX</div>
+            <div class="alpha-hero-title">FUSION MATRIX</div>
             <div class="alpha-hero-sub">Price + Relative Strength ranking</div>
             <span class="alpha-badge">MATRIX</span>
         </div>
@@ -5981,82 +5995,123 @@ elif page == "RS Matrix":
         unsafe_allow_html=True,
     )
 
-    st.caption(
-        "Performance + Ranking scores • Relative Strength vs NIFTY 50"
-    )
+    st.caption("Performance + ranking scores • Relative Strength vs NIFTY 50")
 
-    fut=future_universe(master,"NSE")
+    fut = future_universe(master, "NSE")
 
     if fut.empty:
         st.error("No NSE F&O universe available.")
     else:
-        c1,c2,c3=st.columns(3)
+        # User-selectable box sizes. Values are percentages.
+        b1, b2, b3, b4 = st.columns(4)
+        with b1:
+            box1 = st.number_input("Box 1 %", min_value=0.05, max_value=20.0, value=3.0, step=0.05, format="%.2f", key="matrix_box1")
+        with b2:
+            box2 = st.number_input("Box 2 %", min_value=0.05, max_value=20.0, value=2.0, step=0.05, format="%.2f", key="matrix_box2")
+        with b3:
+            box3 = st.number_input("Box 3 %", min_value=0.05, max_value=20.0, value=1.0, step=0.05, format="%.2f", key="matrix_box3")
+        with b4:
+            box4 = st.number_input("Box 4 %", min_value=0.05, max_value=20.0, value=0.25, step=0.05, format="%.2f", key="matrix_box4")
 
-        with c1:
-            if st.button(
-                "🔄 Calculate / Refresh Matrix",
-                key="fusion_matrix_refresh",
-            ):
-                st.cache_data.clear()
-                st.session_state.pf_fusion_matrix_result=run_pf_fusion_matrix_manual(fut)
-
-        current=st.session_state.get(
-            "pf_fusion_matrix_result",
-            pd.DataFrame(),
-        )
-
-        with c2:
-            sort_col=None
-            if not current.empty:
-                numeric_cols=[
-                    c for c in current.columns
-                    if c!="Stock" and pd.api.types.is_numeric_dtype(current[c])
-                ]
-                sort_options=numeric_cols
-                if sort_options:
-                    sort_col=st.selectbox(
-                        "Rank by",
-                        sort_options,
-                        index=sort_options.index("Total Performance")
-                        if "Total Performance" in sort_options else 0,
-                        key="fusion_matrix_sort_col",
-                    )
-
-        with c3:
-            order=st.selectbox(
-                "Order",
-                ["High → Low","Low → High"],
-                key="fusion_matrix_order",
-            )
-
-        if current.empty:
-            st.info("Press 'Calculate / Refresh Matrix' to build the Fusion Matrix.")
+        box_values = [box1, box2, box3, box4]
+        if len({round(x, 6) for x in box_values}) != 4:
+            st.warning("Each box size must be different.")
         else:
-            display=current.copy()
+            boxes = [(f"{x:g}%", x / 100.0) for x in box_values]
 
-            # Main client-facing ranking table.
-            core_cols=[
-                "Stock",
-                "Price Performance","Price Ranking",
-                "RS Performance","RS Ranking",
-                "Total Performance","Total Ranking",
-                "Net Performance","Net Ranking",
-                "Price State","RS State",
-            ]
-            core_cols=[c for c in core_cols if c in display.columns]
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if st.button("🔄 Calculate / Refresh Matrix", key="fusion_matrix_refresh"):
+                    st.cache_data.clear()
+                    st.session_state.pf_fusion_matrix_result = run_pf_fusion_matrix_manual(
+                        fut, boxes=boxes
+                    )
+                    st.session_state.pf_fusion_matrix_boxes = boxes
 
-            if sort_col and sort_col in display.columns:
-                display=display.sort_values(
-                    sort_col,
-                    ascending=(order=="Low → High"),
-                    kind="stable",
-                ).reset_index(drop=True)
+            current = st.session_state.get("pf_fusion_matrix_result", pd.DataFrame())
 
-            st.dataframe(
-                display[core_cols],
-                use_container_width=True,
-                hide_index=True,
-            )
+            # If box configuration changed since last calculation, let the user
+            # see that the matrix needs recalculation.
+            saved_boxes = st.session_state.get("pf_fusion_matrix_boxes")
+            if saved_boxes != boxes and not current.empty:
+                st.warning("Box sizes changed. Click Calculate / Refresh Matrix to rebuild.")
+
+            with c2:
+                sort_col = None
+                if not current.empty:
+                    numeric_cols = [
+                        c for c in current.columns
+                        if c != "Stock" and pd.api.types.is_numeric_dtype(current[c])
+                    ]
+                    if numeric_cols:
+                        sort_col = st.selectbox(
+                            "Rank by",
+                            numeric_cols,
+                            index=numeric_cols.index("Total Performance")
+                            if "Total Performance" in numeric_cols else 0,
+                            key="fusion_matrix_sort_col",
+                        )
+
+            with c3:
+                order = st.selectbox(
+                    "Order",
+                    ["High → Low", "Low → High"],
+                    key="fusion_matrix_order",
+                )
+
+            if current.empty:
+                st.info("Press 'Calculate / Refresh Matrix' to build the Fusion Matrix.")
+            else:
+                display = current.copy()
+
+                core_cols = [
+                    "Stock",
+                    "Price Performance","Price Ranking",
+                    "RS Performance","RS Ranking",
+                    "Total Performance","Total Ranking",
+                    "Net Performance","Net Ranking",
+                    "Price State","RS State",
+                ]
+                core_cols = [c for c in core_cols if c in display.columns]
+
+                if sort_col and sort_col in display.columns:
+                    display = display.sort_values(
+                        sort_col,
+                        ascending=(order == "Low → High"),
+                        kind="stable",
+                    ).reset_index(drop=True)
+
+                # Green: current 0.25% Price P&F has a fresh perfect DTB score (+2).
+                # Red: current 0.25% Price P&F has a fresh perfect DBS score (-2).
+                def highlight_matrix_row(row):
+                    signal = str(row.get("_0.25 Signal", ""))
+                    perfect = bool(row.get("_0.25 Perfect", False))
+
+                    if perfect and signal == "DTB BUY":
+                        return ["background-color: #d9f2d9; color: #0b5d1e; font-weight: 700"] * len(row)
+                    if perfect and signal == "DBS SELL":
+                        return ["background-color: #f8d7da; color: #8a1c1c; font-weight: 700"] * len(row)
+                    return [""] * len(row)
+
+                shown = display[core_cols].copy()
+                style_base = display[core_cols].copy()
+                # add hidden helper columns only for style application
+                style_base["_0.25 Signal"] = display["_0.25 Signal"].values
+                style_base["_0.25 Perfect"] = display["_0.25 Perfect"].values
+
+                styled = style_base.style.apply(highlight_matrix_row, axis=1)
+                styled = styled.hide(subset=["_0.25 Signal", "_0.25 Perfect"], axis="columns")
+
+                st.dataframe(
+                    styled,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.caption(
+                    "🟢 Green = latest 0.25% DTB with perfect +2 score • "
+                    "🔴 Red = latest 0.25% DBS with perfect -2 score"
+                )
 
 
 else:

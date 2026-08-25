@@ -118,3 +118,11 @@ The existing Matrix has been upgraded using the source-inspired scoring concept:
 ## Display Cleanup
 Core P&F calculations remain in the backend, but the client-facing Matrix no
 longer displays "P&F" terminology or the detailed per-box score expander.
+
+
+## Matrix Enhancements
+- Four box sizes are user-configurable from the Matrix screen.
+- Default values remain 3%, 2%, 1%, 0.25%.
+- The latest 0.25% price-chart DTB with a perfect +2 score is highlighted green.
+- The latest 0.25% price-chart DBS with a perfect -2 score is highlighted red.
+- Core calculations remain backend-driven.
