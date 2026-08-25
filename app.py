@@ -114,6 +114,7 @@ with st.sidebar:
             "Trade Logs",
             "Option Seller",
             "ALPHA PRO SELLER",
+            "Historical Data Lab",
             "Momentum",
             "Positional",
             "MCX Futures",
@@ -4877,6 +4878,720 @@ def render_alpha_pro_seller():
 
 
 
+
+
+# -----------------------------
+# HISTORICAL DATA LAB
+# -----------------------------
+HIST_OPT_ALLOWED_INTERVALS = [1, 5, 15, 25, 60]
+HIST_STD_ALLOWED_INTERVALS = [1, 5, 15, 25, 60]
+HIST_CHUNK_DAYS_OPTIONS = 30          # Dhan rolling-option limit
+HIST_CHUNK_DAYS_STANDARD = 90         # Dhan intraday historical limit
+HIST_DEFAULT_REQUIRED = ["open", "high", "low", "close", "volume", "oi", "iv", "strike", "spot"]
+
+
+def _daterange_chunks(start_date, end_date, max_days):
+    """Yield [start, exclusive_end] chunks no larger than max_days."""
+    cur = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if end <= cur:
+        return
+    while cur < end:
+        nxt = min(cur + pd.Timedelta(days=max_days), end)
+        yield cur.date(), nxt.date()
+        cur = nxt
+
+
+def _timestamp_frame_from_dhan(data, tz=LOCAL_TZ):
+    """Convert Dhan array response to a tidy OHLC/OI DataFrame."""
+    if not isinstance(data, dict):
+        return pd.DataFrame()
+
+    # Accept either the response body directly or {"data": {...}}.
+    d = data.get("data") if isinstance(data.get("data"), dict) else data
+    if not isinstance(d, dict):
+        return pd.DataFrame()
+
+    ts = d.get("timestamp", [])
+    if not ts:
+        return pd.DataFrame()
+
+    n = len(ts)
+    out = pd.DataFrame({
+        "timestamp": pd.to_numeric(pd.Series(ts), errors="coerce"),
+    })
+
+    # Dhan uses epoch seconds in these responses.
+    out["datetime_ist"] = pd.to_datetime(
+        out["timestamp"], unit="s", utc=True, errors="coerce"
+    ).dt.tz_convert(tz)
+
+    for key, col in [
+        ("open", "open"),
+        ("high", "high"),
+        ("low", "low"),
+        ("close", "close"),
+        ("volume", "volume"),
+        ("oi", "oi"),
+        ("open_interest", "oi"),
+        ("iv", "iv"),
+        ("strike", "strike_price"),
+        ("spot", "spot"),
+    ]:
+        if key in d and col not in out.columns:
+            vals = d.get(key, [])
+            if len(vals) == n:
+                out[col] = pd.to_numeric(pd.Series(vals), errors="coerce")
+
+    # If both oi and open_interest were present, retain the first populated one.
+    if "open_interest" in out.columns and "oi" not in out.columns:
+        out["oi"] = out["open_interest"]
+
+    out = out.dropna(subset=["datetime_ist"]).sort_values("datetime_ist")
+    return out.reset_index(drop=True)
+
+
+def _resolve_history_underlying(master, exchange, script):
+    """
+    Resolve an underlying security ID from the instrument master.
+    Supports index IDs and NSE/MCX underlying symbols.
+    """
+    script = str(script).upper().strip()
+
+    # Fixed Dhan index IDs used elsewhere in the app.
+    index_ids = {
+        "NIFTY": 13,
+        "BANKNIFTY": 25,
+        "SENSEX": 51,
+        "FINNIFTY": 27,
+        "MIDCPNIFTY": 442,
+    }
+    if exchange == "NSE" and script in index_ids:
+        return {
+            "security_id": index_ids[script],
+            "symbol": script,
+            "segment": "NSE_FNO",
+            "instrument": "OPTIDX",
+        }
+
+    x = master.copy()
+    if "exchange" in x.columns:
+        x = x[x["exchange"].astype(str).str.upper() == exchange].copy()
+
+    # Prefer underlying symbol matches.
+    cols = [c for c in ["underlying_symbol", "symbol_name", "trading_symbol", "display_name"] if c in x.columns]
+    if not cols:
+        return None
+
+    masks = []
+    for c in cols:
+        masks.append(x[c].astype(str).str.upper().str.strip().eq(script))
+    mask = masks[0]
+    for m in masks[1:]:
+        mask = mask | m
+    x = x[mask].copy()
+
+    if x.empty:
+        return None
+
+    # Prefer derivative contracts whose underlying ID is populated.
+    if "underlying_security_id" in x.columns:
+        u = pd.to_numeric(x["underlying_security_id"], errors="coerce").dropna()
+        if not u.empty:
+            sid = int(u.iloc[0])
+        else:
+            sid = int(pd.to_numeric(x["security_id"], errors="coerce").dropna().iloc[0])
+    else:
+        sid = int(pd.to_numeric(x["security_id"], errors="coerce").dropna().iloc[0])
+
+    return {
+        "security_id": sid,
+        "symbol": script,
+        "segment": "NSE_FNO" if exchange == "NSE" else "MCX_COMM",
+        "instrument": "OPTIDX" if exchange == "NSE" else "OPTFUT",
+    }
+
+
+def _resolve_standard_contract(master, exchange, instrument, script, security_id_override=""):
+    """Resolve one standard equity/index/future contract for historical OHLC."""
+    if security_id_override:
+        try:
+            sid = int(str(security_id_override).strip())
+            return {"security_id": sid, "symbol": str(script).upper().strip()}
+        except Exception:
+            pass
+
+    script = str(script).upper().strip()
+    x = master.copy()
+    x = x[x["exchange"].astype(str).str.upper() == exchange].copy()
+    x = x[x["instrument"].astype(str).str.upper() == instrument].copy()
+
+    if x.empty:
+        return None
+
+    symbol_cols = [c for c in ["underlying_symbol", "symbol_name", "trading_symbol", "display_name"] if c in x.columns]
+    mask = pd.Series(False, index=x.index)
+    for c in symbol_cols:
+        mask = mask | x[c].astype(str).str.upper().str.strip().eq(script)
+        mask = mask | x[c].astype(str).str.upper().str.startswith(script + "-", na=False)
+    x = x[mask].copy()
+    if x.empty:
+        return None
+
+    if "expiry_date" in x.columns:
+        x["expiry_date"] = pd.to_datetime(x["expiry_date"], errors="coerce")
+        x = x.sort_values(["expiry_date", "security_id"], na_position="last")
+
+    row = x.iloc[0]
+    return {
+        "security_id": int(pd.to_numeric(row["security_id"], errors="coerce")),
+        "symbol": script,
+        "trading_symbol": str(row.get("trading_symbol", script)),
+        "expiry_date": row.get("expiry_date", pd.NaT),
+    }
+
+
+def _rolling_option_request(history_cfg, from_date, to_date):
+    payload = {
+        "exchangeSegment": history_cfg["exchange_segment"],
+        "interval": str(history_cfg["interval"]),
+        "securityId": int(history_cfg["security_id"]),
+        "instrument": history_cfg["instrument"],
+        "expiryFlag": history_cfg["expiry_flag"],
+        "expiryCode": int(history_cfg["expiry_code"]),
+        "strike": history_cfg["strike"],
+        "drvOptionType": history_cfg["option_type"],
+        "requiredData": history_cfg["required_data"],
+        "fromDate": from_date.strftime("%Y-%m-%d"),
+        "toDate": to_date.strftime("%Y-%m-%d"),
+    }
+    return api_post("/charts/rollingoption", payload, "Historical rolling options")
+
+
+def _parse_rolling_option_response(body, option_type):
+    """
+    Convert Dhan rolling-option response into a common DataFrame.
+    The API response is CE/PE keyed; preserve all returned series fields.
+    """
+    data = parse_data(body)
+    if not isinstance(data, dict):
+        return pd.DataFrame()
+
+    key = "ce" if option_type == "CALL" else "pe"
+    obj = data.get(key)
+    if not isinstance(obj, dict):
+        # Some responses can expose the requested leg directly.
+        obj = data if "timestamp" in data else None
+
+    if not isinstance(obj, dict):
+        return pd.DataFrame()
+
+    df = _timestamp_frame_from_dhan(obj)
+    if df.empty:
+        return df
+
+    df["option_type"] = option_type
+    return df
+
+
+def _download_expired_options_dataset(cfg):
+    """Download all selected relative strikes and CE/PE in <=30-day chunks."""
+    offset_values = list(range(cfg["strike_min"], cfg["strike_max"] + 1))
+    option_types = ["CALL", "PUT"] if cfg["side"] == "BOTH" else [cfg["side"]]
+
+    chunks = list(_daterange_chunks(cfg["from_date"], cfg["to_date"], HIST_CHUNK_DAYS_OPTIONS))
+    total_calls = len(chunks) * len(offset_values) * len(option_types)
+
+    frames = []
+    failures = []
+    progress = st.progress(0, text="Starting historical option download...")
+    done = 0
+
+    for ci, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+        for offset in offset_values:
+            strike_label = "ATM" if offset == 0 else f"ATM{offset:+d}"
+
+            for side in option_types:
+                request_cfg = {
+                    "exchange_segment": cfg["exchange_segment"],
+                    "interval": cfg["interval"],
+                    "security_id": cfg["security_id"],
+                    "instrument": cfg["instrument"],
+                    "expiry_flag": cfg["expiry_flag"],
+                    "expiry_code": cfg["expiry_code"],
+                    "strike": strike_label,
+                    "option_type": side,
+                    "required_data": cfg["required_data"],
+                }
+
+                try:
+                    body = _rolling_option_request(
+                        request_cfg, chunk_start, chunk_end
+                    )
+                    df = _parse_rolling_option_response(body, side)
+
+                    if not df.empty:
+                        df["exchange"] = cfg["exchange"]
+                        df["script"] = cfg["script"]
+                        df["expiry_flag"] = cfg["expiry_flag"]
+                        df["expiry_code"] = cfg["expiry_code"]
+                        df["requested_strike"] = strike_label
+                        df["strike_offset"] = offset
+                        frames.append(df)
+                except Exception as exc:
+                    failures.append({
+                        "chunk_start": str(chunk_start),
+                        "chunk_end": str(chunk_end),
+                        "strike": strike_label,
+                        "option_type": side,
+                        "error": str(exc),
+                    })
+
+                done += 1
+                progress.progress(
+                    done / max(total_calls, 1),
+                    text=f"Options: {strike_label} {side} • chunk {ci}/{len(chunks)}",
+                )
+
+    progress.empty()
+
+    if not frames:
+        return pd.DataFrame(), pd.DataFrame(failures)
+
+    out = pd.concat(frames, ignore_index=True)
+
+    # Keep a deterministic, research-friendly schema.
+    for col in ["open", "high", "low", "close", "volume", "oi", "iv", "strike_price", "spot"]:
+        if col not in out.columns:
+            out[col] = np.nan
+
+    out["date"] = out["datetime_ist"].dt.date
+    out["time"] = out["datetime_ist"].dt.strftime("%H:%M:%S")
+    out = out[
+        [
+            "datetime_ist", "date", "time",
+            "exchange", "script", "expiry_flag", "expiry_code",
+            "requested_strike", "strike_offset", "option_type",
+            "strike_price", "spot",
+            "open", "high", "low", "close", "volume", "oi", "iv",
+        ]
+    ]
+
+    out = (
+        out.drop_duplicates(
+            subset=["datetime_ist", "expiry_flag", "expiry_code", "requested_strike", "option_type"],
+            keep="last",
+        )
+        .sort_values(
+            ["datetime_ist", "strike_offset", "option_type"],
+            kind="stable",
+        )
+        .reset_index(drop=True)
+    )
+    return out, pd.DataFrame(failures)
+
+
+def _standard_historical_request(cfg, from_date, to_date):
+    if cfg["timeframe"] == "Daily":
+        payload = {
+            "securityId": str(cfg["security_id"]),
+            "exchangeSegment": cfg["exchange_segment"],
+            "instrument": cfg["instrument"],
+            "expiryCode": int(cfg.get("expiry_code", 0)),
+            "oi": bool(cfg["include_oi"]),
+            "fromDate": from_date.strftime("%Y-%m-%d"),
+            "toDate": to_date.strftime("%Y-%m-%d"),
+        }
+        return api_post("/charts/historical", payload, "Historical daily data")
+
+    payload = {
+        "securityId": str(cfg["security_id"]),
+        "exchangeSegment": cfg["exchange_segment"],
+        "instrument": cfg["instrument"],
+        "interval": str(cfg["interval"]),
+        "oi": bool(cfg["include_oi"]),
+        "fromDate": from_date.strftime("%Y-%m-%d %H:%M:%S"),
+        "toDate": to_date.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return api_post("/charts/intraday", payload, "Historical intraday data")
+
+
+def _download_standard_dataset(cfg):
+    chunk_days = HIST_CHUNK_DAYS_STANDARD
+    chunks = list(_daterange_chunks(cfg["from_date"], cfg["to_date"], chunk_days))
+    progress = st.progress(0, text="Starting historical contract download...")
+    frames = []
+    failures = []
+
+    for i, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+        try:
+            body = _standard_historical_request(cfg, chunk_start, chunk_end)
+            df = _timestamp_frame_from_dhan(body)
+
+            if not df.empty:
+                df["exchange_segment"] = cfg["exchange_segment"]
+                df["instrument"] = cfg["instrument"]
+                df["script"] = cfg["script"]
+                frames.append(df)
+        except Exception as exc:
+            failures.append({
+                "chunk_start": str(chunk_start),
+                "chunk_end": str(chunk_end),
+                "error": str(exc),
+            })
+
+        progress.progress(
+            i / max(len(chunks), 1),
+            text=f"Contract history: chunk {i}/{len(chunks)}",
+        )
+
+    progress.empty()
+
+    if not frames:
+        return pd.DataFrame(), pd.DataFrame(failures)
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.drop_duplicates(subset=["datetime_ist"], keep="last")
+    out = out.sort_values("datetime_ist").reset_index(drop=True)
+    return out, pd.DataFrame(failures)
+
+
+def _make_history_zip(df, failures, metadata):
+    """Create one ZIP containing the final dataset and a metadata/readme CSV."""
+    zip_buffer_path = Path("/mnt/data/alpha_historical_download.zip")
+
+    meta_rows = [
+        ("Created IST", local_now().strftime("%d-%b-%Y %H:%M:%S")),
+        ("Mode", metadata.get("mode", "")),
+        ("Exchange", metadata.get("exchange", "")),
+        ("Script", metadata.get("script", "")),
+        ("From", str(metadata.get("from_date", ""))),
+        ("To", str(metadata.get("to_date", ""))),
+        ("Timeframe", str(metadata.get("timeframe", ""))),
+        ("Rows", str(len(df))),
+        ("Failures", str(len(failures))),
+        ("Note", "Exact historical expiry date is not exposed as a field in Dhan rolling-option response; expiry flag/code are preserved."),
+    ]
+    meta = pd.DataFrame(meta_rows, columns=["Field", "Value"])
+
+    dataset_name = "historical_options.csv" if metadata.get("mode") == "Expired Options" else "historical_contract.csv"
+    with zipfile.ZipFile(zip_buffer_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(dataset_name, df.to_csv(index=False).encode("utf-8"))
+        zf.writestr("metadata.csv", meta.to_csv(index=False).encode("utf-8"))
+        if not failures.empty:
+            zf.writestr("failed_requests.csv", failures.to_csv(index=False).encode("utf-8"))
+    return zip_buffer_path
+
+
+def render_historical_data_lab():
+    st.markdown(
+        """
+        <div class="alpha-hero">
+            <div class="alpha-hero-title">HISTORICAL DATA LAB</div>
+            <div class="alpha-hero-sub">Build clean research datasets from Dhan history</div>
+            <span class="alpha-badge">DATA</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    mode = st.radio(
+        "Data type",
+        ["Expired Options", "Single Contract / Index / Future"],
+        horizontal=True,
+        key="hist_lab_mode",
+    )
+
+    if mode == "Expired Options":
+        st.caption(
+            "Rolling expired-option history • ATM-relative strikes • OHLC + OI/IV/Volume/Spot"
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            exchange = st.selectbox("Exchange", ["NSE", "MCX"], key="hist_opt_exchange")
+        with c2:
+            script = st.text_input("Script / Underlying", value="NIFTY", key="hist_opt_script").strip().upper()
+        with c3:
+            expiry_flag = st.selectbox(
+                "Expiry cycle",
+                ["WEEK", "MONTH"],
+                index=0,
+                key="hist_opt_expiry_flag",
+            )
+
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            timeframe = st.selectbox(
+                "Timeframe",
+                HIST_OPT_ALLOWED_INTERVALS,
+                format_func=lambda x: f"{x} minute",
+                index=0,
+                key="hist_opt_timeframe",
+            )
+        with c5:
+            expiry_code = st.selectbox(
+                "Expiry code",
+                [1, 2, 3],
+                format_func=lambda x: {
+                    1: "Near expiry",
+                    2: "Next expiry",
+                    3: "Far expiry",
+                }[x],
+                index=0,
+                key="hist_opt_expiry_code",
+            )
+        with c6:
+            side = st.selectbox(
+                "Option side",
+                ["BOTH", "CALL", "PUT"],
+                key="hist_opt_side",
+            )
+
+        c7, c8, c9, c10 = st.columns(4)
+        with c7:
+            strike_min = st.number_input(
+                "From ATM",
+                min_value=-10,
+                max_value=10,
+                value=-10,
+                step=1,
+                key="hist_opt_strike_min",
+            )
+        with c8:
+            strike_max = st.number_input(
+                "To ATM",
+                min_value=-10,
+                max_value=10,
+                value=10,
+                step=1,
+                key="hist_opt_strike_max",
+            )
+        with c9:
+            from_date = st.date_input(
+                "From date",
+                value=(local_now().date() - pd.Timedelta(days=365)),
+                key="hist_opt_from",
+            )
+        with c10:
+            to_date = st.date_input(
+                "To date",
+                value=local_now().date(),
+                key="hist_opt_to",
+            )
+
+        st.caption(
+            "Example: NIFTY • WEEK • ATM-10 to ATM+10 • 1 minute • 3 years. "
+            "The downloader automatically splits the request into Dhan's 30-day maximum chunks."
+        )
+
+        if st.button("⬇️ Build Historical Options Dataset", key="hist_opt_download"):
+            if strike_min > strike_max:
+                st.error("From ATM must be less than or equal to To ATM.")
+                return
+            if from_date >= to_date:
+                st.error("From date must be before To date.")
+                return
+
+            resolved = _resolve_history_underlying(master, exchange, script)
+            if not resolved:
+                st.error(f"Could not resolve underlying '{script}' from the Dhan instrument master.")
+                return
+
+            cfg = {
+                "exchange": exchange,
+                "script": script,
+                "security_id": resolved["security_id"],
+                "exchange_segment": "NSE_FNO" if exchange == "NSE" else "MCX_COMM",
+                "instrument": "OPTIDX" if exchange == "NSE" and script in {"NIFTY","BANKNIFTY","SENSEX","FINNIFTY","MIDCPNIFTY"} else "OPTSTK" if exchange == "NSE" else "OPTFUT",
+                "expiry_flag": expiry_flag,
+                "expiry_code": expiry_code,
+                "interval": timeframe,
+                "side": side,
+                "strike_min": int(strike_min),
+                "strike_max": int(strike_max),
+                "from_date": from_date,
+                "to_date": to_date,
+                "required_data": HIST_DEFAULT_REQUIRED,
+            }
+
+            with st.status("Downloading and combining historical data...", expanded=True) as status:
+                st.write(
+                    f"{script} • {expiry_flag} • ATM{strike_min:+d} to ATM{strike_max:+d} • "
+                    f"{timeframe} minute"
+                )
+                dataset, failures = _download_expired_options_dataset(cfg)
+                if dataset.empty:
+                    status.update(label="Download failed", state="error")
+                    st.error("No historical data was returned. Check the script, dates, expiry cycle/code and Dhan access token.")
+                    if not failures.empty:
+                        st.dataframe(failures, use_container_width=True, hide_index=True)
+                    return
+
+                zip_path = _make_history_zip(
+                    dataset,
+                    failures,
+                    {"mode": mode, **cfg},
+                )
+                status.update(label="Dataset ready", state="complete")
+
+            st.success(
+                f"Dataset ready: {len(dataset):,} rows across "
+                f"{dataset['strike_offset'].nunique() if 'strike_offset' in dataset.columns else 'selected'} strike offsets."
+            )
+            if not failures.empty:
+                st.warning(f"{len(failures)} individual requests failed. The ZIP contains failed_requests.csv.")
+
+            st.dataframe(
+                dataset.head(200),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.download_button(
+                "⬇️ Download Final Dataset ZIP",
+                data=zip_path.read_bytes(),
+                file_name=f"{script}_{expiry_flag}_{strike_min:+d}_to_{strike_max:+d}_{timeframe}m_history.zip",
+                mime="application/zip",
+                key="hist_opt_final_download",
+            )
+
+    else:
+        st.caption(
+            "Download OHLC (and OI where supported) for one NSE/MCX/index/futures contract."
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            exchange = st.selectbox(
+                "Exchange",
+                ["NSE", "MCX"],
+                key="hist_std_exchange",
+            )
+        with c2:
+            instrument = st.selectbox(
+                "Instrument",
+                (
+                    ["EQUITY", "FUTSTK", "FUTIDX", "INDEX"]
+                    if exchange == "NSE"
+                    else ["FUTCOM", "INDEX"]
+                ),
+                key="hist_std_instrument",
+            )
+        with c3:
+            script = st.text_input(
+                "Script / Contract",
+                value="NIFTY" if instrument in {"FUTIDX", "INDEX"} else "RELIANCE",
+                key="hist_std_script",
+            ).strip().upper()
+
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            timeframe = st.selectbox(
+                "Timeframe",
+                ["Daily"] + HIST_STD_ALLOWED_INTERVALS,
+                format_func=lambda x: "Daily" if x == "Daily" else f"{x} minute",
+                key="hist_std_timeframe",
+            )
+        with c5:
+            include_oi = st.checkbox("Include OI", value=True, key="hist_std_oi")
+        with c6:
+            security_override = st.text_input(
+                "Security ID (optional)",
+                value="",
+                key="hist_std_security",
+            ).strip()
+
+        c7, c8 = st.columns(2)
+        with c7:
+            from_date = st.date_input(
+                "From date",
+                value=(local_now().date() - pd.Timedelta(days=365)),
+                key="hist_std_from",
+            )
+        with c8:
+            to_date = st.date_input(
+                "To date",
+                value=local_now().date(),
+                key="hist_std_to",
+            )
+
+        if st.button("⬇️ Build Contract Dataset", key="hist_std_download"):
+            if from_date >= to_date:
+                st.error("From date must be before To date.")
+                return
+
+            resolved = _resolve_standard_contract(
+                master,
+                exchange,
+                instrument,
+                script,
+                security_override,
+            )
+            if not resolved:
+                st.error(
+                    f"Could not resolve {script} as {instrument} on {exchange}. "
+                    "Try a valid script or enter its Dhan Security ID."
+                )
+                return
+
+            seg = {
+                ("NSE", "EQUITY"): "NSE_EQ",
+                ("NSE", "FUTSTK"): "NSE_FNO",
+                ("NSE", "FUTIDX"): "NSE_FNO",
+                ("NSE", "INDEX"): "IDX_I",
+                ("MCX", "FUTCOM"): "MCX_COMM",
+                ("MCX", "INDEX"): "MCX_COMM",
+            }.get((exchange, instrument))
+
+            if not seg:
+                st.error("This exchange/instrument combination is not supported by the downloader.")
+                return
+
+            cfg = {
+                "exchange_segment": seg,
+                "instrument": instrument,
+                "security_id": resolved["security_id"],
+                "script": script,
+                "timeframe": timeframe,
+                "include_oi": include_oi,
+                "expiry_code": 0,
+                "from_date": from_date,
+                "to_date": to_date,
+                "mode": mode,
+                "exchange": exchange,
+            }
+
+            with st.status("Downloading and combining contract history...", expanded=True) as status:
+                dataset, failures = _download_standard_dataset(cfg)
+                if dataset.empty:
+                    status.update(label="Download failed", state="error")
+                    st.error("No historical data returned. Check the contract, dates and access token.")
+                    if not failures.empty:
+                        st.dataframe(failures, use_container_width=True, hide_index=True)
+                    return
+                zip_path = _make_history_zip(dataset, failures, cfg)
+                status.update(label="Dataset ready", state="complete")
+
+            st.success(f"Dataset ready: {len(dataset):,} rows.")
+            if not failures.empty:
+                st.warning(f"{len(failures)} chunks failed. The ZIP contains failed_requests.csv.")
+
+            st.dataframe(
+                dataset.head(200),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.download_button(
+                "⬇️ Download Final Dataset ZIP",
+                data=zip_path.read_bytes(),
+                file_name=f"{script}_{instrument}_{timeframe}_history.zip",
+                mime="application/zip",
+                key="hist_std_final_download",
+            )
+
+
+
 if page == "Fresh Trades":
     render_fresh_trades_module()
 
@@ -5707,6 +6422,9 @@ elif page == "MCX Futures":
 
 elif page == "ALPHA PRO SELLER":
     render_alpha_pro_seller()
+
+elif page == "Historical Data Lab":
+    render_historical_data_lab()
 
 elif page == "Option Seller":
     st.markdown(

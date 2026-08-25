@@ -157,3 +157,26 @@ The ALPHA AI STRATEGIST / machine-learning module is intentionally NOT included.
 - Restored +16 / -16 highlighting and row/column separators.
 - Made Alpha Pro Seller P&F events self-contained (2% box, 3-box entry reversal, 4-box exit reversal).
 - Machine learning is excluded.
+
+
+## Historical Data Lab
+Dynamic historical data downloader.
+
+Expired Options mode:
+- Exchange: NSE / MCX
+- Script / underlying
+- WEEK / MONTH expiry
+- Near / Next / Far expiry code
+- ATM-relative strike range (up to ATM-10 to ATM+10 for index options)
+- 1/5/15/25/60 minute timeframe
+- CALL / PUT / BOTH
+- OHLC + OI + IV + Volume + Strike + Spot
+- Automatic 30-day request chunking
+- One consolidated ZIP containing the final CSV, metadata and failed-request log
+
+Standard Contract / Index / Future mode:
+- NSE / MCX
+- Equity / futures / index
+- Daily or 1/5/15/25/60 minute
+- Optional OI
+- Automatic historical chunking
