@@ -140,3 +140,13 @@ The previous 0.25%-only highlight rule has been removed.
 Added clear horizontal separators between stock rows and vertical separators
 between columns, including a stronger header divider. Perfect +16 / -16
 highlighting remains unchanged.
+
+
+## Final Build Scope
+Latest Matrix modifications included:
+- Custom box-size selection
+- Perfect +16 / -16 performance highlighting
+- Clear row/column separators
+- Clean client-facing Matrix display
+
+The ALPHA AI STRATEGIST / machine-learning module is intentionally NOT included.
