@@ -73,6 +73,9 @@ def init_state():
         "uploaded_vix_files": [],
         "prepared_training_data": None,
         "prepared_data_summary": {},
+        "quarterly_reports": {},
+        "friday_master_review": None,
+        "friday_vault_cache": {},
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
@@ -792,6 +795,324 @@ def restore_uploaded_files(key):
     ]
 
 
+
+def _quarter_key(ts):
+    ts = pd.Timestamp(ts)
+    return f"{ts.year} Q{ts.quarter}"
+
+
+def _build_quarterly_reports(feature):
+    reports = {}
+    if feature is None or feature.empty or "timestamp" not in feature.columns:
+        return reports
+
+    x = feature.copy()
+    x["timestamp"] = pd.to_datetime(x["timestamp"], errors="coerce")
+    x = x.dropna(subset=["timestamp"]).sort_values("timestamp")
+    x["quarter"] = x["timestamp"].map(_quarter_key)
+
+    for quarter, qdf in x.groupby("quarter", sort=True):
+        summary = {
+            "quarter": quarter,
+            "rows": len(qdf),
+            "start": str(qdf["timestamp"].min()),
+            "end": str(qdf["timestamp"].max()),
+            "nifty_return": (
+                float(qdf["nifty_spot"].iloc[-1] / qdf["nifty_spot"].iloc[0] - 1)
+                if "nifty_spot" in qdf.columns and len(qdf) > 1
+                and pd.notna(qdf["nifty_spot"].iloc[0])
+                and pd.notna(qdf["nifty_spot"].iloc[-1])
+                else np.nan
+            ),
+            "avg_atm_iv": float(qdf["atm_iv"].mean()) if "atm_iv" in qdf.columns else np.nan,
+            "avg_pcr_oi": float(qdf["pcr_oi"].mean()) if "pcr_oi" in qdf.columns else np.nan,
+            "avg_straddle": float(qdf["straddle"].mean()) if "straddle" in qdf.columns else np.nan,
+        }
+
+        daily = (
+            qdf.assign(date=qdf["timestamp"].dt.date)
+            .groupby("date", as_index=False)
+            .agg(
+                nifty_open=("nifty_spot", "first"),
+                nifty_close=("nifty_spot", "last"),
+                atm_iv_open=("atm_iv", "first"),
+                atm_iv_close=("atm_iv", "last"),
+                avg_pcr_oi=("pcr_oi", "mean"),
+                avg_straddle=("straddle", "mean"),
+            )
+        )
+        daily["nifty_change_pct"] = daily["nifty_close"] / daily["nifty_open"] - 1
+        daily["iv_change"] = daily["atm_iv_close"] - daily["atm_iv_open"]
+
+        reports[quarter] = {
+            "summary": pd.DataFrame([summary]),
+            "daily": daily,
+            "features": qdf.copy(),
+        }
+    return reports
+
+
+def _quarterly_report_zip(reports, selected=None):
+    if not reports:
+        return None
+
+    quarters = selected or sorted(reports.keys())
+    path = Path("/mnt/data/friday_quarterly_reports.zip")
+
+    master_rows = []
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for quarter in quarters:
+            if quarter not in reports:
+                continue
+            pack = reports[quarter]
+            safe = quarter.replace(" ", "_")
+            z.writestr(
+                f"{safe}/quarterly_summary.csv",
+                pack["summary"].to_csv(index=False).encode("utf-8"),
+            )
+            z.writestr(
+                f"{safe}/daily_analysis.csv",
+                pack["daily"].to_csv(index=False).encode("utf-8"),
+            )
+            z.writestr(
+                f"{safe}/decision_features.csv",
+                pack["features"].to_csv(index=False).encode("utf-8"),
+            )
+            master_rows.append(pack["summary"])
+
+        if master_rows:
+            z.writestr(
+                "MASTER_quarterly_summary.csv",
+                pd.concat(master_rows, ignore_index=True).to_csv(index=False).encode("utf-8"),
+            )
+
+        z.writestr(
+            "README.txt",
+            (
+                "Quarterly FRIDAY feature-analysis reports. "
+                "Strategy profitability is only included after strategy outcomes are generated.\n"
+            ).encode("utf-8"),
+        )
+    return path
+
+
+def _read_quarterly_zip_files(files):
+    rows = []
+    for zfile in files:
+        with zipfile.ZipFile(zfile) as z:
+            for name in z.namelist():
+                if name.endswith("/quarterly_summary.csv") or name == "MASTER_quarterly_summary.csv":
+                    with z.open(name) as fh:
+                        rows.append(pd.read_csv(fh))
+    if not rows:
+        raise ValueError("No quarterly_summary.csv found in uploaded ZIPs.")
+    return pd.concat(rows, ignore_index=True).drop_duplicates()
+
+
+def _resolve_basic_instrument(master, dataset):
+    if dataset == "NIFTY Spot":
+        return 13, "IDX_I", "INDEX"
+
+    if dataset == "India VIX":
+        for col in ["underlying_symbol", "symbol_name", "trading_symbol", "display_name"]:
+            if col not in master.columns:
+                continue
+            s = master[col].astype(str).str.upper().str.replace(" ", "", regex=False)
+            rows = master[s.str.contains("INDIAVIX", regex=False, na=False) | s.eq("VIX")]
+            ids = pd.to_numeric(rows["security_id"], errors="coerce").dropna()
+            if not ids.empty:
+                return int(ids.iloc[0]), "IDX_I", "INDEX"
+        return 26, "IDX_I", "INDEX"
+
+    x = master.copy()
+    x = x[x["exchange"].astype(str).str.upper().eq("NSE")]
+    x = x[x["instrument"].astype(str).str.upper().isin(["FUTIDX", "FUTSTK"])]
+    mask = pd.Series(False, index=x.index)
+    for col in ["underlying_symbol", "symbol_name", "trading_symbol", "display_name"]:
+        if col in x.columns:
+            s = x[col].astype(str).str.upper().str.strip()
+            mask |= s.eq("NIFTY") | s.str.startswith("NIFTY-", na=False)
+    x = x[mask].copy()
+    if x.empty:
+        return None
+    if "expiry_date" in x.columns:
+        x["expiry_date"] = pd.to_datetime(x["expiry_date"], errors="coerce")
+        x = x.sort_values("expiry_date", na_position="last")
+    row = x.iloc[0]
+    return int(pd.to_numeric(row["security_id"], errors="coerce")), "NSE_FNO", str(row.get("instrument", "FUTIDX"))
+
+
+def _download_quarter_dataset(security_id, exchange_segment, instrument, interval, year, quarter, include_oi=False):
+    period = pd.Period(f"{year}-Q{quarter}")
+    start = period.start_time
+    end = period.end_time
+    chunks = []
+    current = start
+
+    while current < end:
+        chunk_end = min(current + pd.Timedelta(days=89), end)
+        if interval == "Daily":
+            endpoint = "/charts/historical"
+            payload = {
+                "securityId": str(int(security_id)),
+                "exchangeSegment": exchange_segment,
+                "instrument": instrument,
+                "expiryCode": 0,
+                "oi": bool(include_oi),
+                "fromDate": current.strftime("%Y-%m-%d"),
+                "toDate": chunk_end.strftime("%Y-%m-%d"),
+            }
+        else:
+            endpoint = "/charts/intraday"
+            payload = {
+                "securityId": str(int(security_id)),
+                "exchangeSegment": exchange_segment,
+                "instrument": instrument,
+                "interval": str(int(interval)),
+                "oi": bool(include_oi),
+                "fromDate": current.strftime("%Y-%m-%d %H:%M:%S"),
+                "toDate": chunk_end.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+        body = api_post(endpoint, payload, f"{instrument} {year} Q{quarter} {interval}")
+        data = parse_data(body)
+
+        if isinstance(data, dict) and data.get("timestamp"):
+            dt = pd.to_datetime(
+                pd.to_numeric(pd.Series(data["timestamp"]), errors="coerce"),
+                unit="s", utc=True, errors="coerce"
+            ).dt.tz_convert("Asia/Kolkata")
+            part = pd.DataFrame({"timestamp": dt})
+            for src_col, dst_col in [
+                ("open","open"),("high","high"),("low","low"),
+                ("close","close"),("volume","volume"),
+                ("oi","oi"),("open_interest","oi")
+            ]:
+                vals = data.get(src_col)
+                if vals is not None and len(vals) == len(part):
+                    part[dst_col] = pd.to_numeric(pd.Series(vals), errors="coerce")
+            chunks.append(part)
+
+        current = chunk_end + pd.Timedelta(seconds=1)
+
+    if not chunks:
+        return pd.DataFrame()
+    return (
+        pd.concat(chunks, ignore_index=True)
+        .drop_duplicates("timestamp")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+
+def render_data_vault():
+    st.markdown(
+        """
+        <div class="friday-hero">
+          <div class="friday-title">DATA VAULT</div>
+          <div class="friday-sub">Quarter-wise NIFTY / Futures / India VIX OHLC downloader</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    master = load_master()
+    a,b,c = st.columns(3)
+    with a:
+        dataset = st.selectbox("Dataset", ["NIFTY Spot","NIFTY Futures","India VIX"], key="vault_dataset")
+    with b:
+        year = st.selectbox("Year", list(range(now_ist().year - 5, now_ist().year + 1)), key="vault_year")
+    with c:
+        quarter = st.selectbox("Quarter", [1,2,3,4], index=now_ist().quarter-1, key="vault_quarter")
+
+    if dataset == "NIFTY Futures":
+        timeframe_options = [15,1,5,25,60,"Daily"]
+        default_index = 0
+        include_oi = st.checkbox("Include OI", value=True, key="vault_oi")
+    elif dataset == "NIFTY Spot":
+        timeframe_options = [15,1,5,25,60,"Daily"]
+        default_index = 0
+        include_oi = False
+        st.caption("FRIDAY default: NIFTY Spot 15-minute OHLC.")
+    else:
+        timeframe_options = [15,1,5,25,60,"Daily"]
+        default_index = 0
+        include_oi = False
+        st.caption("FRIDAY default: India VIX can be downloaded at 15-minute or daily resolution.")
+
+    timeframe = st.selectbox(
+        "Timeframe",
+        timeframe_options,
+        index=default_index,
+        format_func=lambda x: "Daily" if x == "Daily" else f"{x}-minute",
+        key="vault_timeframe",
+    )
+
+    st.info(
+        "Dhan's current historical API supports 1/5/15/25/60-minute candles and 90-day "
+        "maximum intraday request windows, so each quarter is automatically split into safe chunks."
+    )
+
+    if st.button("⬇️ Download Quarter", use_container_width=True):
+        try:
+            resolved = _resolve_basic_instrument(master, dataset)
+            if not resolved:
+                st.error(f"Unable to resolve {dataset}.")
+                st.stop()
+
+            sid, segment, instrument = resolved
+            qdf = _download_quarter_dataset(
+                sid, segment, instrument, timeframe, year, quarter, include_oi
+            )
+
+            if qdf.empty:
+                st.error("No data returned for the requested quarter.")
+                return
+
+            qdf.insert(1, "dataset", dataset)
+            qdf.insert(2, "year", year)
+            qdf.insert(3, "quarter", quarter)
+
+            filename = f"{dataset.replace(' ','_')}_{year}_Q{quarter}_{timeframe}_OHLC.csv"
+            data_bytes = qdf.to_csv(index=False).encode("utf-8")
+
+            st.session_state.friday_vault_cache[
+                (dataset, year, quarter, str(timeframe))
+            ] = qdf
+
+            st.success(f"{len(qdf):,} rows downloaded.")
+            st.download_button(
+                "⬇️ Download Quarter CSV",
+                data=data_bytes,
+                file_name=filename,
+                mime="text/csv",
+                use_container_width=True,
+            )
+            st.dataframe(qdf.head(300), use_container_width=True, hide_index=True)
+        except Exception as exc:
+            st.error(str(exc))
+
+    if st.session_state.friday_vault_cache:
+        st.markdown("### Accumulated Quarter Downloads")
+        grouped = {}
+        for key, qdf in st.session_state.friday_vault_cache.items():
+            grouped.setdefault(key[0], []).append((key[1], key[2], key[3], qdf))
+
+        for ds, items in grouped.items():
+            buf = Path("/mnt/data") / f"FRIDAY_{ds.replace(' ','_')}_quarters.zip"
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for yr, q, tf, qdf in sorted(items):
+                    z.writestr(
+                        f"{ds.replace(' ','_')}_{yr}_Q{q}_{tf}_OHLC.csv",
+                        qdf.to_csv(index=False).encode("utf-8")
+                    )
+            st.download_button(
+                f"⬇️ Download {ds} accumulated quarters",
+                data=buf.read_bytes(),
+                file_name=buf.name,
+                mime="application/zip",
+                key=f"vault_{ds}",
+            )
 def prepare_uploaded_feature_base():
     option_files = restore_uploaded_files("uploaded_option_files")
     future_files = restore_uploaded_files("uploaded_future_files")
@@ -1069,12 +1390,44 @@ with st.sidebar:
                     hide_index=True,
                 )
 
+
+    reports = st.session_state.get("quarterly_reports", {})
+    if reports:
+        st.markdown("### Quarterly Reports")
+        quarters = sorted(reports.keys())
+        selected = st.multiselect(
+            "Select quarters",
+            quarters,
+            default=quarters,
+            key="friday_report_quarters",
+        )
+        selected_zip = _quarterly_report_zip(reports, selected)
+        if selected_zip:
+            st.download_button(
+                "⬇️ Download Selected Quarterly Reports",
+                data=selected_zip.read_bytes(),
+                file_name="FRIDAY_selected_quarterly_reports.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+        all_zip = _quarterly_report_zip(reports, quarters)
+        if all_zip:
+            st.download_button(
+                "⬇️ Download ALL Quarterly Reports",
+                data=all_zip.read_bytes(),
+                file_name="FRIDAY_all_quarterly_reports.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+
     if st.button("🔧 Prepare FRIDAY Dataset", use_container_width=True):
         try:
             with st.spinner("Reading, aligning and merging all uploaded years..."):
                 feature = prepare_uploaded_feature_base()
+            st.session_state.quarterly_reports = _build_quarterly_reports(feature)
             st.success(
-                f"Dataset prepared: {len(feature):,} synchronized decision rows."
+                f"Dataset prepared: {len(feature):,} synchronized decision rows "
+                f"across {len(st.session_state.quarterly_reports)} quarter(s)."
             )
         except Exception as exc:
             st.error(str(exc))
@@ -1089,6 +1442,36 @@ with st.sidebar:
             "target_strategy / strategy / label. FRIDAY will train on it."
         ),
     )
+
+
+    st.markdown("### Final Master Review")
+    master_zip_uploads = st.file_uploader(
+        "Upload quarterly report ZIPs later",
+        type=["zip"],
+        accept_multiple_files=True,
+        key="friday_master_zip_uploads",
+    )
+    if master_zip_uploads and st.button("📊 Build Master 3-Year Review", use_container_width=True):
+        try:
+            master_df = _read_quarterly_zip_files(master_zip_uploads)
+            st.session_state.friday_master_review = master_df
+            st.success(f"Master review built from {len(master_df):,} quarterly summaries.")
+        except Exception as exc:
+            st.error(str(exc))
+
+    if st.session_state.friday_master_review is not None:
+        st.dataframe(
+            st.session_state.friday_master_review,
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            "⬇️ Download Master 3-Year Review CSV",
+            data=st.session_state.friday_master_review.to_csv(index=False).encode("utf-8"),
+            file_name="FRIDAY_master_3_year_review.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
     if st.button("🧠 Train / Refresh Model", use_container_width=True):
         if RandomForestClassifier is None:
@@ -1114,6 +1497,18 @@ with st.sidebar:
         "FRIDAY follows the controlled AI strategy-selection design: "
         "market regime → strategy ranking → confidence → NO TRADE when appropriate."
     )
+
+
+friday_view = st.radio(
+    "FRIDAY MODULE",
+    ["AI Strategist", "Data Vault"],
+    horizontal=True,
+    key="friday_view",
+)
+
+if friday_view == "Data Vault":
+    render_data_vault()
+    st.stop()
 
 st.markdown(
     """
