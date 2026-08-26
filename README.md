@@ -1,182 +1,51 @@
-# ALPHA ANALYZER V11 — CLEAN TRADE LEDGER
+# JARVIS — Option Seller Environment
 
-Changes from the working V10 base:
-- One Fresh Trade per Symbol + Module + Mode + Date.
-- Existing duplicate ledger rows are automatically collapsed.
-- Active duplicate rows are preferred over stale duplicate rows.
-- Entry Time is immutable and shown as the first column.
-- Legacy rows use First Logged/Open date only when available; otherwise the UI
-  explicitly shows TIME UNAVAILABLE (LEGACY) rather than inventing a time.
-- Simplified visible Fresh Trades and Trade Logs columns.
-- CSV downloads retain the full detailed ledger.
-- Dynamic SL logic and trading strategy are otherwise preserved.
+Dedicated volatility-environment dashboard using the same Dhan API source and instrument-master source as ALPHA ANALYZER.
 
+## Scope
+JARVIS is NOT a trade execution engine and does not use Momentum, Positional, Matrix, ALPHA PRO SELLER, Historical Data Lab, or ML logic.
 
-## Deployment
-Upload `app.py`, `requirements.txt`, and `alpha_analyzer_logo.png` to Streamlit.
-`README.md` is optional.
+## Core inputs
+1. India VIX
+2. NIFTY ATM CE IV
+3. NIFTY ATM PE IV
+4. ATM average IV
+5. Last 30 completed trading sessions of ATM IV open/close/change
+6. India VIX close-only P&F state
 
+## VIX settings
+Default:
+- Timeframe: Day
+- Box size: 0.25%
+- Reversal: 3 boxes
+- Close only
 
-## Entry Time rule
-Fresh Trade `Entry Time` uses Dhan market-data `last_trade_time` (LTT) from
-the quote feed when the signal is first detected. The dashboard refresh time
-is not used as the primary timestamp. NSE fresh entries are restricted to
-09:15–15:40 IST.
+The user can change VIX timeframe, box size and reversal, then the state and chart recalculate.
 
+## 30-session IV baseline
+The dashboard automatically fetches enough rolling-option history to obtain the last 30 completed sessions. Today's session is excluded from the historical baseline.
 
-## V17 Trade Report Fix
-- Canonicalizes old trade reports before display/download.
-- Exactly one trade per symbol per day.
-- Removes invalid NSE rows outside 09:15–15:40.
-- Entry Time never falls back to dashboard refresh time.
-- Client-facing Trade Logs remain: Entry Time, Symbol, Mode, Direction,
-  Trade Price, Initial SL, Dynamic SL, Status.
+For every historical session:
+IV Change = Close IV - Open IV
 
+The dashboard calculates:
+- 30-session average IV change
+- Standard deviation
+- Today's difference from average
+- Z-score
+- Expansion / contraction state
 
-## V18 Entry Price / LTP
-- `Trade Price` is the immutable actual entry price captured at signal detection.
-- `LTP` is the latest live market price and updates as the dashboard refreshes.
-- NSE/MCX quote `last_price` is preferred over cached batch LTP when available.
-- Client-facing Fresh Trades and Trade Logs show both Entry Price and LTP.
+## Environment interpretation
+FAVOURABLE:
+VIX active sell + ATM IV contracting/stable
 
+CAUTION:
+Mixed conditions or VIX active sell with IV expansion
 
-## V19 Trade-logging safety
-- A Fresh Trade is created only if Dhan exchange timestamp is valid.
-- NSE entries are strictly 09:15–15:40 IST.
-- A complete trade must have a valid Initial SL.
-- Entry Price is captured once from live quote price.
-- LTP is stored separately and updates with the live market.
-- Missing exchange time/SL will prevent the trade from being logged rather than
-  creating a false trade.
-- One symbol/day remains the hard duplicate key.
+NOT FAVOURABLE:
+VIX active long with IV expansion/non-contracting conditions
 
-## Manual upload
-Upload/replace `app.py` and `requirements.txt`. Keep the existing `alpha_analyzer_logo.png` if already present. `README.md` is optional.
+## Data source
+DhanHQ v2 API and Dhan instrument master, using the same API source architecture as the existing Alpha Analyzer.
 
-
-## Positional Table Entry Date/Time
-The NSE Positional LONG/SHORT tables now include `Entry Date/Time`.
-This value is taken from the original immutable trade record created when the
-trade was triggered, not from the current dashboard refresh.
-
-
-## UI Label
-The main NSE `Intraday` module is displayed as **Momentum**.
-Internally, it still runs with `mode="Intraday"` so the existing signal logic,
-market-hours rules, trade logging, and dynamic SL logic are unchanged.
-
-
-## Final Positional Table
-The NSE Positional LONG/SHORT table does not display Entry Date/Time.
-Entry Time remains available in Fresh Trades and Trade Logs.
-
-
-## KeyError Fix
-Removed the stale `Entry Date/Time` column reference from the NSE Positional
-LONG/SHORT display. The Positional table is now exactly:
-Script, LTP, Bias, Entry, SL, Recommendation.
-
-
-## Momentum Sticky Trade State
-A logged Momentum trade stays visible in the active LONG/SHORT table until an
-actual exit is recorded. A temporary loss of the live signal does not hide or
-create a replacement trade. Duplicate prevention remains one symbol per day.
-
-
-## Option Seller UI
-Detailed IV/OI/chain/diagnostic calculations are backend-only. The client sees only the decision, ATM, premium, mode, active status, entry/current premium, P&L and concise risk status.
-
-
-## ALPHA PRO SELLER
-Separate NIFTY intraday theta-decay strategy module.
-
-Rules:
-- Freeze NIFTY ATM using the 09:16 index price for the whole day.
-- Freeze the exact ATM CE + PE contracts.
-- Build the synthetic straddle from 1-minute option closes.
-- 2% P&F box size, 3-box reversal.
-- Fresh X-to-O reversal = SELL ATM straddle.
-- Structural SL = preceding X-column high.
-- Maximum 2 trades per day.
-- 4-box X reversal or structural SL = exit.
-- 15:05 IST = mandatory hard exit.
-
-The existing general Option Seller module remains separate.
-
-
-## P&F Fusion Matrix
-The existing Matrix has been upgraded using the source-inspired scoring concept:
-- Performance score: DTB +2, DTB retracement +1, DBS -2, DBS retracement -1, otherwise 0.
-- Ranking score: current active P&F column box magnitude; X positive, O negative.
-- Separate Price and Relative Strength scores.
-- Total Performance/Ranking = Price + RS.
-- Net Performance/Ranking = RS - Price.
-- User can rank any numeric column High → Low or Low → High.
-- Detailed per-box scores are available in an expander.
-
-
-## Display Cleanup
-Core P&F calculations remain in the backend, but the client-facing Matrix no
-longer displays "P&F" terminology or the detailed per-box score expander.
-
-
-## Matrix Enhancements
-- Four box sizes are user-configurable from the Matrix screen.
-- Default values remain 3%, 2%, 1%, 0.25%.
-- The latest 0.25% price-chart DTB with a perfect +2 score is highlighted green.
-- The latest 0.25% price-chart DBS with a perfect -2 score is highlighted red.
-- Core calculations remain backend-driven.
-
-
-## Perfect Score Highlight
-Rows are highlighted ONLY when `Total Performance` is exactly:
-- +16 = perfect bullish score across all four configured box sizes
-- -16 = perfect bearish score across all four configured box sizes
-
-The previous 0.25%-only highlight rule has been removed.
-
-
-## Matrix Display Cleanup
-Added clear horizontal separators between stock rows and vertical separators
-between columns, including a stronger header divider. Perfect +16 / -16
-highlighting remains unchanged.
-
-
-## Final Build Scope
-Latest Matrix modifications included:
-- Custom box-size selection
-- Perfect +16 / -16 performance highlighting
-- Clear row/column separators
-- Clean client-facing Matrix display
-
-The ALPHA AI STRATEGIST / machine-learning module is intentionally NOT included.
-
-
-## V3 Runtime Fixes
-- Removed all stale RS Matrix `_0.25 Signal` / `_0.25 Perfect` references.
-- Restored +16 / -16 highlighting and row/column separators.
-- Made Alpha Pro Seller P&F events self-contained (2% box, 3-box entry reversal, 4-box exit reversal).
-- Machine learning is excluded.
-
-
-## Historical Data Lab
-Dynamic historical data downloader.
-
-Expired Options mode:
-- Exchange: NSE / MCX
-- Script / underlying
-- WEEK / MONTH expiry
-- Near / Next / Far expiry code
-- ATM-relative strike range (up to ATM-10 to ATM+10 for index options)
-- 1/5/15/25/60 minute timeframe
-- CALL / PUT / BOTH
-- OHLC + OI + IV + Volume + Strike + Spot
-- Automatic 30-day request chunking
-- One consolidated ZIP containing the final CSV, metadata and failed-request log
-
-Standard Contract / Index / Future mode:
-- NSE / MCX
-- Equity / futures / index
-- Daily or 1/5/15/25/60 minute
-- Optional OI
-- Automatic historical chunking
+The rolling expired-option endpoint supports minute-level data, IV, OI, volume, strike and spot, and historical windows of up to 30 days per request; JARVIS combines chunks automatically. Dhan documents up to five years of rolling expired-option history.

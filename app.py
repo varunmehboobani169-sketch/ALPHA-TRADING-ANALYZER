@@ -1,456 +1,57 @@
 
-import os
+import math
 from datetime import datetime, timedelta
 from pathlib import Path
-
+import requests
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 from zoneinfo import ZoneInfo
 
-st.set_page_config(page_title="ALPHA ANALYZER V9", page_icon="α", layout="wide")
+try:
+    import plotly.graph_objects as go
+except Exception:
+    go = None
+
+st.set_page_config(
+    page_title="JARVIS • Option Seller Environment",
+    page_icon="🤖",
+    layout="wide",
+)
 
 API = "https://api.dhan.co/v2"
 LOCAL_TZ = ZoneInfo("Asia/Kolkata")
+NIFTY_ID = 13
+INDIA_VIX_ID = 26
 
+VIX_ALLOWED_TIMEFRAMES = {
+    "Day": {"mode": "daily", "interval": None},
+    "1 Min": {"mode": "intraday", "interval": 1},
+    "5 Min": {"mode": "intraday", "interval": 5},
+    "15 Min": {"mode": "intraday", "interval": 15},
+    "60 Min": {"mode": "intraday", "interval": 60},
+}
 
-def _trade_entry_window(module_name, mode):
-    """Return allowed NEW-entry and forced-exit windows in IST."""
-    now = local_now().time()
-    if module_name == "NSE":
-        return (
-            datetime.strptime("09:15", "%H:%M").time(),
-            datetime.strptime("15:40", "%H:%M").time(),
-        )
-    if module_name == "MCX":
-        return (
-            datetime.strptime("09:00", "%H:%M").time(),
-            datetime.strptime("23:30", "%H:%M").time(),
-        )
-    return (
-        datetime.strptime("00:00", "%H:%M").time(),
-        datetime.strptime("23:59", "%H:%M").time(),
-    )
-
-
-def _trade_entry_allowed(module_name, mode):
-    """
-    Strict NEW-TRADE gate.
-    NSE Intraday: 09:15 through 15:40.
-    NSE Positional: 09:15 through 15:40 for a fresh signal as well.
-    MCX: its normal live window.
-    """
-    now = local_now().time()
-
-    if module_name == "NSE":
-        start = datetime.strptime("09:15", "%H:%M").time()
-        end = datetime.strptime("15:40", "%H:%M").time()
-        return start <= now <= end
-
-    if module_name == "MCX":
-        start = datetime.strptime("09:00", "%H:%M").time()
-        end = datetime.strptime("23:30", "%H:%M").time()
-        return start <= now <= end
-
-    return True
+DEFAULT_BOX = 0.25
+DEFAULT_REVERSAL = 3
+HISTORY_SESSIONS = 30
+HISTORY_CALENDAR_DAYS = 60
+INTRADAY_CHUNK_DAYS = 90
 
 
 def local_now():
-    """Application display time: India Standard Time (IST)."""
     return datetime.now(LOCAL_TZ)
 
 
-# -----------------------------
-# Session credentials
-# -----------------------------
-if "client_id" not in st.session_state:
-    st.session_state.client_id = ""
-if "access_token" not in st.session_state:
-    st.session_state.access_token = ""
-if "api_log" not in st.session_state:
-    st.session_state.api_log = []
-
-# Per-session trade book. It survives Streamlit reruns and is downloadable.
-if "trade_book" not in st.session_state:
-    st.session_state.trade_book = {}
-
-if "trade_sequence" not in st.session_state:
-    st.session_state.trade_sequence = 0
-if "fresh_trade_log" not in st.session_state:
-    st.session_state.fresh_trade_log = []
-if "fresh_trade_loaded_date" not in st.session_state:
-    st.session_state.fresh_trade_loaded_date = None
-
-with st.sidebar:
-    st.markdown(
-        """
-        <div class="a-brand">
-            <div class="a-mark">A</div>
-            <div>
-                <div class="a-brand-name">ALPHA ANALYZER</div>
-                <div class="a-brand-sub">Professional Market Dashboard</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown('<div class="a-side-head">Account</div>', unsafe_allow_html=True)
-    st.session_state.client_id = st.text_input(
-        "User Name",
-        value=st.session_state.client_id,
-    ).strip()
-    st.session_state.access_token = st.text_input(
-        "Password",
-        value=st.session_state.access_token,
-        type="password",
-    ).strip()
-    auto = st.checkbox("Auto Refresh", True)
-    page = st.radio(
-        "Module",
-        [
-            "Market Overview",
-            "Fresh Trades",
-            "Trade Logs",
-            "Option Seller",
-            "ALPHA PRO SELLER",
-            "Historical Data Lab",
-            "Momentum",
-            "Positional",
-            "MCX Futures",
-            "Sector Analysis",
-            "RS Matrix",
-        ],
-    )
-
-
-# -----------------------------
-# Client UI Theme
-# -----------------------------
-st.markdown(
-    """
-    <div class="alpha-statusbar">
-        <span class="alpha-live-dot"></span>
-        <span>ALPHA ANALYZER</span>
-        <span class="alpha-divider">•</span>
-        <span class="alpha-status-text">LIVE MARKET DASHBOARD</span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-
-# -----------------------------
-# ALPHA ANALYZER — REFERENCE DASHBOARD UI
-# -----------------------------
-st.markdown(
-    """
-    <style>
-    :root{
-        --bg:#070d16;
-        --panel:#0c1522;
-        --line:rgba(255,255,255,.075);
-        --text:#f4f7fb;
-        --muted:#7f8ca0;
-        --green:#22d77c;
-        --red:#ff5364;
-        --yellow:#f3c95c;
-        --blue:#3d8dff;
-    }
-
-    .stApp{
-        background:
-            radial-gradient(circle at 82% -5%, rgba(40,105,194,.15), transparent 27%),
-            linear-gradient(180deg,#060b14 0%,#07101a 100%);
-    }
-
-    .block-container{
-        max-width:1580px;
-        padding-top:1rem;
-        padding-left:.9rem;
-        padding-right:.9rem;
-        padding-bottom:2rem;
-    }
-
-    section[data-testid="stSidebar"]{
-        background:linear-gradient(180deg,#09111c 0%,#060c15 100%);
-        border-right:1px solid var(--line);
-    }
-
-    section[data-testid="stSidebar"] .block-container{
-        padding:.75rem .70rem 1rem .70rem;
-    }
-
-    .a-brand{
-        display:flex;
-        align-items:center;
-        gap:10px;
-        margin:3px 3px 11px;
-    }
-
-    .a-mark{
-        width:38px;
-        height:38px;
-        border-radius:10px;
-        display:flex;
-        align-items:center;
-        justify-content:center;
-        background:linear-gradient(145deg,#1f7ef0,#7188ff);
-        color:#fff;
-        font-size:18px;
-        font-weight:900;
-        box-shadow:0 8px 22px rgba(31,126,240,.25);
-    }
-
-    .a-brand-name{
-        font-size:1.03rem;
-        font-weight:900;
-        letter-spacing:.03em;
-    }
-
-    .a-brand-sub{
-        font-size:.62rem;
-        color:var(--muted);
-        margin-top:2px;
-    }
-
-    .a-side-head{
-        margin:12px 3px 6px;
-        color:var(--muted);
-        font-size:.60rem;
-        font-weight:800;
-        letter-spacing:.10em;
-        text-transform:uppercase;
-    }
-
-    .a-account{
-        border:1px solid var(--line);
-        border-radius:11px;
-        padding:9px 10px;
-        margin-bottom:8px;
-        background:rgba(255,255,255,.018);
-    }
-
-    .a-account-label{
-        color:var(--muted);
-        font-size:.60rem;
-        letter-spacing:.07em;
-        text-transform:uppercase;
-    }
-
-    .a-account-value{
-        font-weight:800;
-        font-size:.84rem;
-        margin-top:2px;
-    }
-
-    .a-topbar{
-        display:flex;
-        justify-content:space-between;
-        align-items:center;
-        padding:8px 12px;
-        margin-bottom:11px;
-        border:1px solid var(--line);
-        border-radius:11px;
-        background:rgba(255,255,255,.016);
-    }
-
-    .a-top-left{
-        display:flex;
-        align-items:center;
-        gap:8px;
-        font-size:.73rem;
-        font-weight:820;
-        letter-spacing:.04em;
-    }
-
-    .a-live-dot{
-        width:7px;
-        height:7px;
-        border-radius:50%;
-        background:var(--green);
-        box-shadow:0 0 12px rgba(34,215,124,.65);
-    }
-
-    .a-top-time{
-        color:var(--muted);
-        font-size:.66rem;
-    }
-
-    .alpha-hero{
-        border:1px solid var(--line);
-        border-radius:17px;
-        padding:16px 18px;
-        margin-bottom:13px;
-        background:
-            linear-gradient(135deg,rgba(42,112,205,.11),rgba(255,255,255,.014)),
-            var(--panel);
-        box-shadow:0 12px 32px rgba(0,0,0,.15);
-    }
-
-    .alpha-hero-title{
-        font-size:1.55rem;
-        font-weight:900;
-        letter-spacing:-.03em;
-        line-height:1.05;
-    }
-
-    .alpha-hero-sub{
-        margin-top:4px;
-        color:var(--muted);
-        font-size:.75rem;
-    }
-
-    .alpha-badge{
-        display:inline-block;
-        margin-top:9px;
-        padding:4px 8px;
-        border-radius:999px;
-        font-size:.60rem;
-        font-weight:850;
-        letter-spacing:.06em;
-        color:#8df1bc;
-        border:1px solid rgba(34,215,124,.17);
-        background:rgba(34,215,124,.07);
-    }
-
-    .alpha-kpi{
-        border:1px solid var(--line);
-        border-radius:12px;
-        padding:11px 12px;
-        background:linear-gradient(145deg,rgba(255,255,255,.032),rgba(255,255,255,.012));
-    }
-
-    .alpha-section{
-        display:flex;
-        align-items:center;
-        gap:8px;
-        margin:15px 0 8px;
-        font-size:1rem;
-        font-weight:880;
-    }
-
-    .alpha-section-dot{
-        width:10px;
-        height:10px;
-        border-radius:50%;
-    }
-
-    .alpha-alert{
-        border:1px solid var(--line);
-        border-radius:10px;
-        padding:8px 9px;
-        margin-bottom:6px;
-        background:rgba(255,255,255,.017);
-    }
-
-    .alpha-alert-time{
-        font-size:.58rem;
-        color:var(--muted);
-    }
-
-    .alpha-alert-symbol{
-        margin-top:2px;
-        font-size:.76rem;
-        font-weight:850;
-    }
-
-    .alpha-alert-meta{
-        margin-top:2px;
-        font-size:.59rem;
-        color:var(--muted);
-    }
-
-    div[data-testid="stDataFrame"]{
-        border:1px solid var(--line);
-        border-radius:13px;
-        overflow:hidden;
-        box-shadow:0 10px 24px rgba(0,0,0,.11);
-    }
-
-    div[data-testid="stMetric"]{
-        border:1px solid var(--line);
-        border-radius:12px;
-        background:rgba(255,255,255,.02);
-    }
-
-    .stButton > button,
-    .stDownloadButton > button{
-        min-height:2.3rem;
-        border-radius:9px;
-        font-weight:800;
-        border:1px solid rgba(255,255,255,.07);
-    }
-
-    .stButton > button{
-        background:linear-gradient(135deg,#2f89ff,#4f67db);
-        box-shadow:0 7px 18px rgba(47,137,255,.14);
-    }
-
-    .stDownloadButton > button{
-        background:#101b2b;
-    }
-
-    div[data-baseweb="input"] > div,
-    div[data-baseweb="select"] > div{
-        border-radius:9px !important;
-        background:rgba(255,255,255,.018) !important;
-        border-color:var(--line) !important;
-    }
-
-    div[data-testid="stAlert"],
-    div[data-testid="stExpander"]{
-        border-radius:11px;
-    }
-
-    div[data-testid="stExpander"]{
-        border:1px solid var(--line);
-        background:rgba(255,255,255,.014);
-    }
-
-    hr{border-color:var(--line);}
-
-    .market-dashboard-hero{display:flex;justify-content:space-between;align-items:center;border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:15px 18px;margin-bottom:13px;background:linear-gradient(135deg,rgba(40,105,194,.10),rgba(255,255,255,.018));}
-    .market-dashboard-title{font-size:1.45rem;font-weight:950;letter-spacing:-.03em;}
-    .market-dashboard-sub{font-size:.70rem;color:#f3c95c;font-weight:800;margin-top:3px;}
-    .market-dashboard-live{text-align:right;color:#22d77c;font-size:.70rem;font-weight:900;line-height:1.6;}
-    .market-dashboard-live span{color:#7f8ca0;font-weight:600;font-size:.60rem;}
-    .market-dashboard-card{border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:12px;background:linear-gradient(145deg,rgba(255,255,255,.045),rgba(255,255,255,.012));min-height:96px;}
-    .market-dashboard-card .name{font-size:.67rem;color:#7f8ca0;font-weight:850;}
-    .market-dashboard-card .bias{font-size:1.08rem;font-weight:950;margin-top:7px;}
-    .market-dashboard-card .sub{font-size:.61rem;color:#7f8ca0;margin-top:4px;}
-
-    @media(max-width:900px){
-        .a-top-time{display:none;}
-        .alpha-hero-title{font-size:1.35rem;}
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    f"""
-    <div class="a-topbar">
-        <div class="a-top-left">
-            <span class="a-live-dot"></span>
-            <span>ALPHA ANALYZER</span>
-            <span style="opacity:.30;">•</span>
-            <span style="color:#7f8ca0;font-weight:650;">LIVE MARKET DASHBOARD</span>
-        </div>
-        <div class="a-top-time">
-            {local_now().strftime("%d-%b-%Y %H:%M:%S IST")}
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+def ensure_state():
+    st.session_state.setdefault("client_id", "")
+    st.session_state.setdefault("access_token", "")
+    st.session_state.setdefault("api_log", [])
 
 
 def headers():
     if not st.session_state.client_id or not st.session_state.access_token:
-        raise RuntimeError("Enter your login credentials.")
+        raise RuntimeError("Enter your Dhan Client ID and Access Token.")
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -458,38 +59,46 @@ def headers():
         "client-id": st.session_state.client_id,
     }
 
+
 def api_post(path, payload, label):
-    r = requests.post(API + path, headers=headers(), json=payload, timeout=30)
-    try:
-        body = r.json()
-    except Exception:
-        body = {"raw": r.text}
-    st.session_state.api_log.append(
-        {
-            "time": local_now().strftime("%H:%M:%S IST"),
-            "label": label,
-            "endpoint": path,
-            "status": r.status_code,
-        }
+    response = requests.post(
+        API + path,
+        headers=headers(),
+        json=payload,
+        timeout=45,
     )
-    if not r.ok:
-        raise RuntimeError(
-            f"{label}: HTTP {r.status_code}: "
-            f"{body.get('remarks') or body.get('message') or str(body)[:400]}"
+    try:
+        body = response.json()
+    except Exception:
+        body = {"raw": response.text}
+
+    st.session_state.api_log.append({
+        "time": local_now().strftime("%H:%M:%S IST"),
+        "label": label,
+        "endpoint": path,
+        "status": response.status_code,
+    })
+
+    if not response.ok:
+        msg = (
+            body.get("remarks")
+            or body.get("message")
+            or body.get("error")
+            or str(body)[:500]
         )
+        raise RuntimeError(f"{label}: HTTP {response.status_code}: {msg}")
+
     return body
+
 
 def parse_data(body):
     if isinstance(body, dict) and isinstance(body.get("data"), dict):
         return body["data"]
     return body if isinstance(body, dict) else {}
 
-# -----------------------------
-# Instrument master
-# -----------------------------
+
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_master():
-    # Detailed instrument master: direct underlying-security mapping where available.
     url = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
     df = pd.read_csv(url, low_memory=False)
     df.columns = [str(c).strip() for c in df.columns]
@@ -509,6348 +118,851 @@ def load_master():
     }
     df = df.rename(columns={c: rename.get(c, c) for c in df.columns})
 
-    # Handle column variants.
     if "security_id" not in df.columns:
-        for c in ["SM_SECURITY_ID", "SEM_SECURITY_ID"]:
-            if c in df.columns:
-                df["security_id"] = df[c]
+        for col in ["SM_SECURITY_ID", "SEM_SECURITY_ID"]:
+            if col in df.columns:
+                df["security_id"] = df[col]
                 break
 
     df["security_id"] = pd.to_numeric(df["security_id"], errors="coerce")
-    if "underlying_security_id" in df.columns:
-        df["underlying_security_id"] = pd.to_numeric(
-            df["underlying_security_id"], errors="coerce"
-        )
-
-    for c in ["exchange", "segment", "instrument", "trading_symbol",
-              "underlying_symbol", "symbol_name", "display_name"]:
-        if c in df.columns:
-            df[c] = df[c].astype(str).str.upper().str.strip()
-
+    for col in ["exchange", "segment", "instrument", "trading_symbol",
+                "underlying_symbol", "symbol_name", "display_name"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.upper().str.strip()
     if "expiry_date" in df.columns:
         df["expiry_date"] = pd.to_datetime(df["expiry_date"], errors="coerce")
 
-    # Remove test symbols.
-    bad = pd.Series(False, index=df.index)
-    for c in ["trading_symbol", "underlying_symbol", "symbol_name", "display_name"]:
-        if c in df.columns:
-            bad |= df[c].str.contains("NSETEST", na=False)
-    return df.loc[~bad].copy()
-
-def future_universe(master, exchange="NSE"):
-    """
-    Return ONE nearest active futures contract per underlying.
-    2nd/3rd expiries are never scanned.
-
-    NSE:
-      exchange=NSE, instrument=FUTSTK
-    MCX:
-      exchange=MCX, instrument=FUTCOM
-
-    If expiry is unavailable, we keep one contract per underlying in
-    deterministic instrument-master order rather than crashing.
-    """
-    if exchange == "NSE":
-        x = master[
-            (master["exchange"] == "NSE") &
-            (master["instrument"] == "FUTSTK")
-        ].copy()
-    else:
-        x = master[
-            (master["exchange"] == "MCX") &
-            (master["instrument"] == "FUTCOM")
-        ].copy()
-
-    if x.empty:
-        return x
-
-    # Ensure required fields.
-    x = x.dropna(subset=["security_id"]).copy()
-
-    if "expiry_date" in x.columns:
-        x["expiry_date"] = pd.to_datetime(x["expiry_date"], errors="coerce")
-    else:
-        x["expiry_date"] = pd.NaT
-
-    # Only remove contracts that are definitely expired.
-    now = pd.Timestamp.now()
-    if x["expiry_date"].notna().any():
-        x = x[x["expiry_date"].isna() | (x["expiry_date"] >= now)].copy()
-
-    # Build underlying symbol if missing.
-    if "underlying_symbol" not in x.columns:
-        if "trading_symbol" in x.columns:
-            x["underlying_symbol"] = (
-                x["trading_symbol"].astype(str)
-                .str.split("-", n=1)
-                .str[0]
-                .str.upper()
-                .str.strip()
-            )
-        else:
-            return pd.DataFrame()
-
-    x["underlying_symbol"] = (
-        x["underlying_symbol"].astype(str).str.upper().str.strip()
-    )
-    x = x[~x["underlying_symbol"].isin(["", "NAN", "NONE"])].copy()
-
-    # Sort by expiry first so the first row for each symbol is the nearest contract.
-    # Stable fallback by security_id prevents random selection if expiry is missing.
-    x = x.sort_values(
-        ["underlying_symbol", "expiry_date", "security_id"],
-        ascending=[True, True, True],
-        na_position="last",
-    )
-
-    # ONLY the first/nearest active contract per underlying.
-    x = x.drop_duplicates(subset=["underlying_symbol"], keep="first").reset_index(drop=True)
-
-    return x
-
-# -----------------------------
-# Live LTP
-# -----------------------------
-
-@st.cache_data(ttl=5, show_spinner=False)
-def batch_quote(segment, ids):
-    body = api_post(
-        "/marketfeed/quote",
-        {segment: [int(x) for x in ids]},
-        f"{segment} Quote",
-    )
-    data = parse_data(body).get(segment, {})
-    out = {}
-    for k, v in data.items():
-        if not isinstance(v, dict):
-            continue
-        price = pd.to_numeric(v.get("last_price"), errors="coerce")
-        ltt = pd.to_numeric(v.get("last_trade_time"), errors="coerce")
-        out[int(k)] = {
-            "last_price": float(price) if pd.notna(price) else np.nan,
-            "last_trade_time": float(ltt) if pd.notna(ltt) else np.nan,
-        }
-    return out
-
-
-def exchange_time_from_ltt(ltt):
-    """Convert Dhan Last Trade Time (epoch seconds) to IST."""
-    if pd.isna(ltt):
-        return None
-    try:
-        return datetime.fromtimestamp(float(ltt), tz=LOCAL_TZ).strftime(
-            "%d-%b-%Y %H:%M:%S IST"
-        )
-    except Exception:
-        return None
+    return df.dropna(subset=["security_id"]).copy()
 
 
 @st.cache_data(ttl=5, show_spinner=False)
-def batch_ltp(segment, ids):
+def live_vix():
     body = api_post(
         "/marketfeed/ltp",
-        {segment: [int(x) for x in ids]},
-        f"{segment} LTP",
+        {"IDX_I": [INDIA_VIX_ID]},
+        "India VIX LTP",
     )
-    data = parse_data(body).get(segment, {})
-    return {
-        int(k): float(v.get("last_price"))
-        for k, v in data.items()
-        if isinstance(v, dict) and v.get("last_price") is not None
-    }
-
-# -----------------------------
-# Historical cash data
-# -----------------------------
-def historical(sec_id, segment, instrument, mode):
-    if mode == "Positional":
-        payload = {
-            "securityId": str(int(sec_id)),
-            "exchangeSegment": segment,
-            "instrument": instrument,
-            "expiryCode": 0,
-            "oi": False,
-            "fromDate": str(datetime.now().date() - timedelta(days=220)),
-            "toDate": str(datetime.now().date() + timedelta(days=1)),
-        }
-
-        # Dhan uses IDX_I + INDEX for indices. Some Data API deployments
-        # also validate the daily timeframe explicitly.
-        if segment == "IDX_I" and instrument == "INDEX":
-            payload["timeframe"] = "1D"
-        body = api_post("/charts/historical", payload, "daily history")
-    else:
-        payload = {
-            "securityId": str(int(sec_id)),
-            "exchangeSegment": segment,
-            "instrument": instrument,
-            "interval": "1",
-            "oi": False,
-            "fromDate": (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S"),
-            "toDate": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        body = api_post("/charts/intraday", payload, "1-minute history")
-
     data = parse_data(body)
-    if not isinstance(data, dict) or "close" not in data:
-        raise RuntimeError(f"No historical close data returned: {str(body)[:350]}")
-
-    n = len(data["close"])
-    out = pd.DataFrame({
-        "close": data["close"],
-        "timestamp": data.get("timestamp", [None] * n),
-    })
-    out["close"] = pd.to_numeric(out["close"], errors="coerce")
-    unit = "ms" if pd.to_numeric(out["timestamp"], errors="coerce").dropna().median() > 10**12 else "s"
-    out["datetime"] = pd.to_datetime(out["timestamp"], unit=unit, errors="coerce")
-    out = out.dropna(subset=["close"]).sort_values("datetime").reset_index(drop=True)
-
-    if mode == "Intraday":
-        out = out[out["datetime"] < pd.Timestamp.now().floor("min")].copy()
-
-    return out
+    segment = data.get("IDX_I", {}) if isinstance(data, dict) else {}
+    row = segment.get(str(INDIA_VIX_ID)) or segment.get(INDIA_VIX_ID) or {}
+    ltp = pd.to_numeric(row.get("last_price"), errors="coerce")
+    ltt = pd.to_numeric(row.get("last_trade_time"), errors="coerce")
+    return (
+        float(ltp) if pd.notna(ltp) else np.nan,
+        float(ltt) if pd.notna(ltt) else np.nan,
+    )
 
 
-@st.cache_data(ttl=180, show_spinner=False)
-def cached_cash_intraday(sec_id, days=5):
-    return historical(sec_id, "NSE_EQ", "EQUITY", "Intraday")
-
-@st.cache_data(ttl=180, show_spinner=False)
-def cached_cash_daily(sec_id):
-    return historical(sec_id, "NSE_EQ", "EQUITY", "Positional")
-
-# -----------------------------
-# P&F engine
-# -----------------------------
-def build_pnf(closes, box_pct, reversal=3):
-    p = pd.Series(closes).dropna().astype(float).tolist()
-    if len(p) < 3:
-        return []
-
-    direction = None
-    high = low = p[0]
-    boxes = 0
-    cols = []
-
-    def save():
-        if direction and boxes > 0:
-            cols.append({"type": direction, "boxes": boxes, "high": high, "low": low})
-
-    for price in p[1:]:
-        if direction is None:
-            if price >= high * (1 + box_pct):
-                direction = "X"
-                boxes = 0
-                while price >= high * (1 + box_pct):
-                    high *= (1 + box_pct)
-                    boxes += 1
-                low = high / ((1 + box_pct) ** boxes)
-            elif price <= low * (1 - box_pct):
-                direction = "O"
-                boxes = 0
-                while price <= low * (1 - box_pct):
-                    low *= (1 - box_pct)
-                    boxes += 1
-                high = low / ((1 - box_pct) ** boxes)
-            continue
-
-        if direction == "X":
-            while price >= high * (1 + box_pct):
-                high *= (1 + box_pct)
-                boxes += 1
-            if price <= high * ((1 - box_pct) ** reversal):
-                save()
-                direction = "O"
-                low = high
-                boxes = 0
-                while price <= low * (1 - box_pct):
-                    low *= (1 - box_pct)
-                    boxes += 1
-        else:
-            while price <= low * (1 - box_pct):
-                low *= (1 - box_pct)
-                boxes += 1
-            if price >= low * ((1 + box_pct) ** reversal):
-                save()
-                direction = "X"
-                high = low
-                boxes = 0
-                while price >= high * (1 + box_pct):
-                    high *= (1 + box_pct)
-                    boxes += 1
-
-    save()
-    return cols
-
-def analyze_new_pattern(df, box_pct, anchor_min=15, pullback_max=5):
-    base = {
-        "bias": "NO DATA", "pattern": "—", "prospective": False,
-        "dtb": False, "dbs": False, "anchor_boxes": 0,
-        "pullback_boxes": 0, "entry_level": np.nan, "sl": np.nan,
-        "signal": None, "reason": "No data"
-    }
-    if df.empty:
-        return base
-    cols = build_pnf(df["close"], box_pct)
-    if len(cols) < 3:
-        base["bias"] = "NO P&F"
-        base["reason"] = f"Only {len(cols)} columns"
-        return base
-
-    c1, c2, c3 = cols[-3:]
-    base["bias"] = "Bullish" if c3["type"] == "X" else "Bearish"
-
-    if c1["type"] == "X" and c2["type"] == "O" and c3["type"] == "X":
-        base["anchor_boxes"] = c1["boxes"]
-        base["pullback_boxes"] = c2["boxes"]
-        base["entry_level"] = c1["high"]
-        base["anchor_valid"] = c1["boxes"] > anchor_min
-        pull_valid = 1 <= c2["boxes"] <= pullback_max
-        if base["anchor_valid"] and pull_valid:
-            base["prospective"] = True
-            if c3["high"] > c1["high"]:
-                base["dtb"] = True
-                base["signal"] = "LONG"
-                base["pattern"] = "DTB"
-                base["sl"] = c2["low"]
-                base["reason"] = "3-column Anchor + 1–5 pullback + DTB"
-            else:
-                base["pattern"] = "NEW PATTERN"
-                base["reason"] = "3-column bullish setup forming; waiting for DTB"
-        else:
-            base["reason"] = "3-column X-O-X exists but Anchor/pullback limits fail"
-
-    elif c1["type"] == "O" and c2["type"] == "X" and c3["type"] == "O":
-        base["anchor_boxes"] = c1["boxes"]
-        base["pullback_boxes"] = c2["boxes"]
-        base["entry_level"] = c1["low"]
-        base["anchor_valid"] = c1["boxes"] > anchor_min
-        pull_valid = 1 <= c2["boxes"] <= pullback_max
-        if base["anchor_valid"] and pull_valid:
-            base["prospective"] = True
-            if c3["low"] < c1["low"]:
-                base["dbs"] = True
-                base["signal"] = "SHORT"
-                base["pattern"] = "DBS"
-                base["sl"] = c2["high"]
-                base["reason"] = "3-column Anchor + 1–5 pullback + DBS"
-            else:
-                base["pattern"] = "NEW PATTERN"
-                base["reason"] = "3-column bearish setup forming; waiting for DBS"
-        else:
-            base["reason"] = "3-column O-X-O exists but Anchor/pullback limits fail"
-    else:
-        base["reason"] = f"Latest columns {c1['type']}-{c2['type']}-{c3['type']}"
-
-    return base
-
-
-# -----------------------------
-# Optional confirmation modules
-# -----------------------------
-SECTOR_MAP = {
-    "HDFCBANK":"Banking","ICICIBANK":"Banking","SBIN":"Banking","AXISBANK":"Banking","KOTAKBANK":"Banking",
-    "INDUSINDBK":"Banking","BANKBARODA":"Banking","PNB":"Banking","FEDERALBNK":"Banking","IDFCFIRSTB":"Banking",
-    "BAJFINANCE":"Financials","BAJAJFINSV":"Financials","SHRIRAMFIN":"Financials","CHOLAFIN":"Financials","MUTHOOTFIN":"Financials",
-    "RELIANCE":"Energy","ONGC":"Energy","COALINDIA":"Energy","IOC":"Energy","BPCL":"Energy","GAIL":"Energy",
-    "TCS":"IT","INFY":"IT","HCLTECH":"IT","WIPRO":"IT","TECHM":"IT","LTIM":"IT","MPHASIS":"IT","COFORGE":"IT",
-    "MARUTI":"Auto","M&M":"Auto","TATAMOTORS":"Auto","HEROMOTOCO":"Auto","EICHERMOT":"Auto","BAJAJ-AUTO":"Auto","TVSMOTOR":"Auto","ASHOKLEY":"Auto",
-    "SUNPHARMA":"Pharma","CIPLA":"Pharma","DRREDDY":"Pharma","DIVISLAB":"Pharma","APOLLOHOSP":"Pharma","LUPIN":"Pharma","AUROPHARMA":"Pharma","TORNTPHARM":"Pharma",
-    "TATASTEEL":"Metals","JSWSTEEL":"Metals","HINDALCO":"Metals","SAIL":"Metals","JINDALSTEL":"Metals","NATIONALUM":"Metals","VEDL":"Metals",
-    "ITC":"FMCG","HINDUNILVR":"FMCG","NESTLEIND":"FMCG","BRITANNIA":"FMCG","TATACONSUM":"FMCG","DABUR":"FMCG","MARICO":"FMCG","COLPAL":"FMCG",
-    "LT":"Capital Goods","BEL":"Capital Goods","BHEL":"Capital Goods","SIEMENS":"Capital Goods","ABB":"Capital Goods","CUMMINSIND":"Capital Goods",
-    "DLF":"Realty","GODREJPROP":"Realty","OBEROIRLTY":"Realty","LODHA":"Realty","PRESTIGE":"Realty","PHOENIXLTD":"Realty",
-    "BHARTIARTL":"Telecom","INDUSTOWER":"Telecom","IDEA":"Telecom",
-    "TRENT":"Consumer","TITAN":"Consumer","DMART":"Consumer","KALYANKJIL":"Consumer","JUBLFOOD":"Consumer",
-}
-SECTOR_BASKETS = {}
-for _s, _sec in SECTOR_MAP.items():
-    SECTOR_BASKETS.setdefault(_sec, []).append(_s)
-
-def sector_of(symbol):
-    return SECTOR_MAP.get(str(symbol).upper(), "Other")
-
-def future_quote_map(fut):
-    """Current futures LTP/Quote for the exact active contract."""
-    if fut.empty:
-        return {}
-    try:
-        ids = fut["security_id"].dropna().astype(int).tolist()
-        body = api_post("/marketfeed/quote", {"NSE_FNO": ids}, "NSE futures quote")
-        data = parse_data(body).get("NSE_FNO", {})
-        return {int(k): v for k, v in data.items() if isinstance(v, dict)}
-    except Exception:
-        return {}
-
-@st.cache_data(ttl=60, show_spinner=False)
-def futures_oi_history(sec_id, lookback_days=7):
-    """
-    Fetch OI history for the SAME futures contract.
-    This avoids comparing one expiry's OI to another expiry's OI.
-    """
-    end = datetime.now().date()
-    start = end - timedelta(days=lookback_days)
-    payload = {
-        "securityId": str(int(sec_id)),
-        "exchangeSegment": "NSE_FNO",
-        "instrument": "FUTSTK",
-        "expiryCode": 0,
-        "oi": True,
-        "fromDate": str(start),
-        "toDate": str(end + timedelta(days=1)),
-    }
-    body = api_post("/charts/historical", payload, "same-contract futures OI")
-    data = parse_data(body)
-
+def _parse_arrays(data, include_oi=False):
     if not isinstance(data, dict):
         return pd.DataFrame()
 
-    oi = pd.to_numeric(pd.Series(data.get("open_interest", [])), errors="coerce")
-    close = pd.to_numeric(pd.Series(data.get("close", [])), errors="coerce")
-    ts = pd.to_numeric(pd.Series(data.get("timestamp", [])), errors="coerce")
-
-    n = min(len(oi), len(close), len(ts))
-    if n == 0:
-        return pd.DataFrame()
-
-    out = pd.DataFrame({
-        "timestamp": ts.iloc[:n].to_numpy(),
-        "close": close.iloc[:n].to_numpy(),
-        "oi": oi.iloc[:n].to_numpy(),
-    })
-
-    unit = "ms" if out["timestamp"].dropna().median() > 10**12 else "s"
-    out["datetime"] = pd.to_datetime(out["timestamp"], unit=unit, errors="coerce")
-    out = out.dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
-    return out
-
-def classify_futures_oi(sec_id, direction):
-    """
-    Same active contract:
-    current OI - previous OI = ΔOI
-    current futures close - previous futures close = price direction
-
-    Long:  price up + OI up
-    Short: price down + OI up
-    Short covering: price up + OI down
-    Long unwinding: price down + OI down
-    """
-    try:
-        h = futures_oi_history(sec_id)
-        if len(h) < 2:
-            return {
-                "state": "UNAVAILABLE",
-                "current_oi": np.nan,
-                "previous_oi": np.nan,
-                "oi_change": np.nan,
-                "oi_change_pct": np.nan,
-                "price_change_pct": np.nan,
-                "star": False,
-            }
-
-        a = h.iloc[-2]
-        b = h.iloc[-1]
-
-        prev_oi = float(a["oi"]) if pd.notna(a["oi"]) else np.nan
-        cur_oi = float(b["oi"]) if pd.notna(b["oi"]) else np.nan
-
-        prev_price = float(a["close"]) if pd.notna(a["close"]) else np.nan
-        cur_price = float(b["close"]) if pd.notna(b["close"]) else np.nan
-
-        if any(pd.isna(x) for x in [prev_oi, cur_oi, prev_price, cur_price]):
-            return {
-                "state": "UNAVAILABLE",
-                "current_oi": cur_oi,
-                "previous_oi": prev_oi,
-                "oi_change": np.nan,
-                "oi_change_pct": np.nan,
-                "price_change_pct": np.nan,
-                "star": False,
-            }
-
-        oi_change = cur_oi - prev_oi
-        oi_change_pct = (oi_change / prev_oi * 100.0) if prev_oi else np.nan
-        price_change_pct = ((cur_price / prev_price) - 1.0) * 100.0 if prev_price else np.nan
-
-        if price_change_pct > 0 and oi_change > 0:
-            state = "LONG BUILDUP"
-            star = direction == "LONG"
-        elif price_change_pct < 0 and oi_change > 0:
-            state = "SHORT BUILDUP"
-            star = direction == "SHORT"
-        elif price_change_pct > 0 and oi_change < 0:
-            state = "SHORT COVERING"
-            star = False
-        elif price_change_pct < 0 and oi_change < 0:
-            state = "LONG UNWINDING"
-            star = False
-        else:
-            state = "NEUTRAL"
-            star = False
-
-        return {
-            "state": state,
-            "current_oi": cur_oi,
-            "previous_oi": prev_oi,
-            "oi_change": oi_change,
-            "oi_change_pct": oi_change_pct,
-            "price_change_pct": price_change_pct,
-            "star": star,
-        }
-    except Exception:
-        return {
-            "state": "UNAVAILABLE",
-            "current_oi": np.nan,
-            "previous_oi": np.nan,
-            "oi_change": np.nan,
-            "oi_change_pct": np.nan,
-            "price_change_pct": np.nan,
-            "star": False,
-        }
-
-
-def sector_breadth_star(df, symbol, direction):
-    """
-    Sector confirmation from the already-scanned NSE P&F universe.
-
-    Backend-only:
-    - Uses the sector assigned to each scanned stock.
-    - Uses only valid Bullish/Bearish directional rows.
-    - >=50% same-direction breadth confirms the trade.
-    """
-    try:
-        sec = sector_of(symbol)
-
-        if sec == "Other" or df is None or df.empty:
-            return {
-                "sector": sec,
-                "breadth": np.nan,
-                "star": False,
-            }
-
-        x = df.copy()
-
-        # The client-safe positional table keeps sector as "_Sector".
-        # Older code may pass "Sector", so support both.
-        sector_col = (
-            "_Sector"
-            if "_Sector" in x.columns
-            else "Sector"
-            if "Sector" in x.columns
-            else None
-        )
-
-        if sector_col is None or "Bias" not in x.columns:
-            return {
-                "sector": sec,
-                "breadth": np.nan,
-                "star": False,
-            }
-
-        x[sector_col] = x[sector_col].astype(str).str.strip()
-        x = x[x[sector_col] == sec].copy()
-
-        valid = x[
-            x["Bias"].isin(["Bullish", "Bearish"])
-        ].copy()
-
-        if valid.empty:
-            return {
-                "sector": sec,
-                "breadth": np.nan,
-                "star": False,
-            }
-
-        if direction == "LONG":
-            pct = 100.0 * (
-                valid["Bias"] == "Bullish"
-            ).mean()
-            return {
-                "sector": sec,
-                "breadth": pct,
-                "star": pct >= 50.0,
-            }
-
-        if direction == "SHORT":
-            pct = 100.0 * (
-                valid["Bias"] == "Bearish"
-            ).mean()
-            return {
-                "sector": sec,
-                "breadth": pct,
-                "star": pct >= 50.0,
-            }
-
-        return {
-            "sector": sec,
-            "breadth": np.nan,
-            "star": False,
-        }
-
-    except Exception:
-        return {
-            "sector": sector_of(symbol),
-            "breadth": np.nan,
-            "star": False,
-        }
-
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-
-def intraday_sma10(df):
-    """Calculate 10-period SMA on completed 1-minute cash closes."""
-    if df is None or df.empty or "close" not in df.columns:
-        return np.nan
-    c = pd.to_numeric(df["close"], errors="coerce").dropna()
-    if len(c) < 10:
-        return np.nan
-    return float(c.rolling(10).mean().iloc[-1])
-
-def daily_direction_filter(sec_id, anchor_min=15):
-    """
-    Higher-timeframe filter:
-    0.25% box, 3-box reversal, daily cash closes.
-    Returns Bullish / Bearish / Sideways.
-    """
-    try:
-        h = cached_cash_daily(sec_id)
-        if h.empty:
-            return "UNAVAILABLE", "No daily data"
-        p = analyze_new_pattern(h, 0.0025, anchor_min=anchor_min, pullback_max=5)
-        if p["bias"] == "Bullish":
-            return "Bullish", p["reason"]
-        if p["bias"] == "Bearish":
-            return "Bearish", p["reason"]
-        return "Sideways", p["reason"]
-    except Exception as e:
-        return "UNAVAILABLE", str(e)[:200]
-
-
-
-# -----------------------------
-# Intraday daily-filter state
-# -----------------------------
-if "intraday_daily_filter" not in st.session_state:
-    st.session_state.intraday_daily_filter = {}
-if "intraday_filter_date" not in st.session_state:
-    st.session_state.intraday_filter_date = None
-
-def build_morning_daily_filter(fut):
-    result = {}
-    prog = st.progress(0, text=f"Building daily filter for {len(fut)} stocks...")
-    for i, (_, r) in enumerate(fut.iterrows(), 1):
-        symbol = str(r["underlying_symbol"])
-        try:
-            h = cached_cash_daily(int(r["underlying_security_id"]))
-            cols = build_pnf(h["close"], 0.0025, 3)
-            if cols:
-                last = cols[-1]
-                if last["type"] == "X" and last["boxes"] > 15:
-                    bias, anchor_ok = "Bullish", True
-                elif last["type"] == "O" and last["boxes"] > 15:
-                    bias, anchor_ok = "Bearish", True
-                else:
-                    bias, anchor_ok = "Sideways", False
-            else:
-                bias, anchor_ok = "Unavailable", False
-        except Exception:
-            bias, anchor_ok = "Unavailable", False
-        result[symbol] = {"bias": bias, "anchor_ok": anchor_ok}
-        prog.progress(i / max(len(fut), 1), text=f"Daily filter {i}/{len(fut)}")
-    prog.empty()
-    return result
-
-def get_morning_daily_filter(fut):
-    today = datetime.now().date().isoformat()
-    if (
-        st.session_state.intraday_filter_date != today
-        or not st.session_state.intraday_daily_filter
-    ):
-        st.session_state.intraday_daily_filter = build_morning_daily_filter(fut)
-        st.session_state.intraday_filter_date = today
-    return st.session_state.intraday_daily_filter
-
-
-
-
-def daily_running_pnf_bias(sec_id):
-    """
-    Intraday eligibility gate:
-    - Daily close-only data
-    - 0.25% box
-    - 3-box reversal
-    - Latest completed daily column must itself be an Anchor >15 boxes.
-      X >15 boxes = Bullish candidate.
-      O >15 boxes = Bearish candidate.
-    """
-    try:
-        h = cached_cash_daily(sec_id)
-        if h.empty:
-            return "UNAVAILABLE"
-
-        cols = build_pnf(h["close"], 0.0025, 3)
-        if not cols:
-            return "UNAVAILABLE"
-
-        last = cols[-1]
-
-        if last["type"] == "X" and last["boxes"] > 15:
-            return "Bullish"
-
-        if last["type"] == "O" and last["boxes"] > 15:
-            return "Bearish"
-
-        return "UNAVAILABLE"
-    except Exception:
-        return "UNAVAILABLE"
-
-
-
-
-def positional_active_pattern(sec_id):
-    """
-    STRICT positional classification.
-
-    Bullish ONLY if:
-      latest 3 completed daily columns are X-O-X
-      AND the latest X breaks the prior X high -> ACTIVE DTB.
-
-    Bearish ONLY if:
-      latest 3 completed daily columns are O-X-O
-      AND the latest O breaks the prior O low -> ACTIVE DBS.
-
-    Everything else = SIDEWAYS / NO POSITION.
-
-    Entry:
-      DTB = prior X high
-      DBS = prior O low
-
-    SL:
-      DTB = pullback O low
-      DBS = pullback X high
-    """
-    result = {
-        "bias": "Sideways",
-        "recommendation": "NO POSITION",
-        "entry": np.nan,
-        "sl": np.nan,
-        "active_dtb": False,
-        "active_dbs": False,
-        "pattern": "Sideways",
-        "reason": "No active directional breakout",
-    }
-
-    try:
-        h = cached_cash_daily(sec_id)
-        if h.empty:
-            result["reason"] = "No daily data"
-            return result
-
-        cols = build_pnf(h["close"], 0.0025, 3)
-
-        if len(cols) < 3:
-            result["reason"] = "No completed 3-column structure"
-            return result
-
-        c1, c2, c3 = cols[-3:]
-
-        # Active bullish pattern: X -> O -> X and new X breaks
-        # the high of the prior X column.
-        if c1["type"] == "X" and c2["type"] == "O" and c3["type"] == "X":
-            if c3["high"] > c1["high"]:
-                result.update({
-                    "bias": "Bullish",
-                    "recommendation": "🟢 LONG",
-                    "entry": float(c1["high"]),
-                    "sl": float(c2["low"]),
-                    "active_dtb": True,
-                    "pattern": "DTB",
-                    "reason": "Active DTB with latest column X",
-                })
-                return result
-
-            result["reason"] = "X-O-X present, but Anchor high not broken"
-            return result
-
-        # Active bearish pattern: O -> X -> O and new O breaks
-        # the low of the prior O column.
-        if c1["type"] == "O" and c2["type"] == "X" and c3["type"] == "O":
-            if c3["low"] < c1["low"]:
-                result.update({
-                    "bias": "Bearish",
-                    "recommendation": "🔴 SHORT",
-                    "entry": float(c1["low"]),
-                    "sl": float(c2["high"]),
-                    "active_dbs": True,
-                    "pattern": "DBS",
-                    "reason": "Active DBS with latest column O",
-                })
-                return result
-
-            result["reason"] = "O-X-O present, but Anchor low not broken"
-            return result
-
-        result["reason"] = f"No active DTB/DBS in {c1['type']}-{c2['type']}-{c3['type']}"
-        return result
-
-    except Exception as exc:
-        result["reason"] = f"Pattern data error: {str(exc)[:120]}"
-        return result
-
-
-# -----------------------------
-# Option Seller Analyzer
-# -----------------------------
-
-
-def filter_atm_strike_window(chain_df, spot, strikes_each_side=20):
-    """
-    Restrict all option analysis to ATM +/- N strikes.
-
-    ATM is selected from the live spot using the nearest available strike.
-    The returned chain contains:
-      - 20 strikes below ATM
-      - ATM
-      - 20 strikes above ATM
-    wherever those strikes exist in the live chain.
-    """
-    if chain_df is None or chain_df.empty or pd.isna(spot):
-        return chain_df.copy() if chain_df is not None else pd.DataFrame()
-
-    x = chain_df.copy()
-    x["Strike"] = pd.to_numeric(x["Strike"], errors="coerce")
-    x = x.dropna(subset=["Strike"])
-
-    strikes = sorted(x["Strike"].unique())
-    if not strikes:
-        return x
-
-    atm = min(strikes, key=lambda s: abs(float(s) - float(spot)))
-    atm_idx = strikes.index(atm)
-
-    lo = max(0, atm_idx - strikes_each_side)
-    hi = min(len(strikes), atm_idx + strikes_each_side + 1)
-
-    allowed = set(strikes[lo:hi])
-    return x[x["Strike"].isin(allowed)].copy()
-
-# -----------------------------
-# Dhan v2 Option Seller Analyzer
-# -----------------------------
-INDEX_NAMES = ["NIFTY", "BANKNIFTY", "SENSEX"]
-
-
-def resolve_index_instrument(master, index_name):
-    """
-    Dhan-documented Index Security IDs:
-      NIFTY    = 13
-      BANKNIFTY = 25
-      SENSEX   = 51
-    Dhan uses IDX_I for Index Value.
-    """
-    ids = {
-        "NIFTY": 13,
-        "BANKNIFTY": 25,
-        "SENSEX": 51,
-    }
-
-    key = str(index_name).upper().strip()
-    if key not in ids:
-        raise RuntimeError(f"Unsupported index: {index_name}")
-
-    return ids[key]
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def option_expiry_list_v2(index_security_id):
-    body = api_post(
-        "/optionchain/expirylist",
-        {
-            "UnderlyingScrip": int(index_security_id),
-            "UnderlyingSeg": "IDX_I",
-        },
-        "Option expiry list",
-    )
-
-    data = parse_data(body)
-    expiries = data.get("data") if isinstance(data, dict) else None
-
-    if not isinstance(expiries, list):
-        raise RuntimeError("No active option expiries returned")
-
-    out = []
-    for value in expiries:
-        try:
-            out.append(pd.Timestamp(str(value)).date())
-        except Exception:
-            pass
-
-    out = sorted(set(out))
-    if not out:
-        raise RuntimeError("No valid option expiries returned")
-
-    return out
-
-
-def select_option_expiry_v2(expiries, horizon):
-    today = datetime.now().date()
-    future = [d for d in expiries if d >= today]
-
-    if not future:
-        raise RuntimeError("No future expiry available")
-
-    if horizon == "Intraday":
-        return future[0]
-
-    # Positional: prefer the final active expiry in the current month.
-    current_month = [d for d in future if d.year == today.year and d.month == today.month]
-    if current_month:
-        return max(current_month)
-
-    # Otherwise use the final expiry in the nearest available month.
-    ym = sorted({(d.year, d.month) for d in future})
-    y, m = ym[0]
-    same_month = [d for d in future if (d.year, d.month) == (y, m)]
-    return max(same_month)
-
-
-@st.cache_data(ttl=3, show_spinner=False)
-def option_chain_request_v2(index_security_id, expiry_date):
-    return api_post(
-        "/optionchain",
-        {
-            "UnderlyingScrip": int(index_security_id),
-            "UnderlyingSeg": "IDX_I",
-            "Expiry": expiry_date.strftime("%Y-%m-%d"),
-        },
-        "Option chain",
-    )
-
-
-def parse_option_chain_v2(body):
-    data = parse_data(body)
-    if not isinstance(data, dict) or not isinstance(data.get("oc"), dict):
-        raise RuntimeError("Option chain strikes are unavailable")
-
-    rows = []
-    for strike_raw, pair in data["oc"].items():
-        try:
-            strike = float(strike_raw)
-        except Exception:
-            continue
-
-        if not isinstance(pair, dict):
-            continue
-
-        for key, side in (("ce", "CE"), ("pe", "PE")):
-            leg = pair.get(key)
-            if not isinstance(leg, dict):
-                continue
-
-            oi = pd.to_numeric(leg.get("oi"), errors="coerce")
-            prev_oi = pd.to_numeric(leg.get("previous_oi"), errors="coerce")
-            change_oi = oi - prev_oi if pd.notna(oi) and pd.notna(prev_oi) else np.nan
-
-            greeks = leg.get("greeks") or {}
-
-            rows.append({
-                "Strike": strike,
-                "Side": side,
-                "LTP": pd.to_numeric(leg.get("last_price"), errors="coerce"),
-                "IV": pd.to_numeric(leg.get("implied_volatility"), errors="coerce"),
-                "OI": oi,
-                "Previous OI": prev_oi,
-                "Change OI": change_oi,
-                "Volume": pd.to_numeric(leg.get("volume"), errors="coerce"),
-                "Delta": pd.to_numeric(greeks.get("delta"), errors="coerce"),
-                "Security ID": pd.to_numeric(leg.get("security_id"), errors="coerce"),
-                "Previous Close": pd.to_numeric(
-                    leg.get("previous_close_price"), errors="coerce"
-                ),
-            })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        raise RuntimeError("No option-chain rows returned")
-
-    return df
-
-
-def option_seller_analysis_v2(chain_df, spot, horizon):
-    empty = {
-        "recommendation": "WAIT",
-        "reason": "Option data is currently unavailable.",
-        "atm": np.nan,
-        "ce_ltp": np.nan,
-        "pe_ltp": np.nan,
-        "atm_iv": np.nan,
-        "expected_move": np.nan,
-        "support": np.nan,
-        "resistance": np.nan,
-        "support_oi": np.nan,
-        "resistance_oi": np.nan,
-    }
-
-    if chain_df.empty or pd.isna(spot):
-        return empty
-
-    x = chain_df.copy()
-    x["Strike"] = pd.to_numeric(x["Strike"], errors="coerce")
-    x["LTP"] = pd.to_numeric(x["LTP"], errors="coerce")
-    x["IV"] = pd.to_numeric(x["IV"], errors="coerce")
-    x["OI"] = pd.to_numeric(x["OI"], errors="coerce")
-    x["Change OI"] = pd.to_numeric(x["Change OI"], errors="coerce")
-    x = x.dropna(subset=["Strike"])
-
-    strikes = sorted(x["Strike"].unique())
-    if not strikes:
-        return empty
-
-    atm = min(strikes, key=lambda s: abs(float(s) - float(spot)))
-
-    ce = x[(x["Side"] == "CE") & (x["Strike"] == atm)]
-    pe = x[(x["Side"] == "PE") & (x["Strike"] == atm)]
-
-    if ce.empty or pe.empty:
-        empty["atm"] = atm
-        empty["reason"] = "ATM call/put data is unavailable."
-        return empty
-
-    ce = ce.iloc[-1]
-    pe = pe.iloc[-1]
-
-    ce_ltp = ce["LTP"]
-    pe_ltp = pe["LTP"]
-    ce_iv = ce["IV"]
-    pe_iv = pe["IV"]
-
-    atm_iv = (
-        np.nanmean([ce_iv, pe_iv])
-        if not (pd.isna(ce_iv) and pd.isna(pe_iv))
-        else np.nan
-    )
-
-    expected_move = (
-        ce_ltp + pe_ltp
-        if pd.notna(ce_ltp) and pd.notna(pe_ltp)
-        else np.nan
-    )
-
-    calls = x[x["Side"] == "CE"]
-    puts = x[x["Side"] == "PE"]
-
-    resistance = np.nan
-    support = np.nan
-    resistance_oi = np.nan
-    support_oi = np.nan
-
-    if not calls.empty and calls["OI"].notna().any():
-        idx = calls["OI"].idxmax()
-        resistance = float(calls.loc[idx, "Strike"])
-        resistance_oi = float(calls.loc[idx, "OI"])
-
-    if not puts.empty and puts["OI"].notna().any():
-        idx = puts["OI"].idxmax()
-        support = float(puts.loc[idx, "Strike"])
-        support_oi = float(puts.loc[idx, "OI"])
-
-    range_ok = (
-        pd.notna(expected_move)
-        and pd.notna(support)
-        and pd.notna(resistance)
-        and float(spot) - expected_move >= support * 0.995
-        and float(spot) + expected_move <= resistance * 1.005
-    )
-
-    if pd.notna(expected_move) and pd.notna(atm_iv) and (range_ok or horizon == "Positional"):
-        recommendation = "🟢 SELL STRADDLE"
-        reason = "Premium and current market range are supportive for premium selling."
-    elif pd.notna(expected_move) and pd.notna(atm_iv):
-        recommendation = "🟡 CAUTION"
-        reason = "Premium is available, but the current range is not comfortably contained."
-    else:
-        recommendation = "🔴 DON'T SELL"
-        reason = "Insufficient premium or volatility information."
-
-    return {
-        "recommendation": recommendation,
-        "reason": reason,
-        "atm": atm,
-        "ce_ltp": ce_ltp,
-        "pe_ltp": pe_ltp,
-        "atm_iv": atm_iv,
-        "expected_move": expected_move,
-        "support": support,
-        "resistance": resistance,
-        "support_oi": support_oi,
-        "resistance_oi": resistance_oi,
-    }
-
-
-def option_session_state(index_name, expiry_date, atm_iv):
-    key = f"{index_name}|{expiry_date}"
-
-    if "option_session" not in st.session_state:
-        st.session_state.option_session = {}
-
-    state = st.session_state.option_session.setdefault(
-        key,
-        {
-            "open_iv": np.nan,
-            "last_iv": np.nan,
-            "iv_alert": False,
-            "oi_alert": False,
-        },
-    )
-
-    now = datetime.now().time()
-
-    # The first successfully fetched IV after normal market open is recorded
-    # as the opening baseline for this Streamlit session.
-    if pd.notna(atm_iv) and now >= datetime.strptime("09:15", "%H:%M").time():
-        if pd.isna(state["open_iv"]):
-            state["open_iv"] = float(atm_iv)
-
-    state["last_iv"] = float(atm_iv) if pd.notna(atm_iv) else state["last_iv"]
-    return state
-
-
-def option_oi_risk(chain_df, spot):
-    if chain_df.empty or pd.isna(spot):
-        return {
-            "alert": False,
-            "side": None,
-            "text": "No OI risk alert.",
-        }
-
-    x = chain_df.copy()
-    strikes = sorted(x["Strike"].dropna().unique())
-    if len(strikes) < 2:
-        return {
-            "alert": False,
-            "side": None,
-            "text": "No OI risk alert.",
-        }
-
-    step = np.nanmedian(np.diff(strikes))
-    if pd.isna(step) or step <= 0:
-        return {
-            "alert": False,
-            "side": None,
-            "text": "No OI risk alert.",
-        }
-
-    atm = min(strikes, key=lambda s: abs(float(s) - float(spot)))
-    band = 5 * step
-
-    y = x[
-        x["Strike"].between(atm - band, atm + band)
-        & (x["Change OI"] > 0)
-    ]
-
-    ce_add = y.loc[y["Side"] == "CE", "Change OI"].sum()
-    pe_add = y.loc[y["Side"] == "PE", "Change OI"].sum()
-
-    total = ce_add + pe_add
-    if total <= 0:
-        return {
-            "alert": False,
-            "side": None,
-            "text": "No meaningful one-sided OI buildup.",
-        }
-
-    ce_share = ce_add / total
-    pe_share = pe_add / total
-
-    if ce_share >= 0.65:
-        return {
-            "alert": True,
-            "side": "CALL",
-            "text": "Heavy call-side positioning buildup detected.",
-        }
-
-    if pe_share >= 0.65:
-        return {
-            "alert": True,
-            "side": "PUT",
-            "text": "Heavy put-side positioning buildup detected.",
-        }
-
-    return {
-        "alert": False,
-        "side": None,
-        "text": "No meaningful one-sided OI buildup.",
-    }
-
-
-def option_iv_risk(atm_iv, state):
-    if pd.isna(atm_iv) or pd.isna(state.get("open_iv")):
-        return {
-            "alert": False,
-            "text": "Opening volatility baseline is being recorded.",
-        }
-
-    increase = float(atm_iv) - float(state["open_iv"])
-
-    if increase >= 2.5:
-        return {
-            "alert": True,
-            "level": "HIGH",
-            "text": "Implied volatility is expanding sharply.",
-        }
-
-    if increase >= 1.5:
-        return {
-            "alert": True,
-            "level": "MEDIUM",
-            "text": "Implied volatility is rising.",
-        }
-
-    return {
-        "alert": False,
-        "level": "NORMAL",
-        "text": "Implied volatility is stable.",
-    }
-
-
-def speak_option_alert(message):
-    safe = str(message).replace("\\", "\\\\").replace('"', '\\"')
-    st.components.v1.html(
-        f"""
-        <script>
-        try {{
-            if ("speechSynthesis" in window) {{
-                window.speechSynthesis.cancel();
-                const u = new SpeechSynthesisUtterance("{safe}");
-                u.rate = 0.95;
-                u.volume = 1.0;
-                window.speechSynthesis.speak(u);
-            }}
-        }} catch(e) {{}}
-        </script>
-        """,
-        height=0,
-    )
-
-
-
-def option_strategy_suggestion(
-    index_name,
-    horizon,
-    recommendation,
-    spot,
-    atm,
-    expected_move,
-    support,
-    resistance,
-    atm_iv,
-    open_iv,
-    oi_alert,
-    chain_df,
-):
-    """Suggest strategy + exact option strike(s) from the live chain."""
-
-    empty = {
-        "strategy": "WAIT",
-        "reason": "Live option data is incomplete.",
-        "legs": "—",
-        "ce_strike": np.nan,
-        "pe_strike": np.nan,
-        "ce_premium": np.nan,
-        "pe_premium": np.nan,
-    }
-
-    if pd.isna(spot) or pd.isna(atm) or chain_df.empty:
-        return empty
-
-    iv_move = 0.0
-    if pd.notna(atm_iv) and pd.notna(open_iv):
-        iv_move = float(atm_iv) - float(open_iv)
-
-    if iv_move >= 2.5:
-        return {
-            **empty,
-            "strategy": "NO FRESH SELL",
-            "reason": "Implied volatility is expanding sharply; wait for stabilization.",
-        }
-
-    x = chain_df.copy()
-    x["Strike"] = pd.to_numeric(x["Strike"], errors="coerce")
-    x["LTP"] = pd.to_numeric(x["LTP"], errors="coerce")
-    x["OI"] = pd.to_numeric(x["OI"], errors="coerce")
-    x = x.dropna(subset=["Strike"])
-
-    strikes = sorted(x["Strike"].unique())
-    if not strikes:
-        return empty
-
-    # Sell STRADDLE: current ATM CE + ATM PE.
-    if recommendation == "🟢 SELL STRADDLE":
-        ce = x[(x["Side"] == "CE") & (x["Strike"] == atm)]
-        pe = x[(x["Side"] == "PE") & (x["Strike"] == atm)]
-
-        ce_p = float(ce["LTP"].iloc[-1]) if not ce.empty and pd.notna(ce["LTP"].iloc[-1]) else np.nan
-        pe_p = float(pe["LTP"].iloc[-1]) if not pe.empty and pd.notna(pe["LTP"].iloc[-1]) else np.nan
-
-        return {
-            "strategy": "SELL STRADDLE",
-            "reason": "Premium and the implied range are supportive for an ATM premium sale.",
-            "legs": f"SELL {index_name} {int(atm)} CE + {int(atm)} PE",
-            "ce_strike": atm,
-            "pe_strike": atm,
-            "ce_premium": ce_p,
-            "pe_premium": pe_p,
-        }
-
-    # Heavy call-side OI -> consider selling PUT at/below the strongest
-    # nearby put-support strike.
-    if oi_alert.get("alert") and oi_alert.get("side") == "CALL":
-        puts = x[
-            (x["Side"] == "PE")
-            & (x["Strike"] <= float(support))
-        ].copy()
-
-        if not puts.empty:
-            # Highest strike below/equal to support, so we stay just below support.
-            strike = float(puts["Strike"].max())
-            prem = float(
-                puts.loc[puts["Strike"] == strike, "LTP"].iloc[-1]
-            )
-            return {
-                "strategy": "SELL PUT",
-                "reason": "Call-side positioning is concentrated while downside support remains intact.",
-                "legs": f"SELL {index_name} {int(strike)} PE",
-                "ce_strike": np.nan,
-                "pe_strike": strike,
-                "ce_premium": np.nan,
-                "pe_premium": prem,
-            }
-
-    # Heavy put-side OI -> consider selling CALL at/above the strongest
-    # nearby call-resistance strike.
-    if oi_alert.get("alert") and oi_alert.get("side") == "PUT":
-        calls = x[
-            (x["Side"] == "CE")
-            & (x["Strike"] >= float(resistance))
-        ].copy()
-
-        if not calls.empty:
-            # Lowest strike above/equal to resistance, so we stay just above resistance.
-            strike = float(calls["Strike"].min())
-            prem = float(
-                calls.loc[calls["Strike"] == strike, "LTP"].iloc[-1]
-            )
-            return {
-                "strategy": "SELL CALL",
-                "reason": "Put-side positioning is concentrated while upside resistance remains intact.",
-                "legs": f"SELL {index_name} {int(strike)} CE",
-                "ce_strike": strike,
-                "pe_strike": np.nan,
-                "ce_premium": prem,
-                "pe_premium": np.nan,
-            }
-
-    if recommendation == "🟡 CAUTION":
-        return {
-            **empty,
-            "strategy": "WAIT",
-            "reason": "Premium exists, but the current range is not sufficiently contained.",
-        }
-
-    return {
-        **empty,
-        "strategy": "WAIT",
-        "reason": "Current conditions do not justify a fresh premium-selling position.",
-    }
-
-
-
-
-def simple_option_decision(index_name, recommendation, spot, atm, expected_move,
-                           support, resistance, atm_iv, open_iv, oi_alert):
-    """Simple client-facing decision engine."""
-    if pd.isna(spot) or pd.isna(atm):
-        return "WAIT", "Live option data is incomplete."
-
-    if pd.notna(atm_iv) and pd.notna(open_iv):
-        iv_move = float(atm_iv) - float(open_iv)
-        if iv_move >= 2.5:
-            return "WAIT", "Volatility is rising sharply."
-
-    if recommendation == "🟢 SELL STRADDLE":
-        return "SELL STRADDLE", "IV and the expected range are supportive."
-
-    if oi_alert.get("alert"):
-        if oi_alert.get("side") == "CALL":
-            return "SELL PUT", "Call-side OI buildup is strong and downside support is holding."
-        if oi_alert.get("side") == "PUT":
-            return "SELL CALL", "Put-side OI buildup is strong and upside resistance is holding."
-
-    if pd.notna(expected_move) and pd.notna(support) and pd.notna(resistance):
-        if float(spot) - float(expected_move) >= float(support) * 0.995 and \
-           float(spot) + float(expected_move) <= float(resistance) * 1.005:
-            return "SELL STRADDLE", "The expected range fits inside the current support/resistance zone."
-
-    return "WAIT", "Current conditions are not strong enough for a fresh option sale."
-
-
-
-def oi_confirmation_for_trade(sec_id, trade_direction):
-    """
-    Use nearest active NSE F&O futures price + OI behavior as confirmation.
-
-    LONG:
-      LONG BUILDUP     -> Strong Long
-      NEUTRAL          -> Long
-      SHORT COVERING   -> Weak Long
-      SHORT BUILDUP    -> Conflict
-
-    SHORT:
-      SHORT BUILDUP    -> Strong Short
-      NEUTRAL          -> Short
-      LONG UNWINDING   -> Weak Short
-      LONG BUILDUP     -> Conflict
-    """
-    if trade_direction not in ("LONG", "SHORT"):
-        return {
-            "label": "—",
-            "state": "—",
-            "oi_change_pct": np.nan,
-            "price_change_pct": np.nan,
-            "rank": 0,
-        }
-
-    x = classify_futures_oi(sec_id, trade_direction)
-    state = x.get("state", "UNAVAILABLE")
-
-    if state == "UNAVAILABLE":
-        return {
-            "label": "OI unavailable",
-            "state": state,
-            "oi_change_pct": x.get("oi_change_pct", np.nan),
-            "price_change_pct": x.get("price_change_pct", np.nan),
-            "rank": 0,
-        }
-
-    if trade_direction == "LONG":
-        mapping = {
-            "LONG BUILDUP": ("🟢 STRONG LONG", 3),
-            "NEUTRAL": ("🟢 LONG", 2),
-            "SHORT COVERING": ("🟡 WEAK LONG", 1),
-            "SHORT BUILDUP": ("⚠️ LONG CONFLICT", 0),
-            "LONG UNWINDING": ("⚠️ LONG WEAK", 1),
-        }
-    else:
-        mapping = {
-            "SHORT BUILDUP": ("🔴 STRONG SHORT", 3),
-            "NEUTRAL": ("🔴 SHORT", 2),
-            "LONG UNWINDING": ("🟡 WEAK SHORT", 1),
-            "LONG BUILDUP": ("⚠️ SHORT CONFLICT", 0),
-            "SHORT COVERING": ("⚠️ SHORT WEAK", 1),
-        }
-
-    label, rank = mapping.get(state, ("—", 0))
-
-    return {
-        "label": label,
-        "state": state,
-        "oi_change_pct": x.get("oi_change_pct", np.nan),
-        "price_change_pct": x.get("price_change_pct", np.nan),
-        "rank": rank,
-    }
-
-
-
-# -----------------------------
-# MCX Futures Trading
-# -----------------------------
-MCX_FUTURE_SYMBOLS = [
-    "GOLD",
-    "SILVER",
-    "COPPER",
-    "CRUDEOIL",
-    "NATURALGAS",
-    "ZINC",
-    "LEAD",
-    "NICKEL",
-    "ALUMINIUM",
-]
-
-def mcx_futures_universe(master):
-    x=master.copy()
-    if "exchange" in x.columns:
-        x=x[x["exchange"].astype(str).str.upper().eq("MCX")].copy()
-    if "instrument" in x.columns:
-        x=x[x["instrument"].astype(str).str.upper().eq("FUTCOM")].copy()
-    if x.empty: return x
-
-    expiry_col=next((c for c in [
-        "expiry_date","expiryDate","expiry","EXCH_EXPIRY_DATE","expiry_date_time"
-    ] if c in x.columns),None)
-    if expiry_col:
-        x["_expiry"]=pd.to_datetime(x[expiry_col],errors="coerce")
-        x=x[x["_expiry"].isna() | (x["_expiry"]>=pd.Timestamp.now())].copy()
-    else:
-        x["_expiry"]=pd.NaT
-
-    symbol_col=next((c for c in [
-        "underlying_symbol","underlyingSymbol","symbol_name","trading_symbol","tradingSymbol"
-    ] if c in x.columns),None)
-    if not symbol_col: return pd.DataFrame()
-
-    raw=x[symbol_col].astype(str).str.upper().str.strip()
-    def root(v):
-        for r in MCX_FUTURE_SYMBOLS:
-            if v==r or v.startswith(r+"-") or v.startswith(r+"_") or v.startswith(r+" "):
-                return r
-        return None
-
-    x["underlying_symbol"]=raw.map(root)
-    x=x[x["underlying_symbol"].notna()].copy()
-    if x.empty: return x
-
-    sort_cols=["underlying_symbol","_expiry"]
-    if "security_id" in x.columns: sort_cols.append("security_id")
-    x=x.sort_values(sort_cols,na_position="last")
-    return x.drop_duplicates("underlying_symbol",keep="first").reset_index(drop=True)
-
-
-def positional_active_pattern_mcx(sec_id):
-    result={"bias":"Sideways","recommendation":"NO POSITION","entry":np.nan,"sl":np.nan}
-    try:
-        h=historical(sec_id,"MCX_COMM","FUTCOM","Positional")
-        if h.empty: return result
-        cols=build_pnf(h["close"],0.0025,3)
-        if len(cols)<3: return result
-        c1,c2,c3=cols[-3:]
-        if c1["type"]=="X" and c2["type"]=="O" and c3["type"]=="X" and c3["high"]>c1["high"]:
-            return {"bias":"Bullish","recommendation":"🟢 LONG","entry":float(c1["high"]),"sl":float(c2["low"])}
-        if c1["type"]=="O" and c2["type"]=="X" and c3["type"]=="O" and c3["low"]<c1["low"]:
-            return {"bias":"Bearish","recommendation":"🔴 SHORT","entry":float(c1["low"]),"sl":float(c2["high"])}
-    except Exception:
-        pass
-    return result
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def futures_oi_history_mcx(sec_id, lookback_days=7):
-    end=datetime.now().date()
-    start=end-timedelta(days=lookback_days)
-    body=api_post(
-        "/charts/historical",
-        {
-            "securityId":str(int(sec_id)),
-            "exchangeSegment":"MCX_COMM",
-            "instrument":"FUTCOM",
-            "expiryCode":0,
-            "oi":True,
-            "fromDate":str(start),
-            "toDate":str(end+timedelta(days=1)),
-        },
-        "MCX futures OI",
-    )
-    data=parse_data(body)
-    if not isinstance(data,dict): return pd.DataFrame()
-    oi=pd.to_numeric(pd.Series(data.get("open_interest",[])),errors="coerce")
-    close=pd.to_numeric(pd.Series(data.get("close",[])),errors="coerce")
-    ts=pd.to_numeric(pd.Series(data.get("timestamp",[])),errors="coerce")
-    n=min(len(oi),len(close),len(ts))
-    if n<2: return pd.DataFrame()
-    df=pd.DataFrame({"timestamp":ts.iloc[:n].to_numpy(),"close":close.iloc[:n].to_numpy(),"oi":oi.iloc[:n].to_numpy()})
-    unit="ms" if df["timestamp"].dropna().median()>10**12 else "s"
-    df["datetime"]=pd.to_datetime(df["timestamp"],unit=unit,errors="coerce")
-    return df.dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
-
-
-def mcx_oi_star(sec_id,direction):
-    try:
-        h=futures_oi_history_mcx(sec_id)
-        if len(h)<2: return False
-        a,b=h.iloc[-2],h.iloc[-1]
-        oi_up=float(b["oi"])>float(a["oi"])
-        price_up=float(b["close"])>float(a["close"])
-        return (
-            (direction=="LONG" and price_up and oi_up)
-            or (direction=="SHORT" and (not price_up) and oi_up)
-        )
-    except Exception:
-        return False
-
-
-def mcx_intraday_daily_eligibility(sec_id):
-    try:
-        h=historical(sec_id,"MCX_COMM","FUTCOM","Positional")
-        if h.empty: return None
-        cols=build_pnf(h["close"],0.0025,3)
-        if not cols: return None
-        last=cols[-1]
-        if last["boxes"]>15 and last["type"]=="X": return "Bullish"
-        if last["boxes"]>15 and last["type"]=="O": return "Bearish"
-    except Exception:
-        pass
-    return None
-
-
-
-# -----------------------------
-# Client Alerts
-# -----------------------------
-def speak_client_alert(message, prefix="New trade alert"):
-    spoken = f"{prefix}. {message}"
-    safe = spoken.replace("\\", "\\\\").replace('"', '\\"')
-
-    st.components.v1.html(
-        f"""
-        <script>
-        try {{
-            if ("speechSynthesis" in window) {{
-                window.speechSynthesis.cancel();
-                const u = new SpeechSynthesisUtterance("{safe}");
-                u.rate = 0.95;
-                u.volume = 1.0;
-                window.speechSynthesis.speak(u);
-            }}
-        }} catch(e) {{}}
-        </script>
-        """,
-        height=0,
-    )
-
-
-def notify_new_trades(module_name, mode, current_symbols):
-    """Popup + voice + persistent notification entry for new trades."""
-    clean = {
-        str(s).replace("★ ", "").strip()
-        for s in current_symbols
-        if str(s).strip()
-    }
-
-    state_key = f"{module_name}|{mode}"
-
-    if "trade_alert_previous" not in st.session_state:
-        st.session_state.trade_alert_previous = {}
-
-    previous = set(
-        st.session_state.trade_alert_previous.get(state_key, set())
-    )
-
-    new_trades = sorted(clean - previous)
-
-    if new_trades:
-        record_trade_notifications(
-            module_name,
-            mode,
-            new_trades,
-        )
-
-    for symbol in new_trades:
-        st.toast(
-            f"🆕 New {module_name} {mode} trade: {symbol}",
-            icon="🔔",
-        )
-        speak_client_alert(
-            f"{module_name} {mode} trade in {symbol}",
-            prefix="New trade alert",
-        )
-
-    st.session_state.trade_alert_previous[state_key] = clean
-
-
-def notify_option_warning(module_name, warning_key, message, active):
-    """Popup + warning voice only when a risk warning turns ON."""
-    state_key = f"{module_name}|{warning_key}"
-
-    if "option_warning_states" not in st.session_state:
-        st.session_state.option_warning_states = {}
-
-    previous = bool(
-        st.session_state.option_warning_states.get(state_key, False)
-    )
-    current = bool(active)
-
-    if current and not previous:
-        st.toast(
-            f"⚠️ {module_name}: {message}",
-            icon="⚠️",
-        )
-        speak_client_alert(
-            message,
-            prefix=f"Warning. {module_name}",
-        )
-
-    st.session_state.option_warning_states[state_key] = current
-
-
-
-
-
-# -----------------------------
-# Fresh Trade Ledger / Persistent Trade History
-# -----------------------------
-FRESH_TRADE_DIR = Path(os.getenv("ALPHA_TRADE_DATA_DIR", "alpha_data"))
-FRESH_TRADE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _fresh_trade_path(day=None):
-    day = day or local_now().date()
-    return FRESH_TRADE_DIR / f"fresh_trades_{day.isoformat()}.csv"
-
-
-def _fresh_trade_columns():
-    return [
-        "Trade ID", "Date", "Entry Time", "Module", "Mode", "Symbol",
-        "Direction", "Trade Price", "LTP", "Signal Entry", "Entry",
-        "Initial SL", "SL", "Current", "Exit", "Status", "Exit Reason",
-        "Points P&L", "P&L %", "Closed", "Duration (min)",
-        "SL Trails", "Last SL Update", "First Logged",
-    ]
-
-
-def _dedupe_trade_rows(rows):
-    """
-    Keep exactly one Fresh Trade per SYMBOL per DAY.
-
-    The user wants the ledger to represent the actual trade event, not every
-    Streamlit refresh. If duplicates already exist, prefer:
-      1) ACTIVE row over CLOSED row
-      2) earliest immutable Entry Time
-    """
-    if not rows:
-        return []
-
-    df = pd.DataFrame(rows)
-
-    for col in _fresh_trade_columns():
-        if col not in df.columns:
-            df[col] = np.nan
-
-    def _clean_time(row):
-        for key in ("Entry Time", "First Logged", "Opened"):
-            value = row.get(key)
-            if value is None:
-                continue
-            text = str(value).strip()
-            if text and text.lower() not in {"nan", "none", "nat"}:
-                return text
-        return ""
-
-    df["Entry Time"] = df.apply(_clean_time, axis=1)
-
-    df["_date_key"] = df["Date"].astype(str).str.strip()
-    df["_symbol_key"] = (
-        df["Symbol"].astype(str).str.upper().str.strip()
-    )
-
-    # Prefer the active record. If several exist, keep the earliest real
-    # exchange timestamp.
-    df["_active_rank"] = (
-        df["Status"].astype(str).str.upper().eq("ACTIVE").astype(int)
-    )
-    df["_entry_sort"] = pd.to_datetime(
-        df["Entry Time"],
-        format="%d-%b-%Y %H:%M:%S IST",
-        errors="coerce",
-    )
-
-    df = df.sort_values(
-        ["_date_key", "_symbol_key", "_active_rank", "_entry_sort"],
-        ascending=[True, True, False, True],
-        na_position="last",
-    )
-
-    df = df.drop_duplicates(
-        subset=["_date_key", "_symbol_key"],
-        keep="first",
-    )
-
-    return df[_fresh_trade_columns()].to_dict("records")
-
-
-
-def _load_day_trade_rows(day):
-    path = _fresh_trade_path(day)
-    if not path.exists():
-        return []
-
-    try:
-        df = pd.read_csv(path)
-
-        for col in _fresh_trade_columns():
-            if col not in df.columns:
-                df[col] = np.nan
-
-        rows = df[_fresh_trade_columns()].to_dict("records")
-
-        # Remove impossible NSE entries created outside the actual market window.
-        # This fixes historical bogus rows such as 16:40 for NSE Intraday.
-        clean_rows = []
-        for row in rows:
-            module = str(row.get("Module", "")).upper().strip()
-            mode = str(row.get("Mode", "")).upper().strip()
-            if module == "NSE":
-                raw_time = str(row.get("Entry Time", "")).strip()
-                parsed_time = pd.to_datetime(
-                    raw_time,
-                    format="%d-%b-%Y %H:%M:%S IST",
-                    errors="coerce",
-                )
-                if mode == "INTRADAY" and pd.notna(parsed_time):
-                    t = parsed_time.time()
-                    if not (
-                        datetime.strptime("09:15", "%H:%M").time()
-                        <= t
-                        <= datetime.strptime("15:40", "%H:%M").time()
-                    ):
-                        continue
-                # Positional fresh entries are also only created in the live window.
-                if mode == "POSITIONAL" and pd.notna(parsed_time):
-                    t = parsed_time.time()
-                    if not (
-                        datetime.strptime("09:15", "%H:%M").time()
-                        <= t
-                        <= datetime.strptime("15:40", "%H:%M").time()
-                    ):
-                        continue
-            clean_rows.append(row)
-
-        cleaned = _dedupe_trade_rows(clean_rows)
-
-        # Persist cleanup so old duplicate/invalid entries disappear permanently.
-        pd.DataFrame(
-            cleaned,
-            columns=_fresh_trade_columns(),
-        ).to_csv(path, index=False)
-
-        return cleaned
-
-    except Exception:
-        return []
-
-
-
-def _load_fresh_trades_today():
-    today = local_now().date()
-    if st.session_state.get("fresh_trade_loaded_date") == today:
-        return
-    st.session_state.fresh_trade_log = _dedupe_trade_rows(
-        _load_day_trade_rows(today)
-    )
-    st.session_state.fresh_trade_loaded_date = today
-    try:
-        pd.DataFrame(
-            st.session_state.fresh_trade_log,
-            columns=_fresh_trade_columns(),
-        ).to_csv(_fresh_trade_path(today), index=False)
-    except Exception:
-        pass
-
-
-def _save_fresh_trades_today():
-    _load_fresh_trades_today()
-    try:
-        pd.DataFrame(
-            st.session_state.fresh_trade_log,
-            columns=_fresh_trade_columns(),
-        ).to_csv(_fresh_trade_path(local_now().date()), index=False)
-    except Exception:
-        pass
-
-
-def _canonicalize_ledger_df(df):
-    """Normalize old ledgers and enforce one actual trade per symbol/day."""
-    if df is None or df.empty:
-        return pd.DataFrame(columns=_fresh_trade_columns())
-
-    x = df.copy()
-
-    for col in _fresh_trade_columns():
-        if col not in x.columns:
-            x[col] = np.nan
-
-    # Recover a missing Entry Time from First Logged only when it represents
-    # a valid market-hours timestamp. Never manufacture an after-hours
-    # timestamp from a refresh.
-    def valid_entry_time(row):
-        raw_entry = str(row.get("Entry Time", "")).strip()
-        raw_first = str(row.get("First Logged", "")).strip()
-
-        for raw in (raw_entry, raw_first):
-            if not raw or raw.lower() in {"nan", "none", "nat"}:
-                continue
-            parsed = pd.to_datetime(
-                raw,
-                format="%d-%b-%Y %H:%M:%S IST",
-                errors="coerce",
-            )
-            if pd.isna(parsed):
-                continue
-
-            module = str(row.get("Module", "")).upper().strip()
-            if module == "NSE":
-                t = parsed.time()
-                if not (
-                    datetime.strptime("09:15", "%H:%M").time()
-                    <= t
-                    <= datetime.strptime("15:40", "%H:%M").time()
-                ):
-                    continue
-
-            return raw
-
-        return "TIME UNAVAILABLE"
-
-    x["Entry Time"] = x.apply(valid_entry_time, axis=1)
-
-    if "LTP" not in x.columns:
-        x["LTP"] = x["Current"]
-    else:
-        x["LTP"] = pd.to_numeric(x["LTP"], errors="coerce")
-        x["LTP"] = x["LTP"].fillna(pd.to_numeric(x["Current"], errors="coerce"))
-
-    # Historical report rows from the broken versions may contain entries
-    # generated after NSE close. Remove them completely.
-    def is_valid_row(row):
-        module = str(row.get("Module", "")).upper().strip()
-
-        if module != "NSE":
-            parsed = pd.to_datetime(
-                str(row.get("Entry Time", "")),
-                format="%d-%b-%Y %H:%M:%S IST",
-                errors="coerce",
-            )
-            return bool(
-                pd.notna(parsed)
-                and pd.notna(
-                    pd.to_numeric(
-                        row.get("Initial SL"),
-                        errors="coerce",
-                    )
-                )
-            )
-
-        parsed = pd.to_datetime(
-            str(row.get("Entry Time", "")),
-            format="%d-%b-%Y %H:%M:%S IST",
-            errors="coerce",
-        )
-        if pd.isna(parsed):
-            return False
-
-        t = parsed.time()
-        if not (
-            datetime.strptime("09:15", "%H:%M").time()
-            <= t
-            <= datetime.strptime("15:40", "%H:%M").time()
-        ):
-            return False
-
-        # A genuine NSE trade must have an initial SL.
-        return pd.notna(
-            pd.to_numeric(row.get("Initial SL"), errors="coerce")
-        )
-
-    x = x[x.apply(is_valid_row, axis=1)].copy()
-
-    # One actual trade = one row per symbol/day.
-    x["_date_key"] = x["Date"].astype(str).str.strip()
-    x["_symbol_key"] = x["Symbol"].astype(str).str.upper().str.strip()
-
-    x["_active_rank"] = (
-        x["Status"].astype(str).str.upper().eq("ACTIVE").astype(int)
-    )
-    x["_time_sort"] = pd.to_datetime(
-        x["Entry Time"],
-        format="%d-%b-%Y %H:%M:%S IST",
-        errors="coerce",
-    )
-
-    x = x.sort_values(
-        ["_date_key", "_symbol_key", "_active_rank", "_time_sort"],
-        ascending=[True, True, False, True],
-        na_position="last",
-    )
-
-    # Prefer the earliest legitimate record for the one real trade.
-    x = x.drop_duplicates(
-        subset=["_date_key", "_symbol_key"],
-        keep="first",
-    )
-
-    return x[_fresh_trade_columns()].reset_index(drop=True)
-
-
-def _all_trade_ledger_dataframe():
-    frames = []
-
-    for path in sorted(FRESH_TRADE_DIR.glob("fresh_trades_*.csv")):
-        try:
-            df = pd.read_csv(path)
-        except Exception:
-            continue
-        frames.append(df)
-
-    if not frames:
-        return pd.DataFrame(columns=_fresh_trade_columns())
-
-    out = pd.concat(frames, ignore_index=True)
-    out = _canonicalize_ledger_df(out)
-
-    # Persist canonical cleanup for each day file. This makes the downloaded
-    # report clean from then on as well.
-    if not out.empty and "Date" in out.columns:
-        for day_value in sorted(out["Date"].astype(str).unique()):
-            day_path = FRESH_TRADE_DIR / (
-                f"fresh_trades_{pd.to_datetime(day_value, format='%d-%b-%Y', errors='coerce').strftime('%Y-%m-%d')}.csv"
-            )
-            if str(day_path).endswith("NaT.csv"):
-                continue
-            day_df = out[out["Date"].astype(str) == day_value].copy()
-            try:
-                day_df.to_csv(day_path, index=False)
-            except Exception:
-                pass
-
-    return out.reset_index(drop=True)
-
-
-
-def _update_trade_ledger_row(trade):
-    trade_id = str(trade.get("Trade ID", "")).strip()
-    if not trade_id:
-        return
-
-    for path in sorted(FRESH_TRADE_DIR.glob("fresh_trades_*.csv")):
-        try:
-            df = pd.read_csv(path)
-        except Exception:
-            continue
-
-        if "Trade ID" not in df.columns:
-            continue
-
-        df["Trade ID"] = df["Trade ID"].astype(str)
-        matches = df.index[df["Trade ID"] == trade_id].tolist()
-        if not matches:
-            continue
-
-        idx = matches[0]
-        for col in _fresh_trade_columns():
-            if col in trade:
-                df.loc[idx, col] = trade.get(col)
-
-        for col in _fresh_trade_columns():
-            if col not in df.columns:
-                df[col] = np.nan
-
-        df[_fresh_trade_columns()].to_csv(path, index=False)
-        return
-
-
-def _record_fresh_trade(trade, trade_price):
-    _load_fresh_trades_today()
-
-    symbol_key = str(trade.get("Symbol", "")).upper().strip()
-    date_key = str(
-        trade.get("Date", local_now().strftime("%d-%b-%Y"))
-    ).strip()
-
-    if not symbol_key:
-        return
-
-    # Idempotent symbol/day guard. This catches duplicate Trade IDs as well
-    # as duplicate trades generated by repeated reruns.
-    for existing in st.session_state.get("fresh_trade_log", []):
-        if (
-            str(existing.get("Date", "")).strip() == date_key
-            and str(existing.get("Symbol", "")).upper().strip() == symbol_key
-        ):
-            return
-
-    trade_id = str(trade.get("Trade ID", "")).strip()
-    if not trade_id:
-        return
-
-    entry_time = str(
-        trade.get("Entry Time")
-        or ""
-    ).strip()
-
-    # Never replace a missing exchange timestamp with a dashboard refresh time.
-    if not entry_time or entry_time.lower() in {"nan", "none", "nat"}:
-        entry_time = "TIME UNAVAILABLE"
-
-    row = {
-        "Trade ID": trade_id,
-        "Date": date_key,
-        "Entry Time": entry_time,
-        "Module": trade.get("Module", ""),
-        "Mode": trade.get("Mode", ""),
-        "Symbol": trade.get("Symbol", ""),
-        "Direction": trade.get("Direction", ""),
-        "Trade Price": float(trade.get("Entry", trade_price)) if pd.notna(trade.get("Entry", trade_price)) else np.nan,
-        "LTP": float(trade.get("LTP", trade.get("Current", trade_price))) if pd.notna(trade.get("LTP", trade.get("Current", trade_price))) else np.nan,
-        "Signal Entry": trade.get("Signal Entry", np.nan),
-        "Entry": trade.get("Entry", np.nan),
-        "Initial SL": trade.get("Initial SL", np.nan),
-        "SL": trade.get("SL", np.nan),
-        "Current": trade.get("Current", trade_price),
-        "Exit": trade.get("Exit", np.nan),
-        "Status": trade.get("Status", "ACTIVE"),
-        "Exit Reason": trade.get("Exit Reason", ""),
-        "Points P&L": trade.get("Points P&L", np.nan),
-        "P&L %": trade.get("P&L %", np.nan),
-        "Closed": trade.get("Closed", ""),
-        "Duration (min)": trade.get("Duration (min)", np.nan),
-        "SL Trails": trade.get("SL Trails", 0),
-        "Last SL Update": trade.get("Last SL Update", ""),
-        "First Logged": entry_time,
-    }
-
-    st.session_state.fresh_trade_log.insert(0, row)
-
-    # Always normalize the ledger after insertion.
-    st.session_state.fresh_trade_log = _dedupe_trade_rows(
-        st.session_state.fresh_trade_log
-    )
-    _save_fresh_trades_today()
-
-
-
-def _sync_fresh_trade_status():
-    _load_fresh_trades_today()
-    current = {
-        str(t.get("Trade ID")): t
-        for t in st.session_state.trade_book.values()
-    }
-
-    changed = False
-    for row in st.session_state.fresh_trade_log:
-        trade = current.get(str(row.get("Trade ID")))
-        if trade is None:
-            continue
-
-        new_status = (
-            "ACTIVE"
-            if trade.get("Status", trade.get("status")) == "ACTIVE"
-            else "CLOSED"
-        )
-        if row.get("Status") != new_status:
-            row["Status"] = new_status
-            changed = True
-
-    if changed:
-        _save_fresh_trades_today()
-
-
-def fresh_trades_dataframe():
-    _sync_fresh_trade_status()
-    df = pd.DataFrame(
-        st.session_state.fresh_trade_log,
-        columns=_fresh_trade_columns(),
-    )
-    if df.empty:
-        return df
-
-    # Immutable Entry Time: never use the page-refresh time as a substitute.
-    for col in ("Entry Time", "First Logged"):
-        if col not in df.columns:
-            df[col] = ""
-
-    def _time_value(row):
-        for key in ("Entry Time", "First Logged"):
-            text = str(row.get(key, "")).strip()
-            if text and text.lower() not in {"nan", "none", "nat"}:
-                return text
-        return "TIME UNAVAILABLE (LEGACY)"
-
-    df["Entry Time"] = df.apply(_time_value, axis=1)
-
-    # One ledger row per symbol per module/mode/day.
-    df = pd.DataFrame(
-        _dedupe_trade_rows(df.to_dict("records")),
-        columns=_fresh_trade_columns(),
-    )
-
-    for col in [
-        "Trade Price", "Signal Entry", "Entry", "Initial SL", "SL",
-        "Current", "Exit", "Points P&L", "P&L %",
-        "Duration (min)", "SL Trails",
-    ]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df.reset_index(drop=True)
-
-
-
-def trade_report_dataframe(selected_date=None):
-    df = _canonicalize_ledger_df(_all_trade_ledger_dataframe())
-    if df.empty:
-        return df
-
-    parsed = pd.to_datetime(
-        df["Date"],
-        format="%d-%b-%Y",
-        errors="coerce",
-    )
-
-    if selected_date is not None:
-        df = df[parsed.dt.date == selected_date].copy()
-
-    sort_time = pd.to_datetime(
-        df["Entry Time"],
-        format="%d-%b-%Y %H:%M:%S IST",
-        errors="coerce",
-    )
-    if sort_time.notna().any():
-        df = df.assign(_sort=sort_time)
-        df = df.sort_values("_sort", ascending=False).drop(columns="_sort")
-
-    return df.reset_index(drop=True)
-
-
-def _available_trade_dates():
-    df = _all_trade_ledger_dataframe()
-    if df.empty:
-        return []
-
-    dates = pd.to_datetime(
-        df["Date"],
-        format="%d-%b-%Y",
-        errors="coerce",
-    ).dropna().dt.date
-    return sorted(set(dates), reverse=True)
-
-
-def _restore_active_trades_from_ledger():
-    """Restore persistent active trades after a Streamlit session restart."""
-    if st.session_state.get("_trade_book_restored"):
-        return
-
-    df = _all_trade_ledger_dataframe()
-    if df.empty:
-        st.session_state._trade_book_restored = True
-        return
-
-    today = local_now().date()
-
-    for _, row in df.iterrows():
-        if str(row.get("Status", "")) != "ACTIVE":
-            continue
-
-        module = str(row.get("Module", ""))
-        mode = str(row.get("Mode", ""))
-
-        parsed_date = pd.to_datetime(
-            str(row.get("Date", "")),
-            format="%d-%b-%Y",
-            errors="coerce",
-        )
-
-        # Intraday trades should not leak into the next trading day.
-        # Positional trades may remain overnight, but only valid live-market
-        # entry timestamps are eligible to be restored.
-        if (
-            mode == "Intraday"
-            and (
-                pd.isna(parsed_date)
-                or parsed_date.date() != today
-            )
-        ):
-            continue
-
-        symbol = str(row.get("Symbol", "")).strip()
-        if not symbol:
-            continue
-
-        key = _trade_key(module, mode, symbol)
-        if key in st.session_state.trade_book:
-            continue
-
-        entry_time = str(
-            row.get("Entry Time")
-            or row.get("First Logged")
-            or row.get("Opened")
-            or ""
-        )
-        trade = {
-            col: row.get(col, np.nan)
-            for col in [
-                "Trade ID", "Date", "Module", "Mode", "Symbol", "Direction",
-                "Signal Entry", "Entry", "Initial SL", "SL", "Current",
-                "Exit", "Status", "Exit Reason", "Points P&L", "P&L %",
-                "Closed", "Duration (min)", "SL Trails", "Last SL Update",
-            ]
-        }
-        trade["Entry Time"] = entry_time
-        trade["Opened"] = entry_time
-        trade["LTP"] = pd.to_numeric(row.get("LTP"), errors="coerce")
-        if pd.isna(trade["LTP"]):
-            trade["LTP"] = pd.to_numeric(row.get("Current"), errors="coerce")
-
-        st.session_state.trade_book[key] = trade
-
-    st.session_state._trade_book_restored = True
-
-
-def render_fresh_trades_module():
-    df = fresh_trades_dataframe()
-
-    st.markdown(
-        '<div class="alpha-hero"><div class="alpha-hero-title">FRESH TRADES</div>'
-        '<div class="alpha-hero-sub">New trades detected today • exact signal-detection time and actual entry price</div>'
-        '<span class="alpha-badge">AUTO LOGGED</span></div>',
-        unsafe_allow_html=True,
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Date", local_now().strftime("%d-%b-%Y"))
-    c2.metric("Fresh Trades", len(df))
-    c3.metric(
-        "Active",
-        int((df["Status"] == "ACTIVE").sum()) if not df.empty else 0,
-    )
-    c4.metric(
-        "Closed",
-        int((df["Status"] == "CLOSED").sum()) if not df.empty else 0,
-    )
-
-    st.markdown(
-        "<div class=\"alpha-section\"><span class=\"alpha-section-dot\" "
-        "style=\"background:#22d77c;\"></span>TODAY'S TRADE LEDGER</div>",
-        unsafe_allow_html=True,
-    )
-
-    if df.empty:
-        st.info("No fresh trades detected today.")
-        st.caption(
-            "A row is created only when the live analyzer opens a new trade."
-        )
-        return
-
-    display = df[[
-        "Entry Time", "Symbol", "Mode", "Direction",
-        "Trade Price", "LTP", "Initial SL", "SL", "Status",
-    ]].copy()
-
-    st.dataframe(
-        display,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Trade Price": st.column_config.NumberColumn(
-                "Entry Price", format="%.2f"
-            ),
-            "LTP": st.column_config.NumberColumn(
-                "LTP", format="%.2f"
-            ),
-            "Initial SL": st.column_config.NumberColumn(
-                "Initial SL", format="%.2f"
-            ),
-            "SL": st.column_config.NumberColumn(
-                "Dynamic SL", format="%.2f"
-            ),
-            "Exit": st.column_config.NumberColumn(
-                "Exit", format="%.2f"
-            ),
-        },
-    )
-
-    st.download_button(
-        "⬇️ Download Today's Fresh Trades",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=f"alpha_fresh_trades_{local_now().strftime('%Y-%m-%d')}.csv",
-        mime="text/csv",
-        key="download_fresh_trades_today",
-    )
-
-
-def render_trade_logs_module():
-    dates = _available_trade_dates()
-
-    st.markdown(
-        '<div class="alpha-hero"><div class="alpha-hero-title">TRADE LOGS</div>'
-        '<div class="alpha-hero-sub">Day-wise setup performance and trade history</div>'
-        '<span class="alpha-badge">HISTORICAL</span></div>',
-        unsafe_allow_html=True,
-    )
-
-    if not dates:
-        st.info("No persistent trade history is available yet.")
-        return
-
-    selected_date = st.date_input(
-        "Select trading date",
-        value=dates[0],
-        min_value=min(dates),
-        max_value=max(dates),
-        key="trade_log_selected_date",
-    )
-
-    df = trade_report_dataframe(selected_date)
-    closed = df[df["Status"] == "CLOSED"].copy()
-    active = df[df["Status"] == "ACTIVE"].copy()
-
-    pnl = pd.to_numeric(closed["Points P&L"], errors="coerce")
-    wins = int((pnl > 0).sum()) if not closed.empty else 0
-    losses = int((pnl < 0).sum()) if not closed.empty else 0
-    net_points = float(pnl.sum()) if not closed.empty else 0.0
-    win_rate = 100.0 * wins / len(closed) if not closed.empty else 0.0
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Trades", len(df))
-    c2.metric("Closed", len(closed))
-    c3.metric("Active", len(active))
-    c4.metric("Win Rate", f"{win_rate:.1f}%")
-    c5.metric("Net Points", f"{net_points:.2f}")
-
-    st.markdown("### Trade History")
-
-    if df.empty:
-        st.info("No trades were recorded on the selected date.")
-        return
-
-    # Exactly the client-facing fields requested.
-    display = df[
-        [
-            "Entry Time",
-            "Symbol",
-            "Mode",
-            "Direction",
-            "Trade Price",
-            "LTP",
-            "Initial SL",
-            "SL",
-            "Status",
-        ]
-    ].copy()
-
-    st.dataframe(
-        display,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Trade Price": st.column_config.NumberColumn(
-                "Trade Price", format="%.2f"
-            ),
-            "Initial SL": st.column_config.NumberColumn(
-                "Initial SL", format="%.2f"
-            ),
-            "SL": st.column_config.NumberColumn(
-                "Dynamic SL", format="%.2f"
-            ),
-        },
-    )
-
-    st.markdown("### Day Performance")
-    perf = pd.DataFrame([{
-        "Date": selected_date.strftime("%d-%b-%Y"),
-        "Trades": len(df),
-        "Closed": len(closed),
-        "Active": len(active),
-        "Wins": wins,
-        "Losses": losses,
-        "Win Rate %": win_rate,
-        "Net Points": net_points,
-        "Stop / Dynamic SL Exits": (
-            int(
-                closed["Exit Reason"].astype(str).isin(
-                    ["Stop Loss", "Dynamic SL"]
-                ).sum()
-            )
-            if not closed.empty else 0
-        ),
-        "Dynamic SL Trails": (
-            int(pd.to_numeric(df["SL Trails"], errors="coerce").sum())
-            if not df.empty else 0
-        ),
-    }])
-    st.dataframe(perf, use_container_width=True, hide_index=True)
-
-    # Detailed columns stay in the downloadable report only.
-    st.download_button(
-        "⬇️ Download Selected Day Report",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=f"alpha_trade_report_{selected_date.strftime('%Y-%m-%d')}.csv",
-        mime="text/csv",
-        key=f"trade_report_selected_{selected_date.isoformat()}",
-    )
-
-
-
-
-# -----------------------------
-# Trade Book / Active Trade Manager
-# -----------------------------
-def _trade_key(module_name, mode, symbol):
-    return f"{module_name}|{mode}|{symbol}"
-
-
-def _trade_points_pnl(direction, entry, exit_price):
-    if pd.isna(entry) or pd.isna(exit_price):
-        return np.nan
-    if direction == "LONG":
-        return float(exit_price) - float(entry)
-    return float(entry) - float(exit_price)
-
-
-def _trade_pct_pnl(direction, entry, exit_price):
-    if pd.isna(entry) or pd.isna(exit_price) or float(entry) == 0:
-        return np.nan
-    points = _trade_points_pnl(direction, entry, exit_price)
-    return 100.0 * points / float(entry)
-
-
-def _trade_duration_minutes(opened_at, closed_at=None):
-    try:
-        end = closed_at or datetime.now()
-        return round((end - opened_at).total_seconds() / 60.0, 1)
-    except Exception:
-        return np.nan
-
-
-
-def _trade_key(module_name, mode, symbol):
-    return f"{module_name}|{mode}|{symbol}"
-
-
-def _trade_points_pnl(direction, entry, exit_price):
-    if pd.isna(entry) or pd.isna(exit_price):
-        return np.nan
-    return (
-        float(exit_price) - float(entry)
-        if direction == "LONG"
-        else float(entry) - float(exit_price)
-    )
-
-
-def _trade_pct_pnl(direction, entry, exit_price):
-    if pd.isna(entry) or pd.isna(exit_price) or float(entry) == 0:
-        return np.nan
-    return 100.0 * _trade_points_pnl(
-        direction, entry, exit_price
-    ) / abs(float(entry))
-
-
-def _trade_duration_minutes(opened_at, closed_at=None):
-    try:
-        end = closed_at or local_now()
-        return round((end - opened_at).total_seconds() / 60.0, 1)
-    except Exception:
-        return np.nan
-
-
-def _valid_nse_market_timestamp(value):
-    """Return True only for a real NSE market timestamp in the trade window."""
-    text = _normalize_market_time(value)
-    if not text:
-        return False
-    try:
-        parsed = datetime.strptime(text, "%d-%b-%Y %H:%M:%S IST")
-    except Exception:
-        return False
-    return (
-        datetime.strptime("09:15", "%H:%M").time()
-        <= parsed.time()
-        <= datetime.strptime("15:40", "%H:%M").time()
-    )
-
-
-def _valid_trade_timestamp(module_name, value):
-    if module_name == "NSE":
-        return _valid_nse_market_timestamp(value)
-    return bool(_normalize_market_time(value))
-
-
-def _normalize_market_time(value):
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text or text.lower() in {"nan", "none", "nat"}:
-        return None
-    return text
-
-
-def _upsert_trade_record(
-    module_name,
-    mode,
-    symbol,
-    direction,
-    signal_entry,
-    actual_entry,
-    sl,
-    market_time=None,
-):
-    key = _trade_key(module_name, mode, symbol)
-    book = st.session_state.trade_book
-
-    existing = book.get(key)
-    if existing and existing.get("Status", existing.get("status")) == "ACTIVE":
-        return existing, False
-
-    # Hard validation: a Fresh Trade is created only when all required
-    # live-market fields are present.
-    market_time = _normalize_market_time(market_time)
-    if not _valid_trade_timestamp(module_name, market_time):
-        return None, False
-
-    actual_entry = (
-        float(actual_entry)
-        if pd.notna(actual_entry)
-        else np.nan
-    )
-    initial_sl = (
-        float(sl)
-        if pd.notna(sl)
-        else np.nan
-    )
-
-    if not pd.notna(actual_entry):
-        return None, False
-
-    # We do not log a complete trade without an initial structural SL.
-    if not pd.notna(initial_sl):
-        return None, False
-
-    opened = local_now()
-    st.session_state.trade_sequence += 1
-
-    trade_id = (
-        f"T{opened.strftime('%Y%m%d%H%M%S')}-"
-        f"{st.session_state.trade_sequence:03d}"
-    )
-
-    signal_entry = (
-        float(signal_entry)
-        if pd.notna(signal_entry)
-        else np.nan
-    )
-
-    trade = {
-        "Trade ID": trade_id,
-        "Date": opened.strftime("%d-%b-%Y"),
-        "Module": module_name,
-        "Mode": mode,
-        "Symbol": symbol,
-        "Direction": direction,
-        "Signal Entry": signal_entry,
-        "Entry": actual_entry,
-        "Initial SL": initial_sl,
-        "SL": initial_sl,
-        "Current": actual_entry,
-        "LTP": actual_entry,
-        "Exit": np.nan,
-        "Status": "ACTIVE",
-        "Exit Reason": "",
-        "Points P&L": np.nan,
-        "P&L %": np.nan,
-        "Entry Time": market_time,
-        "Opened": opened.strftime("%d-%b-%Y %H:%M:%S IST"),
-        "Closed": "",
-        "Duration (min)": np.nan,
-        "SL Trails": 0,
-        "Last SL Update": "",
-    }
-
-    book[key] = trade
-    return trade, True
-
-
-
-def _close_trade_record(trade, exit_price, reason):
-    now = local_now()
-
-    trade["Exit"] = (
-        float(exit_price) if pd.notna(exit_price) else np.nan
-    )
-    trade["Current"] = trade["Exit"]
-    trade["Status"] = "CLOSED"
-    trade["Exit Reason"] = str(reason)
-
-    trade["Points P&L"] = _trade_points_pnl(
-        trade["Direction"],
-        trade["Entry"],
-        trade["Exit"],
-    )
-    trade["P&L %"] = _trade_pct_pnl(
-        trade["Direction"],
-        trade["Entry"],
-        trade["Exit"],
-    )
-    trade["Closed"] = now.strftime("%d-%b-%Y %H:%M:%S IST")
-
-    try:
-        opened_text = str(trade.get("Entry Time", "")).replace(" IST", "")
-        opened_dt = datetime.strptime(
-            opened_text,
-            "%d-%b-%Y %H:%M:%S",
-        ).replace(tzinfo=LOCAL_TZ)
-        trade["Duration (min)"] = _trade_duration_minutes(
-            opened_dt,
-            now,
-        )
-    except Exception:
-        trade["Duration (min)"] = np.nan
-
-    _update_trade_ledger_row(trade)
-
-
-def _can_create_fresh_trade(module_name, mode):
-    now_t = local_now().time()
-
-    if module_name == "NSE":
-        return (
-            datetime.strptime("09:15", "%H:%M").time()
-            <= now_t
-            <= datetime.strptime("15:40", "%H:%M").time()
-        )
-
-    if module_name == "MCX":
-        return (
-            datetime.strptime("09:00", "%H:%M").time()
-            <= now_t
-            <= datetime.strptime("23:30", "%H:%M").time()
-        )
-
-    return True
-
-def _trade_already_logged_today(module_name, mode, symbol):
-    """
-    One actual trade per symbol per trading day.
-
-    This is intentionally independent of module/mode so the same underlying
-    stock cannot be logged repeatedly as a fresh trade by repeated refreshes
-    or by another dashboard module.
-    """
-    _load_fresh_trades_today()
-
-    today = local_now().strftime("%d-%b-%Y")
-    target_symbol = str(symbol).upper().strip()
-
-    # Check persistent ledger first.
-    for row in st.session_state.get("fresh_trade_log", []):
-        row_date = str(row.get("Date", "")).strip()
-        row_symbol = str(row.get("Symbol", "")).upper().strip()
-        if row_date == today and row_symbol == target_symbol:
-            return True
-
-    # Also check the live trade book in case the current trade was just
-    # created in this same run and has not yet been persisted.
-    for trade in st.session_state.get("trade_book", {}).values():
-        if (
-            str(trade.get("Date", "")).strip() == today
-            and str(trade.get("Symbol", "")).upper().strip() == target_symbol
-        ):
-            return True
-
-    return False
-
-
-
-
-def _sticky_active_rows_for_display(module_name, mode, res):
-    """
-    Return active logged trades that should remain visible even when the
-    current signal scanner has become neutral.
-
-    A logged trade is sticky until the trade manager records an exit.
-    """
-    today = local_now().strftime("%d-%b-%Y")
-    existing = set()
-
-    if res is not None and not res.empty and "Script" in res.columns:
-        existing = {
-            str(x).replace("★★ ", "").replace("★ ", "").strip().upper()
-            for x in res["Script"].tolist()
-        }
-
-    rows = []
-
-    for trade in st.session_state.get("trade_book", {}).values():
-        if (
-            str(trade.get("Module", "")).upper().strip() != str(module_name).upper().strip()
-            or str(trade.get("Mode", "")).upper().strip() != str(mode).upper().strip()
-            or str(trade.get("Status", "")).upper().strip() != "ACTIVE"
-            or str(trade.get("Date", "")).strip() != today
-        ):
-            continue
-
-        symbol = str(trade.get("Symbol", "")).upper().strip()
-        if not symbol or symbol in existing:
-            continue
-
-        direction = str(trade.get("Direction", "")).upper().strip()
-        rec = "🟢 BUY" if direction == "LONG" else "🔴 SELL"
-
-        rows.append({
-            "Script": symbol,
-            "LTP": trade.get("LTP", trade.get("Current", np.nan)),
-            "Bias": "ACTIVE TRADE",
-            "Pattern": "LOGGED",
-            "OI Confirmation": "ACTIVE TRADE",
-            "OI Δ%": np.nan,
-            "Entry": trade.get("Entry", np.nan),
-            "SL": trade.get("SL", np.nan),
-            "Recommendation": rec,
-            "_OI Rank": 9999,
-            "_Sector Confirmed": False,
-            "_Sector": sector_of(symbol),
-            "_Sector Breadth %": np.nan,
-        })
-
-    return pd.DataFrame(rows)
-
-
-def _is_active_logged_trade(module_name, mode, symbol):
-    today = local_now().strftime("%d-%b-%Y")
-    target = str(symbol).upper().strip()
-    try:
-        df = _all_trade_ledger_dataframe()
-        if df.empty:
-            return False
-        hit = df[
-            (df["Date"].astype(str).str.strip() == today)
-            & (df["Module"].astype(str).str.upper().str.strip() == str(module_name).upper().strip())
-            & (df["Mode"].astype(str).str.upper().str.strip() == str(mode).upper().strip())
-            & (df["Symbol"].astype(str).str.upper().str.strip() == target)
-            & (df["Status"].astype(str).str.upper().str.strip() == "ACTIVE")
-        ]
-        return not hit.empty
-    except Exception:
-        return False
-
-
-def manage_trade_book(module_name, mode, signal_rows):
-    """
-    Persistent NSE/MCX trade manager.
-
-    Universal P&F structural dynamic SL:
-      LONG  -> SL moves upward only.
-      SHORT -> SL moves downward only.
-
-    Entry Time and actual Entry Price are immutable after trade creation.
-    """
-    opened = []
-    exited = []
-
-    rows = (
-        signal_rows.copy()
-        if signal_rows is not None
-        else pd.DataFrame()
-    )
-
-    for _, row in rows.iterrows():
-        symbol = (
-            str(row.get("Script", ""))
-            .replace("★★ ", "")
-            .replace("★ ", "")
-            .strip()
-        )
-        if not symbol:
-            continue
-
-        rec = str(row.get("Recommendation", ""))
-        ltp = pd.to_numeric(row.get("LTP"), errors="coerce")
-        signal_entry = pd.to_numeric(
-            row.get("Entry"),
-            errors="coerce",
-        )
-        structural_sl = pd.to_numeric(
-            row.get("SL"),
-            errors="coerce",
-        )
-
-        if rec in ("🟢 BUY", "🟢 LONG"):
-            direction = "LONG"
-        elif rec in ("🔴 SELL", "🔴 SHORT"):
-            direction = "SHORT"
-        else:
-            direction = None
-
-        key = _trade_key(module_name, mode, symbol)
-        active = st.session_state.trade_book.get(key)
-
-        if active is None and _is_active_logged_trade(
-            module_name, mode, symbol
-        ):
-            _restore_active_trades_from_ledger()
-            active = st.session_state.trade_book.get(key)
-
-        # ---------------------------
-        # EXISTING ACTIVE TRADE
-        # ---------------------------
-        if active and active.get(
-            "Status",
-            active.get("status"),
-        ) == "ACTIVE":
-
-            if pd.notna(ltp):
-                active["Current"] = float(ltp)
-                active["LTP"] = float(ltp)
-                _update_trade_ledger_row(active)
-
-            trail_moved = False
-
-            # Universal dynamic structural stop:
-            # LONG: only a higher structural SL is accepted.
-            # SHORT: only a lower structural SL is accepted.
-            if (
-                pd.notna(structural_sl)
-                and pd.notna(active.get("SL"))
-            ):
-                old_sl = float(active["SL"])
-                new_sl = float(structural_sl)
-
-                should_trail = (
-                    (
-                        active["Direction"] == "LONG"
-                        and new_sl > old_sl
-                    )
-                    or
-                    (
-                        active["Direction"] == "SHORT"
-                        and new_sl < old_sl
-                    )
-                )
-
-                if should_trail:
-                    active["SL"] = new_sl
-                    active["SL Trails"] = int(
-                        active.get("SL Trails", 0)
-                    ) + 1
-                    active["Last SL Update"] = local_now().strftime(
-                        "%d-%b-%Y %H:%M:%S IST"
-                    )
-                    _update_trade_ledger_row(active)
-                    trail_moved = True
-
-                    st.toast(
-                        f"🔒 {symbol} dynamic SL moved to {new_sl:.2f}",
-                        icon="🔒",
-                    )
-                    speak_client_alert(
-                        f"{symbol} dynamic stop moved to {new_sl:.2f}",
-                        prefix="Dynamic stop",
-                    )
-
-            exit_reason = None
-
-            # Current dynamic SL.
-            if pd.notna(ltp) and pd.notna(active.get("SL")):
-                if (
-                    active["Direction"] == "LONG"
-                    and float(ltp) <= float(active["SL"])
-                ):
-                    exit_reason = (
-                        "Dynamic SL"
-                        if (
-                            trail_moved
-                            or int(active.get("SL Trails", 0)) > 0
-                        )
-                        else "Stop Loss"
-                    )
-
-                elif (
-                    active["Direction"] == "SHORT"
-                    and float(ltp) >= float(active["SL"])
-                ):
-                    exit_reason = (
-                        "Dynamic SL"
-                        if (
-                            trail_moved
-                            or int(active.get("SL Trails", 0)) > 0
-                        )
-                        else "Stop Loss"
-                    )
-
-            # Reverse signal.
-            if (
-                exit_reason is None
-                and direction is not None
-                and direction != active["Direction"]
-            ):
-                exit_reason = "Reverse Signal"
-
-            # NSE intraday end-of-day.
-            if (
-                exit_reason is None
-                and module_name == "NSE"
-                and mode == "Intraday"
-                and local_now().time()
-                >= datetime.strptime(
-                    "15:40", "%H:%M"
-                ).time()
-                and pd.notna(ltp)
-            ):
-                exit_reason = "End of Day"
-
-            # MCX intraday end-of-day.
-            if (
-                exit_reason is None
-                and module_name == "MCX"
-                and mode == "Intraday"
-                and local_now().time()
-                >= datetime.strptime(
-                    "23:30", "%H:%M"
-                ).time()
-                and pd.notna(ltp)
-            ):
-                exit_reason = "End of Day"
-
-            if exit_reason:
-                _close_trade_record(
-                    active,
-                    ltp,
-                    exit_reason,
-                )
-                exited.append(active.copy())
-            else:
-                _update_trade_ledger_row(active)
-
-            continue
-
-        # ---------------------------
-        # NEW TRADE
-        # ---------------------------
-        market_time = _normalize_market_time(row.get("Market Time"))
-
-        if (
-            direction is not None
-            and pd.notna(ltp)
-            and pd.notna(structural_sl)
-            and _can_create_fresh_trade(module_name, mode)
-            and _valid_trade_timestamp(module_name, market_time)
-            and not _trade_already_logged_today(
-                module_name,
-                mode,
-                symbol,
-            )
-        ):
-            trade, created = _upsert_trade_record(
-                module_name,
-                mode,
-                symbol,
-                direction,
-                signal_entry,
-                ltp,
-                structural_sl,
-                market_time=market_time,
-            )
-
-            if created and trade is not None:
-                _record_fresh_trade(
-                    trade,
-                    ltp,
-                )
-                opened.append(trade.copy())
-
-    return opened, exited
-
-
-
-def render_trade_monitor(module_name=None, mode=None):
-    """Current-day active/completed monitor + report download."""
-    df = trade_report_dataframe(local_now().date())
-
-    if module_name is not None:
-        df = df[df["Module"] == module_name]
-    if mode is not None:
-        df = df[df["Mode"] == mode]
-
-    if df.empty:
-        return
-
-    active = df[df["Status"] == "ACTIVE"].copy()
-    closed = df[df["Status"] == "CLOSED"].copy()
-
-    st.markdown("---")
-    st.markdown("### Trade Monitor")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Active", int(len(active)))
-    c2.metric("Completed", int(len(closed)))
-
-    if not closed.empty:
-        pnl = pd.to_numeric(
-            closed["Points P&L"],
-            errors="coerce",
-        )
-        winners = int((pnl > 0).sum())
-        win_rate = 100.0 * winners / len(closed)
-        total_points = float(pnl.sum())
-    else:
-        win_rate = 0.0
-        total_points = 0.0
-
-    c3.metric("Win Rate", f"{win_rate:.1f}%")
-    c4.metric("Net Points", f"{total_points:.2f}")
-
-    if not active.empty:
-        st.markdown("#### Active Trades")
-        st.dataframe(
-            active[
-                [
-                    "Symbol", "Direction", "Entry Time",
-                    "Trade Price", "Signal Entry", "Entry",
-                    "Initial SL", "SL", "Current", "Status",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    if not closed.empty:
-        st.markdown("#### Recent Closed Trades")
-        st.dataframe(
-            closed.head(20)[
-                [
-                    "Symbol", "Direction", "Entry Time",
-                    "Entry", "Exit", "Points P&L",
-                    "P&L %", "Exit Reason", "Closed", "SL Trails",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.download_button(
-        "⬇️ Download Today's Trade Report",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=(
-            f"alpha_trades_{local_now().strftime('%Y-%m-%d')}"
-            f"_{module_name or 'ALL'}_{mode or 'ALL'}.csv"
-        ),
-        mime="text/csv",
-        key=f"trade_report_{module_name}_{mode}",
-    )
-
-
-def notify_trade_exits(exited_trades):
-    for trade in exited_trades:
-        symbol = trade["Symbol"]
-        reason = trade["Exit Reason"]
-        st.toast(
-            f"Trade exit: {symbol} • {reason}",
-            icon="✅" if reason != "Stop Loss" else "⚠️",
-        )
-        speak_client_alert(
-            f"{symbol} trade exited because {reason}",
-            prefix="Trade exit",
-        )
-
-
-# -----------------------------
-# Notification Panel
-# -----------------------------
-def record_trade_notifications(module_name, mode, symbols):
-    """
-    Store the latest new-trade timestamps for the client notification panel.
-    Keeps a small rolling history per module/mode.
-    """
-    now_local = local_now()
-    now_text = now_local.strftime("%d-%b-%Y %H:%M:%S IST")
-    now_sort = now_local.isoformat()
-
-    if "notification_history" not in st.session_state:
-        st.session_state.notification_history = {}
-
-    key = f"{module_name}|{mode}"
-    history = st.session_state.notification_history.setdefault(key, [])
-
-    known = {item["symbol"] for item in history}
-
-    for symbol in symbols:
-        clean = str(symbol).replace("★ ", "").strip()
-        if not clean or clean in known:
-            continue
-
-        history.insert(
-            0,
-            {
-                "time": now_text,
-                "sort_time": now_sort,
-                "module": module_name,
-                "mode": mode,
-                "symbol": clean,
-            },
-        )
-
-    st.session_state.notification_history[key] = history[:10]
-
-
-def render_notification_panel():
-    """Top-right client notification panel."""
-    history = []
-
-    for items in st.session_state.get("notification_history", {}).values():
-        history.extend(items)
-
-    history = sorted(
-        history,
-        key=lambda x: x.get("sort_time", ""),
-        reverse=True,
-    )[:10]
-
-    with st.sidebar:
-        st.markdown("### 🔔 Recent Alerts")
-
-        if not history:
-            st.caption("No trades yet.")
-            return
-
-        for item in history[:5]:
-            st.markdown(
-                f"**{item['symbol']}**  \\n"
-                f"{item['module']} • {item['mode']}  \\n"
-                f"🕒 {item['time']}"
-            )
-            st.divider()
-
-
-
-def positional_sector_confirmation(df, symbol, direction):
-    """
-    Backend-only sector confirmation for already-valid positional P&F trades.
-    A sector confirms when at least 50% of its valid directional members agree.
-    """
-    try:
-        result = sector_breadth_star(df, symbol, direction)
-        return {
-            "confirmed": bool(result.get("star", False)),
-            "breadth": result.get("breadth", np.nan),
-            "sector": result.get("sector", "Other"),
-        }
-    except Exception:
-        return {
-            "confirmed": False,
-            "breadth": np.nan,
-            "sector": "Other",
-        }
-
-
-
-# -----------------------------
-# Manual Sector Analysis + RS Matrix
-# -----------------------------
-@st.cache_data(ttl=900, show_spinner=False)
-def manual_daily_close(sec_id):
-    return cached_cash_daily(int(sec_id))
-
-@st.cache_data(ttl=900, show_spinner=False)
-def manual_index_daily(sec_id):
-    return historical(int(sec_id), "IDX_I", "INDEX", "Positional")
-
-def pnf_direction_from_close(close_series, box_pct):
-    s = pd.to_numeric(close_series, errors="coerce").dropna()
-    if len(s) < 3:
-        return "UNAVAILABLE"
-    cols = build_pnf(s, box_pct, 3)
-    if not cols:
-        return "SIDEWAYS"
-    return "BULLISH" if cols[-1]["type"] == "X" else "BEARISH"
-
-def run_sector_analysis_manual(fut):
-    """
-    Sector Analysis:
-    - NSE F&O universe
-    - Daily timeframe
-    - Close-only
-    - 1% P&F box
-    - 3-box reversal
-
-    Returns a sector summary. The stock-level calculation is also retained
-    in session state by the page so an empty sector summary can be diagnosed.
-    """
-    rows = []
-    progress = st.progress(0, text="Building sector analysis...")
-    total = len(fut)
-
-    for i, (_, r) in enumerate(fut.iterrows(), 1):
-        symbol = str(r.get("underlying_symbol", "")).strip()
-
-        try:
-            sec_id = int(r["underlying_security_id"])
-        except Exception:
-            progress.progress(i / max(total, 1), text=f"Sector: {symbol}")
-            continue
-
-        # Use the existing daily cash history loader. Do not rely on a
-        # particular column name beyond close/datetime/date.
-        try:
-            h = manual_daily_close(sec_id)
-        except Exception:
-            h = pd.DataFrame()
-
-        if h is None or h.empty or "close" not in h.columns:
-            progress.progress(i / max(total, 1), text=f"Sector: {symbol}")
-            continue
-
-        close = pd.to_numeric(h["close"], errors="coerce")
-        close = close.dropna()
-
-        if len(close) < 10:
-            progress.progress(i / max(total, 1), text=f"Sector: {symbol}")
-            continue
-
-        # Existing P&F builder is close-only. 1% box, 3-box reversal.
-        try:
-            bias = pnf_direction_from_close(close, 0.01)
-        except Exception:
-            bias = "UNAVAILABLE"
-
-        if bias not in ("BULLISH", "BEARISH"):
-            progress.progress(i / max(total, 1), text=f"Sector: {symbol}")
-            continue
-
-        # Always retain the stock. If the existing sector map has no entry,
-        # put it into "Other" rather than dropping it silently.
-        try:
-            sector = str(sector_of(symbol)).strip()
-        except Exception:
-            sector = "Other"
-
-        if not sector or sector.lower() in ("none", "nan"):
-            sector = "Other"
-
-        rows.append({
-            "Sector": sector,
-            "Stock": symbol,
-            "Bias": bias,
-        })
-
-        progress.progress(i / max(total, 1), text=f"Sector: {symbol}")
-
-    progress.empty()
-
-    stock_df = pd.DataFrame(rows)
-
-    if stock_df.empty:
-        return pd.DataFrame(), stock_df
-
-    result = []
-
-    for sector, g in stock_df.groupby("Sector", dropna=False):
-        stocks = len(g)
-        bullish = int((g["Bias"] == "BULLISH").sum())
-        bearish = int((g["Bias"] == "BEARISH").sum())
-
-        bull_pct = 100.0 * bullish / stocks if stocks else 0.0
-        bear_pct = 100.0 * bearish / stocks if stocks else 0.0
-
-        if bull_pct >= 50:
-            bias = "🟢 BULLISH"
-        elif bear_pct >= 50:
-            bias = "🔴 BEARISH"
-        else:
-            bias = "🟡 SIDEWAYS"
-
-        result.append({
-            "Sector": sector,
-            "Bias": bias,
-            "Bullish": bullish,
-            "Bearish": bearish,
-            "Stocks": stocks,
-            "Bullish %": round(bull_pct, 1),
-            "Bearish %": round(bear_pct, 1),
-        })
-
-    summary = pd.DataFrame(result).sort_values(
-        ["Bullish %", "Bearish %", "Stocks"],
-        ascending=[False, True, False],
-    ).reset_index(drop=True)
-
-    return summary, stock_df
-
-
-
-def matrix_pf_score(close_series, box_pct):
-    """
-    Source-inspired P&F Performance + Ranking scoring.
-
-    Performance:
-      DTB/new X breakout = +2
-      DTB retracement/X-column continuation state = +1
-      DBS/new O breakdown = -2
-      DBS retracement/O-column continuation state = -1
-      otherwise = 0
-
-    Ranking:
-      current active X-column box count = positive magnitude
-      current active O-column box count = negative magnitude
-    """
-    s=pd.to_numeric(close_series, errors="coerce").dropna()
-    cols=build_pnf(s, box_pct, 3)
-    if len(cols)<3:
-        return {"performance":0, "ranking":0, "pattern":"NEUTRAL", "column":"—"}
-
-    c1,c2,c3=cols[-3:]
-
-    performance=0
-    pattern="NEUTRAL"
-
-    if c1["type"]=="X" and c2["type"]=="O" and c3["type"]=="X":
-        if c3["high"]>c1["high"]:
-            performance=2
-            pattern="DTB BUY"
-        else:
-            performance=1
-            pattern="DTB RETRACEMENT"
-    elif c1["type"]=="O" and c2["type"]=="X" and c3["type"]=="O":
-        if c3["low"]<c1["low"]:
-            performance=-2
-            pattern="DBS SELL"
-        else:
-            performance=-1
-            pattern="DBS RETRACEMENT"
-
-    current_type=c3["type"]
-    box_count=int(c3.get("boxes",0))
-    ranking=box_count if current_type=="X" else -box_count
-
-    return {
-        "performance":performance,
-        "ranking":ranking,
-        "pattern":pattern,
-        "column":current_type,
-        "boxes":box_count,
-    }
-
-
-def run_pf_fusion_matrix_manual(fut, boxes=None):
-    """
-    Fusion Matrix based on the uploaded source's scoring concept:
-    Price P&F + Relative Strength P&F across 3%, 2%, 1%, 0.25%.
-    """
-    nifty_id=resolve_nse_index_security_id(master,"NIFTY")
-    if nifty_id is None:
-        return pd.DataFrame()
-
-    nifty=manual_index_daily(nifty_id)
-    if nifty.empty or "close" not in nifty.columns:
-        return pd.DataFrame()
-
-    nifty=nifty[["datetime","close"]].copy()
-    nifty["date"]=pd.to_datetime(nifty["datetime"],errors="coerce").dt.date
-    nifty["close"]=pd.to_numeric(nifty["close"],errors="coerce")
-    nifty=nifty.dropna(subset=["date","close"]).groupby("date")["close"].last()
-
-    rows=[]
-    progress=st.progress(0,text="Building P&F Fusion Matrix...")
-    total=len(fut)
-
-    if boxes is None:
-        boxes=[("3%",0.03),("2%",0.02),("1%",0.01),("0.25%",0.0025)]
-
-    for i,(_,r) in enumerate(fut.iterrows(),1):
-        symbol=str(r["underlying_symbol"])
-        try:
-            h=manual_daily_close(int(r["underlying_security_id"]))
-        except Exception:
-            h=pd.DataFrame()
-
-        if h is None or h.empty or "close" not in h.columns:
-            progress.progress(i/max(total,1),text=f"Matrix: {symbol}")
-            continue
-
-        stock=h[["datetime","close"]].copy()
-        stock["date"]=pd.to_datetime(stock["datetime"],errors="coerce").dt.date
-        stock["close"]=pd.to_numeric(stock["close"],errors="coerce")
-        stock=stock.dropna(subset=["date","close"]).groupby("date")["close"].last()
-
-        common=stock.index.intersection(nifty.index)
-        if len(common)<3:
-            progress.progress(i/max(total,1),text=f"Matrix: {symbol}")
-            continue
-
-        price_rows={"Stock":symbol}
-        price_perf_total=0
-        price_rank_total=0
-        rs_perf_total=0
-        rs_rank_total=0
-
-        ratio=(stock.loc[common].astype(float)/nifty.loc[common].astype(float)).dropna()
-
-        for label,box in boxes:
-            p=matrix_pf_score(stock.loc[common],box)
-            rs=matrix_pf_score(ratio,box)
-
-            price_rows[f"P Perf {label}"]=p["performance"]
-            price_rows[f"P Rank {label}"]=p["ranking"]
-            price_rows[f"RS Perf {label}"]=rs["performance"]
-            price_rows[f"RS Rank {label}"]=rs["ranking"]
-
-            price_perf_total += p["performance"]
-            price_rank_total += p["ranking"]
-            rs_perf_total += rs["performance"]
-            rs_rank_total += rs["ranking"]
-
-        price_rows["Price Performance"]=price_perf_total
-        price_rows["Price Ranking"]=price_rank_total
-        price_rows["RS Performance"]=rs_perf_total
-        price_rows["RS Ranking"]=rs_rank_total
-        price_rows["Total Performance"]=price_perf_total+rs_perf_total
-        price_rows["Total Ranking"]=price_rank_total+rs_rank_total
-        price_rows["Net Performance"]=rs_perf_total-price_perf_total
-        price_rows["Net Ranking"]=rs_rank_total-price_rank_total
-
-        # Useful quick state fields; core detail stays available for ranking.
-        price_rows["Price State"]="BULLISH" if price_perf_total>0 else "BEARISH" if price_perf_total<0 else "NEUTRAL"
-        price_rows["RS State"]="BULLISH" if rs_perf_total>0 else "BEARISH" if rs_perf_total<0 else "NEUTRAL"
-
-        rows.append(price_rows)
-        progress.progress(i/max(total,1),text=f"Matrix: {symbol}")
-
-    progress.empty()
-    if not rows:
-        return pd.DataFrame()
-
-    return pd.DataFrame(rows)
-
-
-def run_rs_matrix_manual(fut):
-    """
-    Relative Strength Matrix versus NIFTY 50.
-
-    RS = Stock daily close / NIFTY 50 daily close.
-    Apply P&F independently to the raw ratio at 3%, 2%, 1%, 0.25%.
-    NIFTY 50 itself is not converted to P&F first.
-    """
-    nifty_id = resolve_nse_index_security_id(master, "NIFTY")
-    if nifty_id is None:
-        return pd.DataFrame()
-
-    nifty = manual_index_daily(nifty_id)
-    if nifty.empty or "close" not in nifty.columns:
-        return pd.DataFrame()
-
-    nifty = nifty[["datetime", "close"]].copy()
-    nifty["date"] = pd.to_datetime(nifty["datetime"], errors="coerce").dt.date
-    nifty["close"] = pd.to_numeric(nifty["close"], errors="coerce")
-    nifty = nifty.dropna(subset=["date", "close"])
-    nifty = nifty.groupby("date")["close"].last()
-
-    rows = []
-    progress = st.progress(0, text="Building RS Matrix vs NIFTY 50...")
-    total = len(fut)
-
-    for i, (_, r) in enumerate(fut.iterrows(), 1):
-        symbol = str(r["underlying_symbol"])
-        h = manual_daily_close(int(r["underlying_security_id"]))
-
-        if not h.empty and "close" in h.columns:
-            stock = h[["datetime", "close"]].copy()
-            stock["date"] = pd.to_datetime(stock["datetime"], errors="coerce").dt.date
-            stock["close"] = pd.to_numeric(stock["close"], errors="coerce")
-            stock = stock.dropna(subset=["date", "close"])
-            stock = stock.groupby("date")["close"].last()
-
-            common = stock.index.intersection(nifty.index)
-            if len(common) >= 3:
-                ratio = (
-                    stock.loc[common].astype(float)
-                    / nifty.loc[common].astype(float)
-                ).dropna()
-
-                row = {"Stock": symbol}
-
-                for label, box in [
-                    ("3%", 0.03),
-                    ("2%", 0.02),
-                    ("1%", 0.01),
-                    ("0.25%", 0.0025),
-                ]:
-                    d = pnf_direction_from_close(ratio, box)
-                    row[label] = (
-                        "🟢 OUTPERFORM"
-                        if d == "BULLISH"
-                        else "🔴 UNDERPERFORM"
-                        if d == "BEARISH"
-                        else "🟡 SIDEWAYS"
-                        if d == "SIDEWAYS"
-                        else "⚪ N/A"
-                    )
-
-                row["_score"] = sum(
-                    1 if row[k] == "🟢 OUTPERFORM"
-                    else -1 if row[k] == "🔴 UNDERPERFORM"
-                    else 0
-                    for k in ["3%", "2%", "1%", "0.25%"]
-                )
-                rows.append(row)
-
-        progress.progress(
-            i / max(total, 1),
-            text=f"RS Matrix: {symbol}",
-        )
-
-    progress.empty()
-
-    if not rows:
-        return pd.DataFrame()
-
-    return pd.DataFrame(rows).sort_values(
-        ["_score", "Stock"],
-        ascending=[False, True],
-    ).reset_index(drop=True)
-
-
-
-# -----------------------------
-# Dhan Index Resolver
-# -----------------------------
-def resolve_nse_index_security_id(master, symbol="NIFTY"):
-    """
-    Resolve an NSE index security ID from Dhan's detailed instrument master.
-    The master uses SEGMENT='I' for the IDX_I segment.
-    """
-    try:
-        x = master.copy()
-
-        if "exchange" in x.columns:
-            x = x[x["exchange"].astype(str).str.upper().eq("NSE")]
-
-        if "segment" in x.columns:
-            x = x[x["segment"].astype(str).str.upper().eq("I")]
-
-        if "instrument" in x.columns:
-            x = x[x["instrument"].astype(str).str.upper().eq("INDEX")]
-
-        target = str(symbol).upper().strip()
-
-        for col in ["underlying_symbol", "symbol_name", "display_name", "trading_symbol"]:
-            if col not in x.columns:
-                continue
-
-            m = x[x[col].astype(str).str.upper().str.strip().eq(target)]
-            if not m.empty:
-                sid = pd.to_numeric(
-                    m.iloc[0]["security_id"],
-                    errors="coerce",
-                )
-                if pd.notna(sid):
-                    return int(sid)
-
-        return None
-
-    except Exception:
-        return None
-
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def sector_confirmation_1pct_map(fut):
-    """
-    Positional sector confirmation must come from the standalone Sector
-    Analysis logic: daily close-only, 1% box, 3-box reversal.
-
-    Returns:
-        {
-            sector: {
-                bullish_pct: ...,
-                bearish_pct: ...,
-                bias: "BULLISH"/"BEARISH"/"SIDEWAYS",
-                stocks: ...,
-            }
-        }
-    """
-    counts = {}
-
-    for _, r in fut.iterrows():
-        symbol = str(r.get("underlying_symbol", "")).strip()
-        sector = sector_of(symbol)
-
-        if sector not in counts:
-            counts[sector] = {
-                "bullish": 0,
-                "bearish": 0,
-                "stocks": 0,
-            }
-
-        try:
-            sid = int(r["underlying_security_id"])
-            h = manual_daily_close(sid)
-
-            if h is None or h.empty or "close" not in h.columns:
-                continue
-
-            close = pd.to_numeric(
-                h["close"],
-                errors="coerce",
-            ).dropna()
-
-            if len(close) < 10:
-                continue
-
-            direction = pnf_direction_from_close(
-                close,
-                0.01,
-            )
-
-            if direction not in ("BULLISH", "BEARISH"):
-                continue
-
-            counts[sector]["stocks"] += 1
-
-            if direction == "BULLISH":
-                counts[sector]["bullish"] += 1
-            else:
-                counts[sector]["bearish"] += 1
-
-        except Exception:
-            continue
-
-    result = {}
-
-    for sector, c in counts.items():
-        n = c["stocks"]
-
-        if n <= 0:
-            result[sector] = {
-                "bullish_pct": np.nan,
-                "bearish_pct": np.nan,
-                "bias": "UNAVAILABLE",
-                "stocks": 0,
-            }
-            continue
-
-        bull_pct = 100.0 * c["bullish"] / n
-        bear_pct = 100.0 * c["bearish"] / n
-
-        if bull_pct >= 50.0:
-            bias = "BULLISH"
-        elif bear_pct >= 50.0:
-            bias = "BEARISH"
-        else:
-            bias = "SIDEWAYS"
-
-        result[sector] = {
-            "bullish_pct": bull_pct,
-            "bearish_pct": bear_pct,
-            "bias": bias,
-            "stocks": n,
-        }
-
-    return result
-
-
-
-# -----------------------------
-# PCR Positioning Trend
-# -----------------------------
-def option_pcr_snapshot(chain_df, spot, strikes_each_side=20):
-    if chain_df is None or chain_df.empty or pd.isna(spot):
-        return np.nan
-    x=chain_df.copy()
-    x["Strike"]=pd.to_numeric(x["Strike"],errors="coerce")
-    x["OI"]=pd.to_numeric(x["OI"],errors="coerce")
-    x=x.dropna(subset=["Strike","OI"])
-    if x.empty:
-        return np.nan
-    strikes=sorted(x["Strike"].unique())
-    if not strikes:
-        return np.nan
-    atm=min(strikes,key=lambda s: abs(float(s)-float(spot)))
-    i=strikes.index(atm)
-    x=x[x["Strike"].isin(set(strikes[max(0,i-strikes_each_side):min(len(strikes),i+strikes_each_side+1)]))]
-    puts=float(x.loc[x["Side"]=="PE","OI"].sum())
-    calls=float(x.loc[x["Side"]=="CE","OI"].sum())
-    return puts/calls if calls>0 else np.nan
-
-def pcr_trend_columns(values):
-    vals=pd.Series(values).dropna()
-    return build_pnf(vals,0.05,3) if len(vals)>=3 else []
-
-def render_pcr_positioning_chart(values):
-    vals=[float(v) for v in values if pd.notna(v)]
-    if not vals:
-        st.info("Positioning trend will appear after option data refreshes.")
-        return
-    cols=pcr_trend_columns(vals)
-    if not cols:
-        st.info(f"Positioning trend is building • Current reading: {vals[-1]:.2f}")
-        return
-    recent=cols[-12:]
-    height=max(150,min(290,90+max(4,max(int(c["boxes"]) for c in recent))*11))
-    parts=[]
-    for c in recent:
-        glyph="▮" if c["type"]=="X" else "▯"
-        parts.append(
-            "<div style='display:flex;flex-direction:column;justify-content:flex-end;"
-            "align-items:center;min-width:20px;height:100%;gap:2px;'>"
-            + "".join(
-                f"<span style='font-size:13px;line-height:11px'>{glyph}</span>"
-                for _ in range(max(1,int(c["boxes"])))
-            )
-            + "</div>"
-        )
-    html=f"""<div style="border:1px solid rgba(255,255,255,.10);border-radius:16px;padding:16px;
-    background:linear-gradient(145deg,rgba(255,255,255,.055),rgba(255,255,255,.018));
-    box-shadow:0 8px 24px rgba(0,0,0,.16);">
-    <div style="font-size:1.05rem;font-weight:800;margin-bottom:4px;">Positioning Trend</div>
-    <div style="font-size:.76rem;opacity:.55;margin-bottom:12px;">Current reading: {vals[-1]:.2f}</div>
-    <div style="height:{height-55}px;display:flex;align-items:flex-end;gap:12px;overflow:hidden;
-    border-bottom:1px solid rgba(255,255,255,.10);padding:8px 4px;">{''.join(parts)}</div></div>"""
-    st.components.v1.html(html,height=height,scrolling=False)
-
-
-# -----------------------------
-# Main
-# -----------------------------
-if not st.session_state.client_id or not st.session_state.access_token:
-    st.warning("Enter Client Code and Access Token.")
-    st.stop()
-
-try:
-    master = load_master()
-except Exception as e:
-    st.error(f"Instrument master failed: {e}")
-    st.stop()
-
-_load_fresh_trades_today()
-render_notification_panel()
-
-# The report button is rendered only after trade-report helpers are defined.
-if st.session_state.get("trade_book"):
-    report_all = trade_report_dataframe(local_now().date())
-    with st.sidebar:
-        st.markdown(
-            '<div class="a-side-head">Reports</div>',
-            unsafe_allow_html=True,
-        )
-        st.download_button(
-            "⬇️ Download Daily Report",
-            data=report_all.to_csv(index=False).encode("utf-8"),
-            file_name=f"alpha_trades_{local_now().strftime('%Y-%m-%d')}.csv",
-            mime="text/csv",
-            key="sidebar_daily_report",
-        )
-
-
-# -----------------------------
-# Global Option Seller Warning Monitor
-# -----------------------------
-def _global_option_warning_snapshot():
-    """
-    Lightweight option-risk monitor for the three supported NSE indices.
-    It is intentionally independent of the selected page/module.
-    """
-    out = []
-
-    for index_name in INDEX_NAMES:
-        try:
-            index_sid = resolve_index_instrument(master, index_name)
-            expiries = option_expiry_list_v2(index_sid)
-
-            if not expiries:
-                continue
-
-            selected_expiry = select_option_expiry_v2(expiries, "Intraday")
-            raw_chain = option_chain_request_v2(index_sid, selected_expiry)
-            raw_data = parse_data(raw_chain)
-
-            spot = (
-                pd.to_numeric(
-                    raw_data.get("last_price"),
-                    errors="coerce",
-                )
-                if isinstance(raw_data, dict)
-                else np.nan
-            )
-
-            chain_df = parse_option_chain_v2(raw_chain)
-            chain_df = filter_atm_strike_window(
-                chain_df,
-                spot,
-                strikes_each_side=20,
-            )
-
-            analysis = option_seller_analysis_v2(
-                chain_df,
-                spot,
-                "Intraday",
-            )
-
-            session_state = option_session_state(
-                index_name,
-                selected_expiry,
-                analysis["atm_iv"],
-            )
-
-            iv_risk = option_iv_risk(
-                analysis["atm_iv"],
-                session_state,
-            )
-            oi_risk = option_oi_risk(
-                chain_df,
-                spot,
-            )
-
-            if bool(iv_risk.get("alert")):
-                out.append({
-                    "index": index_name,
-                    "key": "iv_expansion",
-                    "message": (
-                        f"{index_name} IV is expanding sharply."
-                        if iv_risk.get("level") == "HIGH"
-                        else f"{index_name} IV is rising."
-                    ),
-                    "severity": "HIGH"
-                    if iv_risk.get("level") == "HIGH"
-                    else "MEDIUM",
-                })
-
-            if bool(oi_risk.get("alert")):
-                side_word = (
-                    "call"
-                    if oi_risk.get("side") == "CALL"
-                    else "put"
-                )
-                out.append({
-                    "index": index_name,
-                    "key": "oi_buildup",
-                    "message": (
-                        f"{index_name} heavy {side_word} side "
-                        "positioning buildup."
-                    ),
-                    "severity": "HIGH",
-                })
-
-        except Exception:
-            # Global monitor must never interrupt the client's selected module.
-            continue
-
-    return out
-
-
-def render_global_option_warning_monitor():
-    """
-    Runs independently from the selected module using Streamlit fragments.
-    This keeps option warnings alive even while the user is on NSE/MCX/RS/etc.
-    """
-    try:
-        fragment = getattr(st, "fragment", None)
-        if fragment is None:
-            return
-
-        @fragment(run_every="60s")
-        def _warning_fragment():
-            warnings = _global_option_warning_snapshot()
-
-            active_keys = {
-                f"{w['index']}|{w['key']}"
-                for w in warnings
-            }
-
-            if "global_option_warning_states" not in st.session_state:
-                st.session_state.global_option_warning_states = {}
-
-            previous_states = st.session_state.global_option_warning_states
-
-            for warning in warnings:
-                state_key = (
-                    f"{warning['index']}|{warning['key']}"
-                )
-                was_active = bool(
-                    previous_states.get(state_key, False)
-                )
-
-                if not was_active:
-                    st.toast(
-                        f"⚠️ Option warning: {warning['message']}",
-                        icon="⚠️",
-                    )
-                    speak_option_alert(
-                        f"Warning. {warning['message']}"
-                    )
-
-                previous_states[state_key] = True
-
-            # Clear warnings that are no longer active.
-            for key in list(previous_states):
-                if key not in active_keys:
-                    previous_states[key] = False
-
-            with st.sidebar:
-                st.markdown(
-                    '<div class="a-side-head">Option Seller Risk</div>',
-                    unsafe_allow_html=True,
-                )
-
-                if not warnings:
-                    st.markdown(
-                        """
-                        <div class="alpha-alert">
-                            <div class="alpha-alert-symbol">✓ Option risk normal</div>
-                            <div class="alpha-alert-meta">
-                                Monitoring continues in the background
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    for warning in warnings:
-                        color = "#ff5364"
-                        st.markdown(
-                            f"""
-                            <div class="alpha-alert"
-                                 style="border-color:rgba(255,83,100,.30);
-                                        background:rgba(255,83,100,.06);">
-                                <div class="alpha-alert-time">
-                                    ⚠ {warning["severity"]}
-                                </div>
-                                <div class="alpha-alert-symbol">
-                                    {warning["index"]} • OPTION WARNING
-                                </div>
-                                <div class="alpha-alert-meta">
-                                    {warning["message"]}
-                                </div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-        _warning_fragment()
-
-    except Exception:
-        # Never break the selected page because the background warning monitor
-        # is unavailable.
-        pass
-
-
-render_global_option_warning_monitor()
-
-
-# Auto refresh is deliberately longer than the initial full-universe scan.
-# The full NSE scan can take longer than 1 minute, so a 1-minute rerun would
-# interrupt the scan and start it again from stock 1.
-if auto:
-    try:
-        from streamlit_autorefresh import st_autorefresh
-        if page in ("Intraday", "Fresh Trades", "Trade Logs"):
-            mins = 1
-        elif page == "Option Seller":
-            mins = 1 if st.session_state.get("option_horizon", "Intraday") == "Intraday" else 3
-        elif page == "MCX Futures":
-            mins = 1 if st.session_state.get("mcx_futures_mode", "Intraday") == "Intraday" else 15
-        elif page in ("Sector Analysis", "RS Matrix"):
-            mins = None
-        else:
-            mins = 15
-        if page == "Market Overview":
-            mins = 3
-        if mins is not None:
-            st_autorefresh(interval=mins * 60 * 1000, key=f"refresh_{page}")
-        if page == "Intraday":
-            st.caption("Live intraday monitor — updates every minute.")
-        elif page == "Option Seller":
-            st.caption(
-                "Live option monitor — "
-                + ("updates every minute." if mins == 1 else "updates every 3 minutes.")
-            )
-    except Exception:
-        pass
-
-if not st.session_state.get("_trade_book_restored"):
-    _restore_active_trades_from_ledger()
-
-
-
-# -----------------------------
-# ALPHA PRO SELLER — dedicated intraday theta engine
-# -----------------------------
-ALPHA_PRO_BOX_PCT = 0.02
-ALPHA_PRO_ENTRY_REVERSAL = 3
-ALPHA_PRO_EXIT_REVERSAL = 4
-ALPHA_PRO_MAX_TRADES_PER_DAY = 2
-ALPHA_PRO_FORCE_EXIT = datetime.strptime("15:05", "%H:%M").time()
-
-
-@st.cache_data(ttl=5, show_spinner=False)
-def alpha_pro_option_minute_history(security_id):
-    today = local_now().date()
-    now = local_now()
-    payload = {
-        "securityId": str(int(security_id)),
-        "exchangeSegment": "NSE_FNO",
-        "instrument": "OPTIDX",
-        "interval": "1",
-        "oi": False,
-        "fromDate": f"{today} 09:15:00",
-        "toDate": now.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    body = api_post("/charts/intraday", payload, "Alpha Pro option 1m")
-    data = parse_data(body)
-    if not isinstance(data, dict) or "close" not in data:
-        return pd.DataFrame()
-    n = len(data.get("close", []))
-    if n == 0:
-        return pd.DataFrame()
-    out = pd.DataFrame({
-        "close": pd.to_numeric(pd.Series(data.get("close", [])), errors="coerce"),
-        "timestamp": pd.to_numeric(pd.Series(data.get("timestamp", [np.nan] * n)), errors="coerce"),
-    })
-    unit = "ms" if out["timestamp"].dropna().median() > 10**12 else "s"
-    out["datetime"] = pd.to_datetime(
-        out["timestamp"], unit=unit, utc=True, errors="coerce"
-    ).dt.tz_convert(LOCAL_TZ)
-    out = out.dropna(subset=["close", "datetime"]).sort_values("datetime")
-    out = out.drop_duplicates("datetime").reset_index(drop=True)
-    return out[out["datetime"] < local_now().replace(second=0, microsecond=0)].copy()
-
-
-@st.cache_data(ttl=10, show_spinner=False)
-def alpha_pro_index_minute_history(security_id):
-    today = local_now().date()
-    now = local_now()
-    payload = {
-        "securityId": str(int(security_id)),
-        "exchangeSegment": "IDX_I",
-        "instrument": "INDEX",
-        "interval": "1",
-        "oi": False,
-        "fromDate": f"{today} 09:15:00",
-        "toDate": now.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    body = api_post("/charts/intraday", payload, "Alpha Pro index 1m")
-    data = parse_data(body)
-    if not isinstance(data, dict) or "close" not in data:
-        return pd.DataFrame()
-    n = len(data.get("close", []))
-    if n == 0:
-        return pd.DataFrame()
-    out = pd.DataFrame({
-        "close": pd.to_numeric(pd.Series(data.get("close", [])), errors="coerce"),
-        "timestamp": pd.to_numeric(pd.Series(data.get("timestamp", [np.nan] * n)), errors="coerce"),
-    })
-    unit = "ms" if out["timestamp"].dropna().median() > 10**12 else "s"
-    out["datetime"] = pd.to_datetime(
-        out["timestamp"], unit=unit, utc=True, errors="coerce"
-    ).dt.tz_convert(LOCAL_TZ)
-    return out.dropna(subset=["close", "datetime"]).sort_values("datetime").drop_duplicates("datetime").reset_index(drop=True)
-
-
-def alpha_pro_get_916_spot(index_sid):
-    h = alpha_pro_index_minute_history(index_sid)
-    if h.empty:
-        return np.nan
-    target = h[h["datetime"].dt.time >= datetime.strptime("09:16", "%H:%M").time()]
-    if target.empty:
-        return np.nan
-    return float(target.iloc[0]["close"])
-
-
-def alpha_pro_find_contracts(chain, atm):
-    if chain is None or chain.empty or pd.isna(atm):
-        return {}
-    x = chain.copy()
-    x["Strike"] = pd.to_numeric(x["Strike"], errors="coerce")
-    x["Security ID"] = pd.to_numeric(x["Security ID"], errors="coerce")
-    x = x.dropna(subset=["Strike", "Security ID"])
-    x = x[np.isclose(x["Strike"].astype(float), float(atm))]
-    out = {}
-    for side, key in [("CE", "ce_sid"), ("PE", "pe_sid")]:
-        r = x[x["Side"] == side]
-        if not r.empty:
-            out[key] = int(r.iloc[0]["Security ID"])
-            out[f"{key}_strike"] = float(r.iloc[0]["Strike"])
-    return out
-
-
-def alpha_pro_lock_atm(index_sid, expiry):
-    spot = alpha_pro_get_916_spot(index_sid)
-    if pd.isna(spot):
-        return None
-    raw = option_chain_request_v2(index_sid, expiry)
-    chain = parse_option_chain_v2(raw)
-    strikes = sorted(pd.to_numeric(chain["Strike"], errors="coerce").dropna().unique())
-    if not strikes:
-        return None
-    atm = min(strikes, key=lambda x: abs(float(x) - float(spot)))
-    contracts = alpha_pro_find_contracts(chain, atm)
-    if "ce_sid" not in contracts or "pe_sid" not in contracts:
-        return None
-    return {
-        "date": local_now().date().isoformat(),
-        "spot_916": float(spot),
-        "atm": float(atm),
-        "expiry": expiry.isoformat(),
-        **contracts,
-        "locked_at": local_now().strftime("%d-%b-%Y %H:%M:%S IST"),
-    }
-
-
-def alpha_pro_straddle_series(lock):
-    ce = alpha_pro_option_minute_history(lock["ce_sid"])
-    pe = alpha_pro_option_minute_history(lock["pe_sid"])
-    if ce.empty or pe.empty:
-        return pd.DataFrame()
-    ce = ce.rename(columns={"close": "ce_close"})[["datetime", "ce_close"]]
-    pe = pe.rename(columns={"close": "pe_close"})[["datetime", "pe_close"]]
-    x = pd.merge(ce, pe, on="datetime", how="inner")
-    if x.empty:
-        return x
-    x["straddle_close"] = (
-        pd.to_numeric(x["ce_close"], errors="coerce")
-        + pd.to_numeric(x["pe_close"], errors="coerce")
-    )
-    return x.dropna(subset=["straddle_close"]).sort_values("datetime").reset_index(drop=True)
-
-
-def alpha_pro_events(prices):
-    prices = [float(p) for p in prices if pd.notna(p) and float(p) > 0]
-    if len(prices) < 2:
-        return []
-
-    box_pct = 0.02
-    entry_reversal = 3
-    exit_reversal = 4
-    lb = math.log1p(box_pct)
-    base = math.floor(math.log(prices[0]) / lb)
-    direction = None
-    high = low = base
-    events = []
-    for i, price in enumerate(prices[1:], 1):
-        level = math.floor(math.log(price) / lb)
-        if direction is None:
-            if level >= high + 1:
-                direction, high = "X", level
-            elif level <= low - 1:
-                direction, low = "O", level
-            continue
-        if direction == "X":
-            if level > high:
-                high = level
-            if level <= high - entry_reversal:
-                prior_high = high
-                direction, low = "O", level
-                events.append({
-                    "i": i,
-                    "event": "ENTRY",
-                    "price": price,
-                    "sl": math.exp(prior_high * lb),
-                })
-        else:
-            if level < low:
-                low = level
-            if level >= low + exit_reversal:
-                direction, high = "X", level
-                events.append({
-                    "i": i,
-                    "event": "EXIT",
-                    "price": price,
-                    "sl": np.nan,
-                })
-    return events
-
-
-def render_alpha_pro_seller():
-    st.markdown(
-        """
-        <div class="alpha-hero">
-            <div class="alpha-hero-title">ALPHA PRO SELLER</div>
-            <div class="alpha-hero-sub">Mechanical theta-decay straddle engine</div>
-            <span class="alpha-badge">PRO</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    if local_now().time() < datetime.strptime("09:16", "%H:%M").time():
-        st.info("Waiting for 09:16 AM to freeze today's ATM.")
-        return
-
-    index_sid = resolve_index_instrument(master, "NIFTY")
-    expiries = option_expiry_list_v2(index_sid)
-    expiry = select_option_expiry_v2(expiries, "Intraday")
-
-    if (
-        "alpha_pro_lock" not in st.session_state
-        or st.session_state.alpha_pro_lock.get("date") != local_now().date().isoformat()
-    ):
-        try:
-            st.session_state.alpha_pro_lock = alpha_pro_lock_atm(index_sid, expiry)
-        except Exception:
-            st.session_state.alpha_pro_lock = None
-
-    lock = st.session_state.get("alpha_pro_lock")
-    if not lock:
-        st.error("Unable to lock the 09:16 ATM contracts.")
-        return
-
-    if "alpha_pro_state" not in st.session_state:
-        st.session_state.alpha_pro_state = {
-            "date": local_now().date().isoformat(),
-            "trades_today": 0,
-            "active": None,
-            "last_candle": None,
-        }
-
-    state = st.session_state.alpha_pro_state
-    if state.get("date") != local_now().date().isoformat():
-        state = {
-            "date": local_now().date().isoformat(),
-            "trades_today": 0,
-            "active": None,
-            "last_candle": None,
-        }
-
-    series = alpha_pro_straddle_series(lock)
-    last_ltp = (
-        float(series.iloc[-1]["straddle_close"])
-        if not series.empty else np.nan
-    )
-
-    if not series.empty:
-        events = alpha_pro_events(series["straddle_close"].tolist())
-        processed = state.get("last_candle")
-
-        for event in events:
-            event_time = series.iloc[event["i"]]["datetime"]
-            event_key = str(event_time)
-            if processed and event_key <= processed:
-                continue
-
-            if event["event"] == "ENTRY":
-                if (
-                    state["active"] is None
-                    and state["trades_today"] < ALPHA_PRO_MAX_TRADES_PER_DAY
-                    and event_time.time() < ALPHA_PRO_FORCE_EXIT
-                ):
-                    state["trades_today"] += 1
-                    state["active"] = {
-                        "trade_no": state["trades_today"],
-                        "entry": float(event["price"]),
-                        "sl": float(event["sl"]),
-                        "entry_time": event_time.strftime("%d-%b-%Y %H:%M:%S IST"),
-                    }
-
-            elif event["event"] == "EXIT" and state["active"] is not None:
-                tr = state["active"]
-                # Structural SL takes precedence if the exit close is already above it.
-                state["active"] = None
-
-            if state["active"] is not None and event["event"] == "ENTRY":
-                # Stop can only be evaluated from subsequent completed candles.
-                pass
-
-            state["last_candle"] = event_key
-
-        # Check structural SL on the latest completed candle.
-        if state["active"] is not None and pd.notna(last_ltp):
-            if float(last_ltp) >= float(state["active"]["sl"]):
-                state["active"] = None
-
-        # Hard 15:05 exit.
-        if (
-            state["active"] is not None
-            and local_now().time() >= ALPHA_PRO_FORCE_EXIT
-        ):
-            state["active"] = None
-
-    st.session_state.alpha_pro_state = state
-
-    a, b, c, d = st.columns(4)
-    a.metric("Fixed ATM", int(lock["atm"]))
-    b.metric("Straddle", f"{last_ltp:.2f}" if pd.notna(last_ltp) else "—")
-    c.metric("Trades", f"{state['trades_today']}/2")
-    d.metric("Status", "ACTIVE" if state["active"] else "WAIT")
-
-    if state["active"]:
-        tr = state["active"]
-        st.success(
-            f"🟢 SELL NIFTY {int(lock['atm'])} CE + {int(lock['atm'])} PE"
-        )
-        x1, x2, x3, x4 = st.columns(4)
-        x1.metric("Entry Premium", f"{tr['entry']:.2f}")
-        x2.metric("Structural SL", f"{tr['sl']:.2f}")
-        pnl = tr["entry"] - last_ltp if pd.notna(last_ltp) else np.nan
-        x3.metric("Current P&L", f"{pnl:.2f}" if pd.notna(pnl) else "—")
-        x4.metric("Trade", f"#{tr['trade_no']}")
-        st.caption(f"Entry: {tr['entry_time']} • Mandatory exit: 15:05 IST")
-    else:
-        if local_now().time() >= ALPHA_PRO_FORCE_EXIT:
-            st.info("WAIT — trading session closed at 15:05.")
-        elif state["trades_today"] >= ALPHA_PRO_MAX_TRADES_PER_DAY:
-            st.info("WAIT — maximum 2 trades reached today.")
-        else:
-            st.info("WAIT — no fresh Alpha Pro Seller entry is active.")
-
-
-
-
-
-# -----------------------------
-# HISTORICAL DATA LAB
-# -----------------------------
-HIST_OPT_ALLOWED_INTERVALS = [1, 5, 15, 25, 60]
-HIST_STD_ALLOWED_INTERVALS = [1, 5, 15, 25, 60]
-HIST_CHUNK_DAYS_OPTIONS = 30          # Dhan rolling-option limit
-HIST_CHUNK_DAYS_STANDARD = 90         # Dhan intraday historical limit
-HIST_DEFAULT_REQUIRED = ["open", "high", "low", "close", "volume", "oi", "iv", "strike", "spot"]
-
-
-def _daterange_chunks(start_date, end_date, max_days):
-    """Yield [start, exclusive_end] chunks no larger than max_days."""
-    cur = pd.Timestamp(start_date).normalize()
-    end = pd.Timestamp(end_date).normalize()
-    if end <= cur:
-        return
-    while cur < end:
-        nxt = min(cur + pd.Timedelta(days=max_days), end)
-        yield cur.date(), nxt.date()
-        cur = nxt
-
-
-def _timestamp_frame_from_dhan(data, tz=LOCAL_TZ):
-    """Convert Dhan array response to a tidy OHLC/OI DataFrame."""
-    if not isinstance(data, dict):
-        return pd.DataFrame()
-
-    # Accept either the response body directly or {"data": {...}}.
     d = data.get("data") if isinstance(data.get("data"), dict) else data
-    if not isinstance(d, dict):
+    if not isinstance(d, dict) or not d.get("timestamp"):
         return pd.DataFrame()
 
-    ts = d.get("timestamp", [])
-    if not ts:
-        return pd.DataFrame()
+    timestamps = pd.to_numeric(pd.Series(d["timestamp"]), errors="coerce")
+    # Dhan chart endpoints return Unix epoch seconds.
+    dt = pd.to_datetime(
+        timestamps,
+        unit="s",
+        utc=True,
+        errors="coerce",
+    ).dt.tz_convert(LOCAL_TZ)
 
-    n = len(ts)
-    out = pd.DataFrame({
-        "timestamp": pd.to_numeric(pd.Series(ts), errors="coerce"),
-    })
+    out = pd.DataFrame({"datetime": dt})
 
-    # Dhan uses epoch seconds in these responses.
-    out["datetime_ist"] = pd.to_datetime(
-        out["timestamp"], unit="s", utc=True, errors="coerce"
-    ).dt.tz_convert(tz)
-
-    for key, col in [
+    for source, target in [
         ("open", "open"),
         ("high", "high"),
         ("low", "low"),
         ("close", "close"),
         ("volume", "volume"),
-        ("oi", "oi"),
         ("open_interest", "oi"),
+        ("oi", "oi"),
         ("iv", "iv"),
-        ("strike", "strike_price"),
+        ("strike", "strike"),
         ("spot", "spot"),
     ]:
-        if key in d and col not in out.columns:
-            vals = d.get(key, [])
-            if len(vals) == n:
-                out[col] = pd.to_numeric(pd.Series(vals), errors="coerce")
+        values = d.get(source)
+        if values is not None and len(values) == len(out):
+            out[target] = pd.to_numeric(pd.Series(values), errors="coerce")
 
-    # If both oi and open_interest were present, retain the first populated one.
-    if "open_interest" in out.columns and "oi" not in out.columns:
-        out["oi"] = out["open_interest"]
+    if include_oi and "oi" not in out.columns:
+        out["oi"] = np.nan
 
-    out = out.dropna(subset=["datetime_ist"]).sort_values("datetime_ist")
-    return out.reset_index(drop=True)
-
-
-def _resolve_history_underlying(master, exchange, script):
-    """
-    Resolve an underlying security ID from the instrument master.
-    Supports index IDs and NSE/MCX underlying symbols.
-    """
-    script = str(script).upper().strip()
-
-    # Fixed Dhan index IDs used elsewhere in the app.
-    index_ids = {
-        "NIFTY": 13,
-        "BANKNIFTY": 25,
-        "SENSEX": 51,
-        "FINNIFTY": 27,
-        "MIDCPNIFTY": 442,
-    }
-    if exchange == "NSE" and script in index_ids:
-        return {
-            "security_id": index_ids[script],
-            "symbol": script,
-            "segment": "NSE_FNO",
-            "instrument": "OPTIDX",
-        }
-
-    x = master.copy()
-    if "exchange" in x.columns:
-        x = x[x["exchange"].astype(str).str.upper() == exchange].copy()
-
-    # Prefer underlying symbol matches.
-    cols = [c for c in ["underlying_symbol", "symbol_name", "trading_symbol", "display_name"] if c in x.columns]
-    if not cols:
-        return None
-
-    masks = []
-    for c in cols:
-        masks.append(x[c].astype(str).str.upper().str.strip().eq(script))
-    mask = masks[0]
-    for m in masks[1:]:
-        mask = mask | m
-    x = x[mask].copy()
-
-    if x.empty:
-        return None
-
-    # Prefer derivative contracts whose underlying ID is populated.
-    if "underlying_security_id" in x.columns:
-        u = pd.to_numeric(x["underlying_security_id"], errors="coerce").dropna()
-        if not u.empty:
-            sid = int(u.iloc[0])
-        else:
-            sid = int(pd.to_numeric(x["security_id"], errors="coerce").dropna().iloc[0])
-    else:
-        sid = int(pd.to_numeric(x["security_id"], errors="coerce").dropna().iloc[0])
-
-    return {
-        "security_id": sid,
-        "symbol": script,
-        "segment": "NSE_FNO" if exchange == "NSE" else "MCX_COMM",
-        "instrument": "OPTIDX" if exchange == "NSE" else "OPTFUT",
-    }
+    return (
+        out.dropna(subset=["datetime"])
+        .sort_values("datetime")
+        .drop_duplicates("datetime")
+        .reset_index(drop=True)
+    )
 
 
-def _resolve_standard_contract(master, exchange, instrument, script, security_id_override=""):
-    """Resolve one standard equity/index/future contract for historical OHLC."""
-    if security_id_override:
+def _date_chunks(start_date, end_date, max_days):
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    current = start
+    while current < end:
+        nxt = min(current + pd.Timedelta(days=max_days), end)
+        yield current.date(), nxt.date()
+        current = nxt
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def vix_history(timeframe, from_date, to_date):
+    cfg = VIX_ALLOWED_TIMEFRAMES[timeframe]
+    frames = []
+
+    if cfg["mode"] == "daily":
+        body = api_post(
+            "/charts/historical",
+            {
+                "securityId": str(INDIA_VIX_ID),
+                "exchangeSegment": "IDX_I",
+                "instrument": "INDEX",
+                "expiryCode": 0,
+                "oi": False,
+                "fromDate": pd.Timestamp(from_date).strftime("%Y-%m-%d"),
+                "toDate": pd.Timestamp(to_date).strftime("%Y-%m-%d"),
+            },
+            "India VIX daily history",
+        )
+        return _parse_arrays(body)
+
+    for chunk_start, chunk_end in _date_chunks(
+        from_date, to_date, INTRADAY_CHUNK_DAYS
+    ):
+        body = api_post(
+            "/charts/intraday",
+            {
+                "securityId": str(INDIA_VIX_ID),
+                "exchangeSegment": "IDX_I",
+                "instrument": "INDEX",
+                "interval": str(cfg["interval"]),
+                "oi": False,
+                "fromDate": f"{chunk_start} 00:00:00",
+                "toDate": f"{chunk_end} 00:00:00",
+            },
+            f"India VIX {timeframe} history",
+        )
+        part = _parse_arrays(body)
+        if not part.empty:
+            frames.append(part)
+
+    if not frames:
+        return pd.DataFrame()
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates("datetime")
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def current_nifty_option_chain():
+    body = api_post(
+        "/optionchain",
+        {
+            "UnderlyingScrip": NIFTY_ID,
+            "UnderlyingSeg": "IDX_I",
+            "Expiry": "",
+        },
+        "NIFTY option chain",
+    )
+    return body
+
+
+def expiry_list():
+    body = api_post(
+        "/optionchain/expirylist",
+        {
+            "UnderlyingScrip": NIFTY_ID,
+            "UnderlyingSeg": "IDX_I",
+        },
+        "NIFTY expiry list",
+    )
+    data = parse_data(body)
+    values = data.get("data") if isinstance(data, dict) else []
+    dates = []
+    for value in values if isinstance(values, list) else []:
         try:
-            sid = int(str(security_id_override).strip())
-            return {"security_id": sid, "symbol": str(script).upper().strip()}
+            dates.append(pd.Timestamp(str(value)).date())
         except Exception:
             pass
-
-    script = str(script).upper().strip()
-    x = master.copy()
-    x = x[x["exchange"].astype(str).str.upper() == exchange].copy()
-    x = x[x["instrument"].astype(str).str.upper() == instrument].copy()
-
-    if x.empty:
-        return None
-
-    symbol_cols = [c for c in ["underlying_symbol", "symbol_name", "trading_symbol", "display_name"] if c in x.columns]
-    mask = pd.Series(False, index=x.index)
-    for c in symbol_cols:
-        mask = mask | x[c].astype(str).str.upper().str.strip().eq(script)
-        mask = mask | x[c].astype(str).str.upper().str.startswith(script + "-", na=False)
-    x = x[mask].copy()
-    if x.empty:
-        return None
-
-    if "expiry_date" in x.columns:
-        x["expiry_date"] = pd.to_datetime(x["expiry_date"], errors="coerce")
-        x = x.sort_values(["expiry_date", "security_id"], na_position="last")
-
-    row = x.iloc[0]
-    return {
-        "security_id": int(pd.to_numeric(row["security_id"], errors="coerce")),
-        "symbol": script,
-        "trading_symbol": str(row.get("trading_symbol", script)),
-        "expiry_date": row.get("expiry_date", pd.NaT),
-    }
+    return sorted(set(dates))
 
 
-def _rolling_option_request(history_cfg, from_date, to_date):
-    payload = {
-        "exchangeSegment": history_cfg["exchange_segment"],
-        "interval": str(history_cfg["interval"]),
-        "securityId": int(history_cfg["security_id"]),
-        "instrument": history_cfg["instrument"],
-        "expiryFlag": history_cfg["expiry_flag"],
-        "expiryCode": int(history_cfg["expiry_code"]),
-        "strike": history_cfg["strike"],
-        "drvOptionType": history_cfg["option_type"],
-        "requiredData": history_cfg["required_data"],
-        "fromDate": from_date.strftime("%Y-%m-%d"),
-        "toDate": to_date.strftime("%Y-%m-%d"),
-    }
-    return api_post("/charts/rollingoption", payload, "Historical rolling options")
+def option_chain_for_expiry(expiry):
+    return api_post(
+        "/optionchain",
+        {
+            "UnderlyingScrip": NIFTY_ID,
+            "UnderlyingSeg": "IDX_I",
+            "Expiry": expiry.strftime("%Y-%m-%d"),
+        },
+        "NIFTY option chain for expiry",
+    )
 
 
-def _parse_rolling_option_response(body, option_type):
-    """
-    Convert Dhan rolling-option response into a common DataFrame.
-    The API response is CE/PE keyed; preserve all returned series fields.
-    """
+def parse_option_chain(body):
     data = parse_data(body)
+    rows = []
     if not isinstance(data, dict):
         return pd.DataFrame()
 
-    key = "ce" if option_type == "CALL" else "pe"
-    obj = data.get(key)
-    if not isinstance(obj, dict):
-        # Some responses can expose the requested leg directly.
-        obj = data if "timestamp" in data else None
+    spot = pd.to_numeric(data.get("last_price"), errors="coerce")
 
-    if not isinstance(obj, dict):
-        return pd.DataFrame()
-
-    df = _timestamp_frame_from_dhan(obj)
-    if df.empty:
-        return df
-
-    df["option_type"] = option_type
-    return df
-
-
-def _download_expired_options_dataset(cfg):
-    """Download all selected relative strikes and CE/PE in <=30-day chunks."""
-    offset_values = list(range(cfg["strike_min"], cfg["strike_max"] + 1))
-    option_types = ["CALL", "PUT"] if cfg["side"] == "BOTH" else [cfg["side"]]
-
-    chunks = list(_daterange_chunks(cfg["from_date"], cfg["to_date"], HIST_CHUNK_DAYS_OPTIONS))
-    total_calls = len(chunks) * len(offset_values) * len(option_types)
-
-    frames = []
-    failures = []
-    progress = st.progress(0, text="Starting historical option download...")
-    done = 0
-
-    for ci, (chunk_start, chunk_end) in enumerate(chunks, start=1):
-        for offset in offset_values:
-            strike_label = "ATM" if offset == 0 else f"ATM{offset:+d}"
-
-            for side in option_types:
-                request_cfg = {
-                    "exchange_segment": cfg["exchange_segment"],
-                    "interval": cfg["interval"],
-                    "security_id": cfg["security_id"],
-                    "instrument": cfg["instrument"],
-                    "expiry_flag": cfg["expiry_flag"],
-                    "expiry_code": cfg["expiry_code"],
-                    "strike": strike_label,
-                    "option_type": side,
-                    "required_data": cfg["required_data"],
-                }
-
-                try:
-                    body = _rolling_option_request(
-                        request_cfg, chunk_start, chunk_end
-                    )
-                    df = _parse_rolling_option_response(body, side)
-
-                    if not df.empty:
-                        df["exchange"] = cfg["exchange"]
-                        df["script"] = cfg["script"]
-                        df["expiry_flag"] = cfg["expiry_flag"]
-                        df["expiry_code"] = cfg["expiry_code"]
-                        df["requested_strike"] = strike_label
-                        df["strike_offset"] = offset
-                        frames.append(df)
-                except Exception as exc:
-                    failures.append({
-                        "chunk_start": str(chunk_start),
-                        "chunk_end": str(chunk_end),
-                        "strike": strike_label,
-                        "option_type": side,
-                        "error": str(exc),
-                    })
-
-                done += 1
-                progress.progress(
-                    done / max(total_calls, 1),
-                    text=f"Options: {strike_label} {side} • chunk {ci}/{len(chunks)}",
-                )
-
-    progress.empty()
-
-    if not frames:
-        return pd.DataFrame(), pd.DataFrame(failures)
-
-    out = pd.concat(frames, ignore_index=True)
-
-    # Keep a deterministic, research-friendly schema.
-    for col in ["open", "high", "low", "close", "volume", "oi", "iv", "strike_price", "spot"]:
-        if col not in out.columns:
-            out[col] = np.nan
-
-    out["date"] = out["datetime_ist"].dt.date
-    out["time"] = out["datetime_ist"].dt.strftime("%H:%M:%S")
-    out = out[
-        [
-            "datetime_ist", "date", "time",
-            "exchange", "script", "expiry_flag", "expiry_code",
-            "requested_strike", "strike_offset", "option_type",
-            "strike_price", "spot",
-            "open", "high", "low", "close", "volume", "oi", "iv",
-        ]
-    ]
-
-    out = (
-        out.drop_duplicates(
-            subset=["datetime_ist", "expiry_flag", "expiry_code", "requested_strike", "option_type"],
-            keep="last",
-        )
-        .sort_values(
-            ["datetime_ist", "strike_offset", "option_type"],
-            kind="stable",
-        )
-        .reset_index(drop=True)
-    )
-    return out, pd.DataFrame(failures)
-
-
-def _standard_historical_request(cfg, from_date, to_date):
-    if cfg["timeframe"] == "Daily":
-        payload = {
-            "securityId": str(cfg["security_id"]),
-            "exchangeSegment": cfg["exchange_segment"],
-            "instrument": cfg["instrument"],
-            "expiryCode": int(cfg.get("expiry_code", 0)),
-            "oi": bool(cfg["include_oi"]),
-            "fromDate": from_date.strftime("%Y-%m-%d"),
-            "toDate": to_date.strftime("%Y-%m-%d"),
-        }
-        return api_post("/charts/historical", payload, "Historical daily data")
-
-    payload = {
-        "securityId": str(cfg["security_id"]),
-        "exchangeSegment": cfg["exchange_segment"],
-        "instrument": cfg["instrument"],
-        "interval": str(cfg["interval"]),
-        "oi": bool(cfg["include_oi"]),
-        "fromDate": from_date.strftime("%Y-%m-%d %H:%M:%S"),
-        "toDate": to_date.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    return api_post("/charts/intraday", payload, "Historical intraday data")
-
-
-def _download_standard_dataset(cfg):
-    chunk_days = HIST_CHUNK_DAYS_STANDARD
-    chunks = list(_daterange_chunks(cfg["from_date"], cfg["to_date"], chunk_days))
-    progress = st.progress(0, text="Starting historical contract download...")
-    frames = []
-    failures = []
-
-    for i, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+    for strike_raw, pair in (data.get("oc") or {}).items():
         try:
-            body = _standard_historical_request(cfg, chunk_start, chunk_end)
-            df = _timestamp_frame_from_dhan(body)
+            strike = float(strike_raw)
+        except Exception:
+            continue
+        if not isinstance(pair, dict):
+            continue
 
-            if not df.empty:
-                df["exchange_segment"] = cfg["exchange_segment"]
-                df["instrument"] = cfg["instrument"]
-                df["script"] = cfg["script"]
-                frames.append(df)
-        except Exception as exc:
-            failures.append({
-                "chunk_start": str(chunk_start),
-                "chunk_end": str(chunk_end),
-                "error": str(exc),
-            })
-
-        progress.progress(
-            i / max(len(chunks), 1),
-            text=f"Contract history: chunk {i}/{len(chunks)}",
-        )
-
-    progress.empty()
-
-    if not frames:
-        return pd.DataFrame(), pd.DataFrame(failures)
-
-    out = pd.concat(frames, ignore_index=True)
-    out = out.drop_duplicates(subset=["datetime_ist"], keep="last")
-    out = out.sort_values("datetime_ist").reset_index(drop=True)
-    return out, pd.DataFrame(failures)
-
-
-def _make_history_zip(df, failures, metadata):
-    """Create one ZIP containing the final dataset and a metadata/readme CSV."""
-    zip_buffer_path = Path("/mnt/data/alpha_historical_download.zip")
-
-    meta_rows = [
-        ("Created IST", local_now().strftime("%d-%b-%Y %H:%M:%S")),
-        ("Mode", metadata.get("mode", "")),
-        ("Exchange", metadata.get("exchange", "")),
-        ("Script", metadata.get("script", "")),
-        ("From", str(metadata.get("from_date", ""))),
-        ("To", str(metadata.get("to_date", ""))),
-        ("Timeframe", str(metadata.get("timeframe", ""))),
-        ("Rows", str(len(df))),
-        ("Failures", str(len(failures))),
-        ("Note", "Exact historical expiry date is not exposed as a field in Dhan rolling-option response; expiry flag/code are preserved."),
-    ]
-    meta = pd.DataFrame(meta_rows, columns=["Field", "Value"])
-
-    dataset_name = "historical_options.csv" if metadata.get("mode") == "Expired Options" else "historical_contract.csv"
-    with zipfile.ZipFile(zip_buffer_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(dataset_name, df.to_csv(index=False).encode("utf-8"))
-        zf.writestr("metadata.csv", meta.to_csv(index=False).encode("utf-8"))
-        if not failures.empty:
-            zf.writestr("failed_requests.csv", failures.to_csv(index=False).encode("utf-8"))
-    return zip_buffer_path
-
-
-def render_historical_data_lab():
-    st.markdown(
-        """
-        <div class="alpha-hero">
-            <div class="alpha-hero-title">HISTORICAL DATA LAB</div>
-            <div class="alpha-hero-sub">Build clean research datasets from Dhan history</div>
-            <span class="alpha-badge">DATA</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    mode = st.radio(
-        "Data type",
-        ["Expired Options", "Single Contract / Index / Future"],
-        horizontal=True,
-        key="hist_lab_mode",
-    )
-
-    if mode == "Expired Options":
-        st.caption(
-            "Rolling expired-option history • ATM-relative strikes • OHLC + OI/IV/Volume/Spot"
-        )
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            exchange = st.selectbox("Exchange", ["NSE", "MCX"], key="hist_opt_exchange")
-        with c2:
-            script = st.text_input("Script / Underlying", value="NIFTY", key="hist_opt_script").strip().upper()
-        with c3:
-            expiry_flag = st.selectbox(
-                "Expiry cycle",
-                ["WEEK", "MONTH"],
-                index=0,
-                key="hist_opt_expiry_flag",
-            )
-
-        c4, c5, c6 = st.columns(3)
-        with c4:
-            timeframe = st.selectbox(
-                "Timeframe",
-                HIST_OPT_ALLOWED_INTERVALS,
-                format_func=lambda x: f"{x} minute",
-                index=0,
-                key="hist_opt_timeframe",
-            )
-        with c5:
-            expiry_code = st.selectbox(
-                "Expiry code",
-                [1, 2, 3],
-                format_func=lambda x: {
-                    1: "Near expiry",
-                    2: "Next expiry",
-                    3: "Far expiry",
-                }[x],
-                index=0,
-                key="hist_opt_expiry_code",
-            )
-        with c6:
-            side = st.selectbox(
-                "Option side",
-                ["BOTH", "CALL", "PUT"],
-                key="hist_opt_side",
-            )
-
-        c7, c8, c9, c10 = st.columns(4)
-        with c7:
-            strike_min = st.number_input(
-                "From ATM",
-                min_value=-10,
-                max_value=10,
-                value=-10,
-                step=1,
-                key="hist_opt_strike_min",
-            )
-        with c8:
-            strike_max = st.number_input(
-                "To ATM",
-                min_value=-10,
-                max_value=10,
-                value=10,
-                step=1,
-                key="hist_opt_strike_max",
-            )
-        with c9:
-            from_date = st.date_input(
-                "From date",
-                value=(local_now().date() - pd.Timedelta(days=365)),
-                key="hist_opt_from",
-            )
-        with c10:
-            to_date = st.date_input(
-                "To date",
-                value=local_now().date(),
-                key="hist_opt_to",
-            )
-
-        st.caption(
-            "Example: NIFTY • WEEK • ATM-10 to ATM+10 • 1 minute • 3 years. "
-            "The downloader automatically splits the request into Dhan's 30-day maximum chunks."
-        )
-
-        if st.button("⬇️ Build Historical Options Dataset", key="hist_opt_download"):
-            if strike_min > strike_max:
-                st.error("From ATM must be less than or equal to To ATM.")
-                return
-            if from_date >= to_date:
-                st.error("From date must be before To date.")
-                return
-
-            resolved = _resolve_history_underlying(master, exchange, script)
-            if not resolved:
-                st.error(f"Could not resolve underlying '{script}' from the Dhan instrument master.")
-                return
-
-            cfg = {
-                "exchange": exchange,
-                "script": script,
-                "security_id": resolved["security_id"],
-                "exchange_segment": "NSE_FNO" if exchange == "NSE" else "MCX_COMM",
-                "instrument": "OPTIDX" if exchange == "NSE" and script in {"NIFTY","BANKNIFTY","SENSEX","FINNIFTY","MIDCPNIFTY"} else "OPTSTK" if exchange == "NSE" else "OPTFUT",
-                "expiry_flag": expiry_flag,
-                "expiry_code": expiry_code,
-                "interval": timeframe,
+        for key, side in [("ce", "CE"), ("pe", "PE")]:
+            leg = pair.get(key)
+            if not isinstance(leg, dict):
+                continue
+            rows.append({
+                "strike": strike,
                 "side": side,
-                "strike_min": int(strike_min),
-                "strike_max": int(strike_max),
-                "from_date": from_date,
-                "to_date": to_date,
-                "required_data": HIST_DEFAULT_REQUIRED,
-            }
-
-            with st.status("Downloading and combining historical data...", expanded=True) as status:
-                st.write(
-                    f"{script} • {expiry_flag} • ATM{strike_min:+d} to ATM{strike_max:+d} • "
-                    f"{timeframe} minute"
-                )
-                dataset, failures = _download_expired_options_dataset(cfg)
-                if dataset.empty:
-                    status.update(label="Download failed", state="error")
-                    st.error("No historical data was returned. Check the script, dates, expiry cycle/code and Dhan access token.")
-                    if not failures.empty:
-                        st.dataframe(failures, use_container_width=True, hide_index=True)
-                    return
-
-                zip_path = _make_history_zip(
-                    dataset,
-                    failures,
-                    {"mode": mode, **cfg},
-                )
-                status.update(label="Dataset ready", state="complete")
-
-            st.success(
-                f"Dataset ready: {len(dataset):,} rows across "
-                f"{dataset['strike_offset'].nunique() if 'strike_offset' in dataset.columns else 'selected'} strike offsets."
-            )
-            if not failures.empty:
-                st.warning(f"{len(failures)} individual requests failed. The ZIP contains failed_requests.csv.")
-
-            st.dataframe(
-                dataset.head(200),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.download_button(
-                "⬇️ Download Final Dataset ZIP",
-                data=zip_path.read_bytes(),
-                file_name=f"{script}_{expiry_flag}_{strike_min:+d}_to_{strike_max:+d}_{timeframe}m_history.zip",
-                mime="application/zip",
-                key="hist_opt_final_download",
-            )
-
-    else:
-        st.caption(
-            "Download OHLC (and OI where supported) for one NSE/MCX/index/futures contract."
-        )
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            exchange = st.selectbox(
-                "Exchange",
-                ["NSE", "MCX"],
-                key="hist_std_exchange",
-            )
-        with c2:
-            instrument = st.selectbox(
-                "Instrument",
-                (
-                    ["EQUITY", "FUTSTK", "FUTIDX", "INDEX"]
-                    if exchange == "NSE"
-                    else ["FUTCOM", "INDEX"]
-                ),
-                key="hist_std_instrument",
-            )
-        with c3:
-            script = st.text_input(
-                "Script / Contract",
-                value="NIFTY" if instrument in {"FUTIDX", "INDEX"} else "RELIANCE",
-                key="hist_std_script",
-            ).strip().upper()
-
-        c4, c5, c6 = st.columns(3)
-        with c4:
-            timeframe = st.selectbox(
-                "Timeframe",
-                ["Daily"] + HIST_STD_ALLOWED_INTERVALS,
-                format_func=lambda x: "Daily" if x == "Daily" else f"{x} minute",
-                key="hist_std_timeframe",
-            )
-        with c5:
-            include_oi = st.checkbox("Include OI", value=True, key="hist_std_oi")
-        with c6:
-            security_override = st.text_input(
-                "Security ID (optional)",
-                value="",
-                key="hist_std_security",
-            ).strip()
-
-        c7, c8 = st.columns(2)
-        with c7:
-            from_date = st.date_input(
-                "From date",
-                value=(local_now().date() - pd.Timedelta(days=365)),
-                key="hist_std_from",
-            )
-        with c8:
-            to_date = st.date_input(
-                "To date",
-                value=local_now().date(),
-                key="hist_std_to",
-            )
-
-        if st.button("⬇️ Build Contract Dataset", key="hist_std_download"):
-            if from_date >= to_date:
-                st.error("From date must be before To date.")
-                return
-
-            resolved = _resolve_standard_contract(
-                master,
-                exchange,
-                instrument,
-                script,
-                security_override,
-            )
-            if not resolved:
-                st.error(
-                    f"Could not resolve {script} as {instrument} on {exchange}. "
-                    "Try a valid script or enter its Dhan Security ID."
-                )
-                return
-
-            seg = {
-                ("NSE", "EQUITY"): "NSE_EQ",
-                ("NSE", "FUTSTK"): "NSE_FNO",
-                ("NSE", "FUTIDX"): "NSE_FNO",
-                ("NSE", "INDEX"): "IDX_I",
-                ("MCX", "FUTCOM"): "MCX_COMM",
-                ("MCX", "INDEX"): "MCX_COMM",
-            }.get((exchange, instrument))
-
-            if not seg:
-                st.error("This exchange/instrument combination is not supported by the downloader.")
-                return
-
-            cfg = {
-                "exchange_segment": seg,
-                "instrument": instrument,
-                "security_id": resolved["security_id"],
-                "script": script,
-                "timeframe": timeframe,
-                "include_oi": include_oi,
-                "expiry_code": 0,
-                "from_date": from_date,
-                "to_date": to_date,
-                "mode": mode,
-                "exchange": exchange,
-            }
-
-            with st.status("Downloading and combining contract history...", expanded=True) as status:
-                dataset, failures = _download_standard_dataset(cfg)
-                if dataset.empty:
-                    status.update(label="Download failed", state="error")
-                    st.error("No historical data returned. Check the contract, dates and access token.")
-                    if not failures.empty:
-                        st.dataframe(failures, use_container_width=True, hide_index=True)
-                    return
-                zip_path = _make_history_zip(dataset, failures, cfg)
-                status.update(label="Dataset ready", state="complete")
-
-            st.success(f"Dataset ready: {len(dataset):,} rows.")
-            if not failures.empty:
-                st.warning(f"{len(failures)} chunks failed. The ZIP contains failed_requests.csv.")
-
-            st.dataframe(
-                dataset.head(200),
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.download_button(
-                "⬇️ Download Final Dataset ZIP",
-                data=zip_path.read_bytes(),
-                file_name=f"{script}_{instrument}_{timeframe}_history.zip",
-                mime="application/zip",
-                key="hist_std_final_download",
-            )
-
-
-
-if page == "Fresh Trades":
-    render_fresh_trades_module()
-
-elif page == "Trade Logs":
-    render_trade_logs_module()
-
-elif page == "Market Overview":
-    st.markdown(
-        f"""
-        <div class="market-dashboard-hero">
-          <div>
-            <div class="market-dashboard-title">ALPHA ANALYZER</div>
-            <div class="market-dashboard-sub">Smart View • Clear Signals • Better Trades</div>
-          </div>
-          <div class="market-dashboard-live">● LIVE MARKET<br><span>{local_now().strftime('%d-%b-%Y %H:%M:%S IST')}</span></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.caption("Market Pulse • P&F Direction • Fresh Trade Flow")
-
-    def market_bias_from_history(sec_id, segment, instrument):
-        try:
-            h=historical(sec_id,segment,instrument,"Positional")
-            if h.empty:
-                return "UNAVAILABLE"
-            cols=build_pnf(h["close"],0.0025,3)
-            if len(cols)<3:
-                return "SIDEWAYS"
-            c1,c2,c3=cols[-3:]
-            if c1["type"]=="X" and c2["type"]=="O" and c3["type"]=="X" and c3["high"]>c1["high"]:
-                return "BULLISH"
-            if c1["type"]=="O" and c2["type"]=="X" and c3["type"]=="O" and c3["low"]<c1["low"]:
-                return "BEARISH"
-            return "SIDEWAYS"
-        except Exception:
-            return "UNAVAILABLE"
-
-    overview=[]
-    for name in ["NIFTY","BANKNIFTY"]:
-        sid=resolve_nse_index_security_id(master,name)
-        overview.append({"Market":name,"Bias":market_bias_from_history(sid,"IDX_I","INDEX") if sid is not None else "UNAVAILABLE"})
-
-    mcx=mcx_futures_universe(master)
-    for commodity in ["GOLD","SILVER","CRUDEOIL"]:
-        match=mcx[mcx["underlying_symbol"]==commodity]
-        bias="UNAVAILABLE"
-        if not match.empty:
-            bias=market_bias_from_history(int(match.iloc[0]["security_id"]),"MCX_COMM","FUTCOM")
-        overview.append({"Market":commodity,"Bias":bias})
-
-    st.markdown("""
-    <style>
-    .market-card{border:1px solid rgba(255,255,255,.10);border-radius:16px;padding:15px;min-height:105px;
-    background:linear-gradient(145deg,rgba(255,255,255,.055),rgba(255,255,255,.018));box-shadow:0 8px 24px rgba(0,0,0,.16);}
-    .market-name{font-size:.82rem;font-weight:700;opacity:.75;margin-bottom:10px;}
-    .market-bias{font-size:1.18rem;font-weight:800;}
-    .market-sub{margin-top:7px;font-size:.70rem;opacity:.50;}
-    
-    .alpha-statusbar {
-        display:flex;
-        align-items:center;
-        gap:9px;
-        padding:9px 13px;
-        margin:0 0 18px 0;
-        border-radius:12px;
-        background:rgba(255,255,255,.028);
-        border:1px solid rgba(255,255,255,.06);
-        color:rgba(255,255,255,.78);
-        font-size:.78rem;
-        font-weight:750;
-        letter-spacing:.04em;
-    }
-
-    .alpha-live-dot {
-        width:8px;
-        height:8px;
-        border-radius:50%;
-        background:#47d18c;
-        box-shadow:0 0 12px rgba(71,209,140,.55);
-        flex:0 0 auto;
-    }
-
-    .alpha-divider {
-        opacity:.35;
-    }
-
-    .alpha-status-text {
-        opacity:.55;
-        font-weight:650;
-        letter-spacing:.03em;
-    }
-</style>
-    """,unsafe_allow_html=True)
-
-    def _market_parts(bias):
-        if bias=="BULLISH": return "🟢","BULLISH","#47d18c"
-        if bias=="BEARISH": return "🔴","BEARISH","#ff5c69"
-        if bias=="SIDEWAYS": return "🟡","SIDEWAYS","#ffd15c"
-        return "⚪","UNAVAILABLE","#a9adb7"
-
-    cards=st.columns(5,gap="small")
-    for col,item in zip(cards,overview):
-        icon,label,dot=_market_parts(item["Bias"])
-        with col:
-            st.markdown(
-                f"""<div class="market-dashboard-card"><div class="name">{item["Market"]}</div>
-                <div class="bias" style="color:{dot};">{icon} {label}</div>
-                <div class="sub">Current market state</div></div>""",
-                unsafe_allow_html=True)
-
-    st.markdown("### Dashboard Signals")
-    ft=fresh_trades_dataframe()
-    a,b,c=st.columns([1.25,1.25,1.5],gap="small")
-    with a:
-        bull=sum(1 for x in overview if x["Bias"]=="BULLISH")
-        bear=sum(1 for x in overview if x["Bias"]=="BEARISH")
-        st.metric("Bullish Markets",bull)
-    with b:
-        st.metric("Bearish Markets",bear)
-    with c:
-        st.metric("Fresh Trades Today",len(ft))
-
-    if not ft.empty:
-        st.markdown("#### Latest Fresh Trades")
-        st.dataframe(
-            ft.head(8)[["Entry Time","Symbol","Direction","Trade Price","Module","Mode","Status"]],
-            use_container_width=True, hide_index=True,
-            column_config={"Trade Price": st.column_config.NumberColumn("Price",format="%.2f")},
-        )
-    st.caption("Market information only.")
-
-
-elif page in ("Momentum", "Positional"):
-    mode = "Intraday" if page == "Momentum" else "Positional"
-    st.markdown(
-        f"""
-        <div class="alpha-hero">
-            <div class="alpha-hero-title">NSE {"Momentum" if page == "Momentum" else mode}</div>
-            <div class="alpha-hero-sub">Live trade monitoring & signal tracking</div>
-            <span class="alpha-badge">LIVE</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    
-
-    fut = future_universe(master, "NSE")
-    if fut.empty:
-        st.error("No NSE F&O instruments available.")
-        st.stop()
-
-    # ---------------------------------------------------------
-    # INTRADAY: daily Anchor eligibility is calculated once/day
-    # ---------------------------------------------------------
-    if mode == "Intraday":
-        if "intraday_daily_filter" not in st.session_state:
-            st.session_state.intraday_daily_filter = {}
-        if "intraday_filter_date" not in st.session_state:
-            st.session_state.intraday_filter_date = None
-
-        today = datetime.now().date().isoformat()
-
-        if (
-            st.session_state.intraday_filter_date != today
-            or not st.session_state.intraday_daily_filter
-        ):
-            eligible = {}
-
-            prog = st.progress(
-                0,
-                text=f"Building today's opportunity universe: {len(fut)} instruments..."
-            )
-
-            for i, (_, r) in enumerate(fut.iterrows(), 1):
-                try:
-                    h = cached_cash_daily(int(r["underlying_security_id"]))
-                    cols = build_pnf(h["close"], 0.0025, 3)
-
-                    if cols:
-                        last = cols[-1]
-
-                        if last["type"] == "X" and last["boxes"] > 15:
-                            eligible[str(r["underlying_symbol"])] = "Bullish"
-                        elif last["type"] == "O" and last["boxes"] > 15:
-                            eligible[str(r["underlying_symbol"])] = "Bearish"
-                        else:
-                            eligible[str(r["underlying_symbol"])] = None
-                    else:
-                        eligible[str(r["underlying_symbol"])] = None
-
-                except Exception:
-                    eligible[str(r["underlying_symbol"])] = None
-
-                prog.progress(
-                    i / max(len(fut), 1),
-                    text=f"Universe {i}/{len(fut)}"
-                )
-
-            prog.empty()
-
-            st.session_state.intraday_daily_filter = eligible
-            st.session_state.intraday_filter_date = today
-
-        daily_map = st.session_state.intraday_daily_filter
-
-        allowed_symbols = {
-            symbol
-            for symbol, bias in daily_map.items()
-            if bias in ("Bullish", "Bearish")
-        }
-
-        candidates = fut[
-            fut["underlying_symbol"].isin(allowed_symbols)
-        ].copy()
-
-        st.info(
-            f"{len(candidates)} instruments currently eligible for intraday monitoring."
-        )
-
-        if st.button(
-            "Refresh Eligible Universe",
-            key="refresh_intraday_universe"
-        ):
-            st.session_state.intraday_daily_filter = {}
-            st.session_state.intraday_filter_date = None
-            st.rerun()
-
-    # ---------------------------------------------------------
-    # POSITIONAL: show the currently running daily direction
-    # ---------------------------------------------------------
-    else:
-        candidates = fut.copy()
-
-    ids = (
-        candidates["underlying_security_id"].astype(int).tolist()
-        if not candidates.empty else []
-    )
-
-    spot_map = batch_ltp("NSE_EQ", ids) if ids else {}
-
-    rows = []
-
-    prog = st.progress(
-        0,
-        text=f"Scanning {len(candidates)} instruments..."
-    )
-
-    for i, (_, r) in enumerate(candidates.iterrows(), 1):
-        symbol = str(r["underlying_symbol"])
-        sid = int(r["underlying_security_id"])
-        fut_sid = int(r["security_id"])
-        ltp = spot_map.get(sid, np.nan)
-        market_quote = {}
-        try:
-            market_quote = batch_quote("NSE_EQ", [sid]).get(sid, {})
-        except Exception:
-            market_quote = {}
-        market_time = exchange_time_from_ltt(
-            market_quote.get("last_trade_time", np.nan)
-        )
-        quote_price = pd.to_numeric(
-            market_quote.get("last_price"),
-            errors="coerce",
-        )
-        if pd.notna(quote_price):
-            ltp = float(quote_price)
-
-        try:
-            oi_conf = {
-                "label": "—",
-                "state": "—",
-                "oi_change_pct": np.nan,
-                "price_change_pct": np.nan,
-                "rank": 0,
-            }
-            sector_conf = {
-                "confirmed": False,
-                "breadth": np.nan,
-                "sector": "Other",
-            }
-
-            if mode == "Intraday":
-                # Only eligible stocks reach this point.
-                h = cached_cash_intraday(sid)
-
-                ip = analyze_new_pattern(
-                    h,
-                    0.0015,
-                    anchor_min=15,
-                    pullback_max=5,
-                )
-
-                positional_bias = daily_map[symbol]
-
-                above_trend = (
-                    pd.notna(ltp)
-                    and pd.notna(intraday_sma10(h))
-                    and float(ltp) > float(intraday_sma10(h))
-                )
-                below_trend = (
-                    pd.notna(ltp)
-                    and pd.notna(intraday_sma10(h))
-                    and float(ltp) < float(intraday_sma10(h))
-                )
-
-                if (
-                    positional_bias == "Bullish"
-                    and ip["dtb"]
-                    and above_trend
-                ):
-                    rec = "🟢 BUY"
-
-                elif (
-                    positional_bias == "Bearish"
-                    and ip["dbs"]
-                    and below_trend
-                ):
-                    rec = "🔴 SELL"
-
-                elif (
-                    positional_bias == "Bullish"
-                    and ip["prospective"]
-                    and ip["bias"] == "Bullish"
-                    and above_trend
-                ):
-                    rec = "🟡 SETUP"
-
-                elif (
-                    positional_bias == "Bearish"
-                    and ip["prospective"]
-                    and ip["bias"] == "Bearish"
-                    and below_trend
-                ):
-                    rec = "🟡 SETUP"
-
-                else:
-                    rec = "NO TRADE"
-
-                bias = positional_bias
-                entry = ip.get("entry_level", np.nan)
-                sl = ip.get("sl", np.nan)
-
-            else:
-                # Positional = ACTIVE DTB/DBS only.
-                p = positional_active_pattern(sid)
-
-                bias = p["bias"]
-                rec = p["recommendation"]
-                entry = p["entry"]
-                sl = p["sl"]
-
-            # F&O OI confirmation runs ONLY for positional trades.
-            # Intraday remains lightweight and does not query futures OI.
-            if mode == "Positional":
-                trade_direction = None
-                if rec == "🟢 LONG":
-                    trade_direction = "LONG"
-                elif rec == "🔴 SHORT":
-                    trade_direction = "SHORT"
-
-                if trade_direction is not None:
-                    oi_conf = oi_confirmation_for_trade(
-                        fut_sid,
-                        trade_direction,
-                    )
-
-                    # Sector confirmation is additive only.
-                    # It never removes or changes the P&F trade.
-                    sector_direction = trade_direction
-
-            # A star means: valid positional P&F trade + strong OI confirmation.
-            # It does not create the trade.
-            superior = (
-                mode == "Positional"
-                and oi_conf.get("state") in ("LONG BUILDUP", "SHORT BUILDUP")
-                and oi_conf.get("rank", 0) >= 3
-                and rec in ("🟢 LONG", "🔴 SHORT")
-            )
-            display_symbol = f"★ {symbol}" if superior else symbol
-
-            rows.append({
-                "Script": display_symbol,
-                "LTP": ltp,
-                "Market Time": market_time,
-                "Bias": bias,
-                "Pattern": p.get("pattern", "—") if mode == "Positional" else "—",
-                "OI Confirmation": oi_conf["label"],
-                "OI Δ%": oi_conf["oi_change_pct"],
-                "Entry": entry,
-                "SL": sl,
-                "Recommendation": rec,
-                "_OI Rank": oi_conf["rank"],
-                "_Sector Confirmed": False,
-                "_Sector": sector_of(symbol),
-                "_Sector Breadth %": np.nan,
+                "ltp": pd.to_numeric(leg.get("last_price"), errors="coerce"),
+                "iv": pd.to_numeric(leg.get("implied_volatility"), errors="coerce"),
+                "oi": pd.to_numeric(leg.get("oi"), errors="coerce"),
+                "security_id": pd.to_numeric(leg.get("security_id"), errors="coerce"),
             })
 
-        except Exception:
-            rows.append({
-                "Script": symbol,
-                "LTP": ltp,
-                "Market Time": market_time,
-                "Bias": "UNAVAILABLE",
-                "Pattern": "—",
-                "OI Confirmation": "DATA ERROR",
-                "OI Δ%": np.nan,
-                "Entry": np.nan,
-                "SL": np.nan,
-                "Recommendation": "DATA ERROR",
-                "_OI Rank": 0,
-                "_Sector Confirmed": False,
-                "_Sector": sector_of(symbol),
-                "_Sector Breadth %": np.nan,
-            })
+    return pd.DataFrame(rows), float(spot) if pd.notna(spot) else np.nan
 
-        prog.progress(
-            i / max(len(candidates), 1),
-            text=f"Scanning {i}/{max(len(candidates), 1)}"
-        )
 
-    prog.empty()
+def current_atm_iv():
+    expiries = expiry_list()
+    today = local_now().date()
+    future = [d for d in expiries if d >= today]
+    if not future:
+        return {}
 
-    if mode == "Positional":
-        st.session_state["positional_oi_confirmed_count"] = int(
-            sum(1 for x in rows if str(x.get("Script", "")).startswith("★ "))
-        )
+    expiry = future[0]
+    raw = option_chain_for_expiry(expiry)
+    chain, spot = parse_option_chain(raw)
+    if chain.empty or pd.isna(spot):
+        return {}
 
-    res = pd.DataFrame(rows)
+    strikes = sorted(chain["strike"].dropna().unique())
+    atm = min(strikes, key=lambda x: abs(float(x) - float(spot)))
 
-    if mode == "Positional" and not res.empty:
-        # IMPORTANT:
-        # Sector confirmation is based on the same 1% / 3-box daily
-        # Sector Analysis module, NOT the individual stock's 0.25% P&F.
-        fut_for_sector = future_universe(master, "NSE")
-        sector_map_1pct = sector_confirmation_1pct_map(
-            fut_for_sector
-        )
+    ce = chain[(chain["side"] == "CE") & np.isclose(chain["strike"], atm)]
+    pe = chain[(chain["side"] == "PE") & np.isclose(chain["strike"], atm)]
 
-        for idx_row, trade_row in res.iterrows():
-            rec = str(
-                trade_row.get("Recommendation", "")
+    ce_iv = float(ce.iloc[-1]["iv"]) if not ce.empty and pd.notna(ce.iloc[-1]["iv"]) else np.nan
+    pe_iv = float(pe.iloc[-1]["iv"]) if not pe.empty and pd.notna(pe.iloc[-1]["iv"]) else np.nan
+    avg_iv = float(np.nanmean([ce_iv, pe_iv])) if not (pd.isna(ce_iv) and pd.isna(pe_iv)) else np.nan
+
+    return {
+        "expiry": expiry,
+        "spot": spot,
+        "atm": float(atm),
+        "ce_iv": ce_iv,
+        "pe_iv": pe_iv,
+        "avg_iv": avg_iv,
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def historical_atm_iv_sessions():
+    """
+    Fetch roughly 60 calendar days of weekly ATM CE/PE 1-minute IV, then
+    reduce to the last 30 completed trading sessions.
+    """
+    end = local_now().date() + timedelta(days=1)
+    start = local_now().date() - timedelta(days=HISTORY_CALENDAR_DAYS)
+    frames = []
+
+    for chunk_start, chunk_end in _date_chunks(
+        start, end, 30
+    ):
+        for side in ["CALL", "PUT"]:
+            body = api_post(
+                "/charts/rollingoption",
+                {
+                    "exchangeSegment": "NSE_FNO",
+                    "interval": "1",
+                    "securityId": NIFTY_ID,
+                    "instrument": "OPTIDX",
+                    "expiryFlag": "WEEK",
+                    "expiryCode": 0,
+                    "strike": "ATM",
+                    "drvOptionType": side,
+                    "requiredData": [
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "iv",
+                        "volume",
+                        "strike",
+                        "oi",
+                        "spot",
+                    ],
+                    "fromDate": chunk_start.strftime("%Y-%m-%d"),
+                    "toDate": chunk_end.strftime("%Y-%m-%d"),
+                },
+                f"Historical ATM {side} IV",
             )
-
-            if rec not in ("🟢 LONG", "🔴 SHORT"):
+            data = parse_data(body)
+            key = "ce" if side == "CALL" else "pe"
+            leg = data.get(key) if isinstance(data, dict) else None
+            if not isinstance(leg, dict):
                 continue
 
-            symbol_clean = (
-                str(trade_row["Script"])
-                .replace("★★ ", "")
-                .replace("★ ", "")
-                .strip()
-            )
+            df = _parse_arrays(leg)
+            if df.empty or "iv" not in df.columns:
+                continue
 
-            direction = (
-                "LONG"
-                if rec == "🟢 LONG"
-                else "SHORT"
-            )
+            df["side"] = side
+            frames.append(df[["datetime", "iv", "side"]])
 
-            sector_name = sector_of(symbol_clean)
-            sector_info = sector_map_1pct.get(
-                sector_name,
-                {
-                    "bullish_pct": np.nan,
-                    "bearish_pct": np.nan,
-                    "bias": "UNAVAILABLE",
-                    "stocks": 0,
-                },
-            )
+    if not frames:
+        return pd.DataFrame()
 
-            sector_bias = sector_info["bias"]
+    raw = pd.concat(frames, ignore_index=True)
+    raw["date"] = raw["datetime"].dt.date
+    raw = raw.dropna(subset=["iv"])
 
-            if direction == "LONG":
-                sector_ok = sector_bias == "BULLISH"
-                breadth = sector_info["bullish_pct"]
-            else:
-                sector_ok = sector_bias == "BEARISH"
-                breadth = sector_info["bearish_pct"]
-
-            res.at[idx_row, "_Sector Confirmed"] = bool(
-                sector_ok
-            )
-            res.at[idx_row, "_Sector"] = sector_name
-            res.at[idx_row, "_Sector Breadth %"] = breadth
-
-            # ★ = one confirmation
-            # ★★ = both OI + sector confirmation
-            oi_ok = (
-                int(trade_row.get("_OI Rank", 0)) >= 3
-            )
-
-            if oi_ok and sector_ok:
-                res.at[idx_row, "Script"] = (
-                    f"★★ {symbol_clean}"
-                )
-            elif oi_ok or sector_ok:
-                res.at[idx_row, "Script"] = (
-                    f"★ {symbol_clean}"
-                )
-            else:
-                res.at[idx_row, "Script"] = symbol_clean
-
-
-    opened_trades, exited_trades = manage_trade_book(
-        "NSE",
-        mode,
-        res,
+    # Per day: first available IV and last available IV for each side.
+    piv = (
+        raw.sort_values("datetime")
+        .groupby(["date", "side"], as_index=False)
+        .agg(
+            open_iv=("iv", "first"),
+            close_iv=("iv", "last"),
+        )
     )
 
-    if opened_trades:
-        notify_new_trades(
-            "NSE",
-            mode,
-            [t["Symbol"] for t in opened_trades],
-        )
+    wide = piv.pivot(index="date", columns="side", values=["open_iv", "close_iv"]).reset_index()
+    wide.columns = [
+        "_".join([str(x) for x in col if str(x) != ""])
+        if isinstance(col, tuple) else str(col)
+        for col in wide.columns
+    ]
 
-    if exited_trades:
-        notify_trade_exits(exited_trades)
+    rename = {
+        "CALL_open_iv": "ce_open_iv",
+        "PUT_open_iv": "pe_open_iv",
+        "CALL_close_iv": "ce_close_iv",
+        "PUT_close_iv": "pe_close_iv",
+    }
+    wide = wide.rename(columns=rename)
+
+    for col in ["ce_open_iv", "pe_open_iv", "ce_close_iv", "pe_close_iv"]:
+        if col not in wide.columns:
+            wide[col] = np.nan
+
+    wide["open_iv"] = wide[["ce_open_iv", "pe_open_iv"]].mean(axis=1)
+    wide["close_iv"] = wide[["ce_close_iv", "pe_close_iv"]].mean(axis=1)
+    wide["iv_change"] = wide["close_iv"] - wide["open_iv"]
+
+    # Only completed sessions for the baseline.
+    today = local_now().date()
+    wide = wide[wide["date"] < today].copy()
+    wide = wide.dropna(subset=["open_iv", "close_iv"]).sort_values("date")
+    return wide.tail(HISTORY_SESSIONS).reset_index(drop=True)
 
 
-    if mode == "Intraday":
-        long_df = res[res["Recommendation"] == "🟢 BUY"].copy()
-        short_df = res[res["Recommendation"] == "🔴 SELL"].copy()
-        setup_df = res[res["Recommendation"] == "🟡 SETUP"].copy()
+def build_pnf(closes, box_pct, reversal):
+    vals = [
+        float(v) for v in pd.to_numeric(pd.Series(closes), errors="coerce").dropna()
+        if float(v) > 0
+    ]
+    if len(vals) < 2:
+        return []
 
-    # MOMENTUM STICKY TRADES:
-    # Once a trade is logged, keep it visible until an actual exit is recorded.
-    if mode == "Intraday":
-        sticky = _sticky_active_rows_for_display("NSE", "Intraday", res)
-        if not sticky.empty:
-            long_df = pd.concat(
-                [long_df, sticky[sticky["Recommendation"] == "🟢 BUY"]],
-                ignore_index=True,
-            )
-            short_df = pd.concat(
-                [short_df, sticky[sticky["Recommendation"] == "🔴 SELL"]],
-                ignore_index=True,
-            )
-    else:
-        long_df = res[res["Recommendation"] == "🟢 LONG"].copy()
-        short_df = res[res["Recommendation"] == "🔴 SHORT"].copy()
-        setup_df = res[res["Recommendation"] == "🟡 SETUP"].copy()
+    log_box = math.log1p(float(box_pct) / 100.0)
+    level0 = math.floor(math.log(vals[0]) / log_box)
+    direction = None
+    high = level0
+    low = level0
+    columns = []
 
-    long_df = long_df.sort_values("_OI Rank", ascending=False)
-    short_df = short_df.sort_values("_OI Rank", ascending=False)
+    for value in vals[1:]:
+        level = math.floor(math.log(value) / log_box)
 
-    def active_trade_style(row):
-        rec = str(row.get("Recommendation", ""))
-        oi = str(row.get("OI Confirmation", ""))
+        if direction is None:
+            if level >= high + 1:
+                direction = "X"
+                high = level
+                columns.append({"type": "X", "top": high, "bottom": high})
+            elif level <= low - 1:
+                direction = "O"
+                low = level
+                columns.append({"type": "O", "top": low, "bottom": low})
+            continue
 
-        if rec in ("🟢 BUY", "🟢 LONG"):
-            base = "background-color: #d9f2d9; color: #0b5d1e; font-weight: 700"
-        elif rec in ("🔴 SELL", "🔴 SHORT"):
-            base = "background-color: #f8d7da; color: #8a1c1c; font-weight: 700"
+        if direction == "X":
+            if level > high:
+                high = level
+                columns[-1]["top"] = high
+            elif level <= high - reversal:
+                previous_high = high
+                direction = "O"
+                low = level
+                columns.append({
+                    "type": "O",
+                    "top": previous_high - 1,
+                    "bottom": low,
+                })
         else:
-            base = ""
+            if level < low:
+                low = level
+                columns[-1]["bottom"] = low
+            elif level >= low + reversal:
+                previous_low = low
+                direction = "X"
+                high = level
+                columns.append({
+                    "type": "X",
+                    "top": high,
+                    "bottom": previous_low + 1,
+                })
 
-        styles = [base] * len(row)
+    return columns
 
-        try:
-            oi_col = row.index.get_loc("OI Confirmation")
-            if "STRONG LONG" in oi or "STRONG SHORT" in oi:
-                styles[oi_col] = "background-color: #b7e4c7; color: #064420; font-weight: 800"
-            elif "CONFLICT" in oi:
-                styles[oi_col] = "background-color: #f8b4b4; color: #7a0000; font-weight: 800"
-            elif "WEAK" in oi:
-                styles[oi_col] = "background-color: #fff3cd; color: #7a5200; font-weight: 700"
-        except Exception:
-            pass
 
-        return styles
+def vix_pnf_state(df, box_pct, reversal):
+    if df.empty or "close" not in df.columns:
+        return {
+            "state": "UNAVAILABLE",
+            "direction": None,
+            "columns": [],
+        }
 
-    if mode == "Positional":
-        st.caption("Active trades remain visible until the system records an exit.")
+    cols = build_pnf(df["close"], box_pct, reversal)
+    if not cols:
+        return {
+            "state": "SIDEWAYS / NEUTRAL",
+            "direction": None,
+            "columns": [],
+        }
 
+    last = cols[-1]
+    if last["type"] == "O":
+        state = "ACTIVE SELL"
+        direction = "BEARISH"
+    else:
+        state = "ACTIVE LONG"
+        direction = "BULLISH"
+
+    return {
+        "state": state,
+        "direction": direction,
+        "columns": cols,
+    }
+
+
+def make_pnf_figure(df, box_pct, reversal):
+    if go is None or df.empty:
+        return None
+
+    cols = build_pnf(df["close"], box_pct, reversal)
+    if not cols:
+        return None
+
+    log_box = math.log1p(float(box_pct) / 100.0)
+    xs, ys, texts, labels = [], [], [], []
+
+    for col_idx, col in enumerate(cols):
+        start = col["bottom"]
+        end = col["top"]
+        for level in range(int(start), int(end) + 1):
+            xs.append(col_idx)
+            ys.append(math.exp(level * log_box))
+            if col["type"] == "X":
+                texts.append("X")
+                labels.append("bullish")
+            else:
+                texts.append("O")
+                labels.append("bearish")
+
+    fig = go.Figure()
+    for kind, marker_symbol, color in [
+        ("bullish", "x", "#39ff70"),
+        ("bearish", "circle-open", "#ff3b30"),
+    ]:
+        idx = [i for i, label in enumerate(labels) if label == kind]
+        if not idx:
+            continue
+        fig.add_trace(go.Scatter(
+            x=[xs[i] for i in idx],
+            y=[ys[i] for i in idx],
+            mode="markers+text",
+            text=[texts[i] for i in idx],
+            textposition="middle center",
+            marker={
+                "symbol": marker_symbol,
+                "size": 10,
+                "color": color,
+                "line": {"width": 2, "color": color},
+            },
+            hovertemplate="Column %{x}<br>Level %{y:.2f}<extra></extra>",
+            name="X" if kind == "bullish" else "O",
+        ))
+
+    fig.update_layout(
+        height=390,
+        margin=dict(l=10, r=10, t=20, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(4,10,18,0.55)",
+        xaxis=dict(
+            title="P&F Columns",
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.08)",
+            zeroline=False,
+        ),
+        yaxis=dict(
+            title="India VIX",
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.08)",
+            zeroline=False,
+        ),
+        legend=dict(orientation="h", y=1.06, x=0),
+    )
+    return fig
+
+
+def environment_assessment(vix_state, iv_change, avg_change, std_change):
+    if pd.isna(iv_change):
+        iv_class = "UNAVAILABLE"
+    else:
+        z = (
+            (iv_change - avg_change) / std_change
+            if pd.notna(std_change) and std_change > 0 else 0
+        )
+        if z >= 2:
+            iv_class = "EXPANDING SHARPLY"
+        elif z >= 0.5 or iv_change > 0:
+            iv_class = "EXPANDING"
+        elif z <= -0.5 or iv_change < 0:
+            iv_class = "CONTRACTING"
+        else:
+            iv_class = "STABLE"
+
+    if vix_state == "ACTIVE SELL":
+        if iv_class in {"CONTRACTING", "STABLE"}:
+            overall = "FAVOURABLE"
+            reason = "VIX is falling/soft while ATM IV is not expanding."
+        elif iv_class == "EXPANDING":
+            overall = "CAUTION"
+            reason = "VIX is favourable, but ATM IV is expanding."
+        else:
+            overall = "CAUTION"
+            reason = "VIX is favourable, but IV conditions are not fully confirmed."
+    elif vix_state == "ACTIVE LONG":
+        if iv_class == "CONTRACTING":
+            overall = "CAUTION"
+            reason = "VIX is rising even though ATM IV is contracting."
+        else:
+            overall = "NOT FAVOURABLE"
+            reason = "VIX is rising; short-volatility conditions are weak."
+    else:
+        overall = "CAUTION"
+        reason = "VIX has no clear directional P&F state."
+
+    return overall, iv_class, reason
+
+
+def inject_css():
+    st.markdown(
+        """
+        <style>
+        .stApp{
+            background:
+              radial-gradient(circle at 75% 0%, rgba(255,30,30,.10), transparent 30%),
+              linear-gradient(180deg,#050912 0%,#070b12 100%);
+        }
+        .block-container{max-width:1550px;padding-top:1rem;}
+        .jarvis-hero{
+            background:linear-gradient(135deg,#111a27,#07101c);
+            border:1px solid rgba(255,70,50,.28);
+            border-radius:18px;
+            padding:24px 28px;
+            box-shadow:0 0 40px rgba(255,40,20,.08);
+            margin-bottom:14px;
+        }
+        .jarvis-title{font-size:38px;font-weight:800;color:#ff453a;letter-spacing:2px;}
+        .jarvis-sub{font-size:15px;color:#91a1b5;}
+        .jarvis-card{
+            background:rgba(10,19,31,.82);
+            border:1px solid rgba(94,160,220,.18);
+            border-radius:16px;
+            padding:18px;
+            min-height:120px;
+            box-shadow:0 8px 30px rgba(0,0,0,.18);
+        }
+        .metric-label{font-size:12px;color:#8fa0b5;text-transform:uppercase;letter-spacing:1px;}
+        .metric-value{font-size:32px;font-weight:750;color:#f5f7fb;margin-top:5px;}
+        .good{color:#36f06a !important;}
+        .warn{color:#ffc436 !important;}
+        .bad{color:#ff4a48 !important;}
+        .section-title{font-size:18px;font-weight:750;color:#dfe8f2;margin-bottom:8px;}
+        .jarvis-banner{
+            border-radius:14px;padding:16px 20px;margin:10px 0 16px 0;
+            font-size:21px;font-weight:750;border:1px solid rgba(255,255,255,.08);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+ensure_state()
+inject_css()
+
+with st.sidebar:
+    st.markdown(
+        """
+        <div style="font-size:34px;font-weight:800;color:#ff453a;letter-spacing:2px;">JARVIS</div>
+        <div style="color:#93a1b4;margin-bottom:18px;">Option Seller Environment</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.session_state.client_id = st.text_input(
+        "Dhan Client ID",
+        value=st.session_state.client_id,
+    ).strip()
+    st.session_state.access_token = st.text_input(
+        "Dhan Access Token",
+        value=st.session_state.access_token,
+        type="password",
+    ).strip()
+
+    auto = st.checkbox("Auto Refresh", value=True)
+    if st.button("🔄 Refresh Now"):
+        st.cache_data.clear()
+        st.rerun()
 
     st.markdown("---")
-    st.markdown(
-        '<div class="alpha-section"><span class="alpha-section-dot" style="background:#29d77a;"></span>BULLISH / LONG</div>',
-        unsafe_allow_html=True,
-    )
-    if long_df.empty:
-        st.info("No active bullish positions currently.")
-    else:
-        st.dataframe(
-            long_df[
-                [
-                    "Script", "LTP", "Bias", "Entry", "SL", "Recommendation"
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+    st.caption("Single-purpose volatility environment dashboard.")
+    st.caption("Source: same Dhan API / instrument-master pipeline.")
 
-    st.markdown(
-        '<div class="alpha-section"><span class="alpha-section-dot" style="background:#ff5362;"></span>BEARISH / SHORT</div>',
-        unsafe_allow_html=True,
-    )
-    if short_df.empty:
-        st.info("No active bearish positions currently.")
-    else:
-        st.dataframe(
-            short_df[
-                [
-                    "Script", "LTP", "Bias", "Entry", "SL", "Recommendation"
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.markdown(
-        '<div class="alpha-section"><span class="alpha-section-dot" style="background:#ffd45c;"></span>OTHER</div>',
-        unsafe_allow_html=True,
-    )
-    sideways_df = res[res["Recommendation"] == "NO POSITION"].copy()
-    if sideways_df.empty:
-        st.info("No sideways instruments currently.")
-    else:
-        st.dataframe(
-            sideways_df[
-                ["Script", "LTP", "Bias", "Entry", "SL", "Recommendation"]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    render_trade_monitor("NSE", mode)
-
-
-
-elif page == "MCX Futures":
-    st.markdown(
-        """
-        <div class="alpha-hero">
-            <div class="alpha-hero-title">MCX FUTURES</div>
-            <div class="alpha-hero-sub">Live commodity futures monitoring</div>
-            <span class="alpha-badge">LIVE</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    
-    st.caption("GOLD • SILVER • COPPER • CRUDEOIL • NATURALGAS • ZINC • LEAD • NICKEL • ALUMINIUM")
-
-    mode=st.radio("Horizon",["Intraday","Positional"],horizontal=True,key="mcx_futures_mode")
-    fut=mcx_futures_universe(master)
-
-    if fut.empty:
-        st.error("No active MCX futures contracts available.")
-        st.stop()
-
-    if mode=="Intraday":
-        if "mcx_intraday_daily_filter" not in st.session_state:
-            st.session_state.mcx_intraday_daily_filter={}
-        if "mcx_intraday_filter_date" not in st.session_state:
-            st.session_state.mcx_intraday_filter_date=None
-
-        today=datetime.now().date().isoformat()
-        if (
-            st.session_state.mcx_intraday_filter_date!=today
-            or not st.session_state.mcx_intraday_daily_filter
-        ):
-            daily_map={}
-            for _,row in fut.iterrows():
-                daily_map[str(row["underlying_symbol"])]=mcx_intraday_daily_eligibility(int(row["security_id"]))
-            st.session_state.mcx_intraday_daily_filter=daily_map
-            st.session_state.mcx_intraday_filter_date=today
-
-        daily_map=st.session_state.mcx_intraday_daily_filter
-        candidates=fut[fut["underlying_symbol"].map(daily_map).isin(["Bullish","Bearish"])].copy()
-
-        st.info(f"{len(candidates)} MCX instruments currently eligible for intraday monitoring.")
-        if st.button("Refresh Eligible Universe",key="mcx_refresh_eligible"):
-            st.session_state.mcx_intraday_daily_filter={}
-            st.session_state.mcx_intraday_filter_date=None
-            st.rerun()
-    else:
-        candidates=fut
-
-    ids=candidates["security_id"].astype(int).tolist() if not candidates.empty else []
-    ltp_map=batch_ltp("MCX_COMM",ids) if ids else {}
-    rows=[]
-
-    for _,row in candidates.iterrows():
-        symbol=str(row["underlying_symbol"])
-        sid=int(row["security_id"])
-        ltp=ltp_map.get(sid,np.nan)
-        market_quote = {}
-        try:
-            market_quote = batch_quote("MCX_COMM", [sid]).get(sid, {})
-        except Exception:
-            market_quote = {}
-        market_time = exchange_time_from_ltt(
-            market_quote.get("last_trade_time", np.nan)
-        )
-        quote_price = pd.to_numeric(
-            market_quote.get("last_price"),
-            errors="coerce",
-        )
-        if pd.notna(quote_price):
-            ltp = float(quote_price)
-
-        rec="DATA ERROR"; bias="UNAVAILABLE"; entry=np.nan; sl=np.nan; display_symbol=symbol
-
-        try:
-            if mode=="Positional":
-                p=positional_active_pattern_mcx(sid)
-                rec=p["recommendation"]; bias=p["bias"]; entry=p["entry"]; sl=p["sl"]
-
-                # P&F decides the trade; OI only adds ★.
-                if rec=="🟢 LONG" and mcx_oi_star(sid,"LONG"):
-                    display_symbol=f"★ {symbol}"
-                elif rec=="🔴 SHORT" and mcx_oi_star(sid,"SHORT"):
-                    display_symbol=f"★ {symbol}"
-
-            else:
-                h=historical(sid,"MCX_COMM","FUTCOM","Intraday")
-                ip=analyze_new_pattern(h,0.0015,anchor_min=15,pullback_max=5)
-                positional_bias=st.session_state.mcx_intraday_daily_filter.get(symbol,"Sideways")
-                sma=intraday_sma10(h)
-
-                above=pd.notna(ltp) and pd.notna(sma) and float(ltp)>float(sma)
-                below=pd.notna(ltp) and pd.notna(sma) and float(ltp)<float(sma)
-
-                if positional_bias=="Bullish" and ip["dtb"] and above:
-                    rec="🟢 BUY"
-                elif positional_bias=="Bearish" and ip["dbs"] and below:
-                    rec="🔴 SELL"
-                elif (
-                    (positional_bias=="Bullish" and ip["prospective"] and ip["bias"]=="Bullish" and above)
-                    or
-                    (positional_bias=="Bearish" and ip["prospective"] and ip["bias"]=="Bearish" and below)
-                ):
-                    rec="🟡 SETUP"
-                else:
-                    rec="NO TRADE"
-
-                bias=positional_bias
-                entry=ip.get("entry_level",np.nan)
-                sl=ip.get("sl",np.nan)
-
-        except Exception:
-            pass
-
-        rows.append({
-            "Script":display_symbol,
-            "LTP":ltp,
-            "Market Time":market_time,
-            "Bias":bias,
-            "Entry":entry,
-            "SL":sl,
-            "Recommendation":rec,
-        })
-
-    res = pd.DataFrame(rows)
-
-    opened_trades, exited_trades = manage_trade_book(
-        "MCX",
-        mode,
-        res,
-    )
-
-    if opened_trades:
-        notify_new_trades(
-            "MCX",
-            mode,
-            [t["Symbol"] for t in opened_trades],
-        )
-
-    if exited_trades:
-        notify_trade_exits(exited_trades)
-
-    long_rec="🟢 LONG" if mode=="Positional" else "🟢 BUY"
-    short_rec="🔴 SHORT" if mode=="Positional" else "🔴 SELL"
-
-    long_df=res[res["Recommendation"]==long_rec].copy()
-    short_df=res[res["Recommendation"]==short_rec].copy()
-
-    if mode=="Intraday":
-        sticky = _sticky_active_rows_for_display("MCX", "Intraday", res)
-        if not sticky.empty:
-            # MCX uses the same compact trade display, but preserve the current
-            # table's recommendation labels.
-            sticky["Recommendation"] = sticky["Recommendation"].replace({
-                "🟢 BUY": "🟢 BUY",
-                "🔴 SELL": "🔴 SELL",
-            })
-            long_df = pd.concat(
-                [long_df, sticky[sticky["Recommendation"]=="🟢 BUY"]],
-                ignore_index=True,
-            )
-            short_df = pd.concat(
-                [short_df, sticky[sticky["Recommendation"]=="🔴 SELL"]],
-                ignore_index=True,
-            )
-
-    def mcx_style(row):
-        rec=str(row["Recommendation"])
-        if rec in ("🟢 LONG","🟢 BUY"):
-            return ["background-color:#d9f2d9;color:#0b5d1e;font-weight:700"]*len(row)
-        if rec in ("🔴 SHORT","🔴 SELL"):
-            return ["background-color:#f8d7da;color:#8a1c1c;font-weight:700"]*len(row)
-        return [""]*len(row)
-
-    st.markdown('<div class="alpha-section"><span class="alpha-section-dot" style="background:#22d77c;"></span>BULLISH / LONG</div>', unsafe_allow_html=True)
-    if long_df.empty:
-        st.info("No bullish/long MCX trades currently.")
-    else:
-        st.dataframe(
-            long_df[["Script","LTP","Bias","Entry","SL","Recommendation"]].style.apply(mcx_style,axis=1),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    st.markdown('<div class="alpha-section"><span class="alpha-section-dot" style="background:#ff5364;"></span>BEARISH / SHORT</div>', unsafe_allow_html=True)
-    if short_df.empty:
-        st.info("No bearish/short MCX trades currently.")
-    else:
-        st.dataframe(
-            short_df[["Script","LTP","Bias","Entry","SL","Recommendation"]].style.apply(mcx_style,axis=1),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-elif page == "ALPHA PRO SELLER":
-    render_alpha_pro_seller()
-
-elif page == "Historical Data Lab":
-    render_historical_data_lab()
-
-elif page == "Option Seller":
-    st.markdown(
-        """
-        <div class="alpha-hero">
-            <div class="alpha-hero-title">OPTION SELLER</div>
-            <div class="alpha-hero-sub">Theta collection • Fixed ATM • Live decision engine</div>
-            <span class="alpha-badge">LIVE</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        index_name = st.selectbox("Index", INDEX_NAMES, key="option_index")
-    with c2:
-        horizon_display = st.radio(
-            "Mode",
-            ["Momentum", "Positional"],
-            horizontal=True,
-            key="option_horizon_display",
-        )
-    with c3:
-        st.metric("Market", "LIVE")
-
-    horizon = "Intraday" if horizon_display == "Momentum" else "Positional"
-
+if auto:
     try:
-        index_sid = resolve_index_instrument(master, index_name)
-        expiries = option_expiry_list_v2(index_sid)
-        selected_expiry = select_option_expiry_v2(expiries, horizon)
-
-        raw_chain = option_chain_request_v2(index_sid, selected_expiry)
-        raw_data = parse_data(raw_chain)
-        spot = (
-            pd.to_numeric(raw_data.get("last_price"), errors="coerce")
-            if isinstance(raw_data, dict) else np.nan
-        )
-
-        chain_df = filter_atm_strike_window(
-            parse_option_chain_v2(raw_chain), spot, strikes_each_side=20
-        )
-
-        # BACKEND ONLY - all detailed option calculations remain hidden.
-        analysis = option_seller_analysis_v2(chain_df, spot, horizon)
-        session_state = option_session_state(index_name, selected_expiry, analysis["atm_iv"])
-        iv_risk = option_iv_risk(analysis["atm_iv"], session_state)
-        oi_risk = option_oi_risk(chain_df, spot)
-
-        notify_option_warning(
-            index_name, "iv_expansion",
-            f"{index_name} IV is expanding sharply.", bool(iv_risk["alert"])
-        )
-        notify_option_warning(
-            index_name, "oi_buildup",
-            f"{index_name} has unusual one-sided OI buildup.", bool(oi_risk["alert"])
-        )
-
-        strategy_name, strategy_reason = simple_option_decision(
-            index_name=index_name,
-            recommendation=analysis["recommendation"],
-            spot=spot,
-            atm=analysis["atm"],
-            expected_move=analysis["expected_move"],
-            support=analysis["support"],
-            resistance=analysis["resistance"],
-            atm_iv=analysis["atm_iv"],
-            open_iv=session_state["open_iv"],
-            oi_alert=oi_risk,
-        )
-
-        if "option_trade_state" not in st.session_state:
-            st.session_state.option_trade_state = {}
-
-        state_key = f"{index_name}|{selected_expiry.isoformat()}|{horizon}"
-        current_state = st.session_state.option_trade_state.get(
-            state_key,
-            {"status": "WAIT", "entry_premium": np.nan, "entry_at": None},
-        )
-
-        current_premium = (
-            analysis["ce_ltp"] + analysis["pe_ltp"]
-            if pd.notna(analysis["ce_ltp"]) and pd.notna(analysis["pe_ltp"])
-            else np.nan
-        )
-
-        signal = (
-            "SELL STRADDLE"
-            if analysis["recommendation"] == "🟢 SELL STRADDLE"
-            and strategy_name == "SELL STRADDLE"
-            else "WAIT"
-        )
-
-        if signal == "SELL STRADDLE" and current_state["status"] != "ACTIVE":
-            current_state = {
-                "status": "ACTIVE",
-                "entry_premium": current_premium,
-                "entry_at": local_now().strftime("%d-%b-%Y %H:%M:%S IST"),
-            }
-            st.session_state.option_trade_state[state_key] = current_state
-
-        if (
-            horizon == "Intraday"
-            and current_state["status"] == "ACTIVE"
-            and local_now().time() >= datetime.strptime("15:05", "%H:%M").time()
-        ):
-            current_state = {
-                "status": "CLOSED",
-                "entry_premium": current_state.get("entry_premium", np.nan),
-                "entry_at": current_state.get("entry_at"),
-            }
-            st.session_state.option_trade_state[state_key] = current_state
-
-        # CLEAN CLIENT-FACING DISPLAY ONLY
-        active = current_state["status"] == "ACTIVE"
-        if active:
-            st.success("🟢 SELL STRADDLE")
-        else:
-            st.info("🟡 WAIT")
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("ATM", f"{int(analysis['atm'])}" if pd.notna(analysis["atm"]) else "—")
-        m2.metric("Straddle", f"{current_premium:.2f}" if pd.notna(current_premium) else "—")
-        m3.metric("Mode", "Momentum" if horizon == "Intraday" else "Positional")
-        m4.metric("Status", "ACTIVE" if active else "WAIT")
-
-        if active:
-            st.success(
-                f"SELL {index_name} {int(analysis['atm'])} CE + "
-                f"{int(analysis['atm'])} PE"
-            )
-
-            e1, e2, e3 = st.columns(3)
-            e1.metric(
-                "Entry Premium",
-                f"{current_state['entry_premium']:.2f}"
-                if pd.notna(current_state.get("entry_premium")) else "—",
-            )
-            e2.metric(
-                "Current Premium",
-                f"{current_premium:.2f}" if pd.notna(current_premium) else "—",
-            )
-            pnl_pts = (
-                current_state["entry_premium"] - current_premium
-                if pd.notna(current_state.get("entry_premium"))
-                and pd.notna(current_premium)
-                else np.nan
-            )
-            e3.metric("Straddle P&L", f"{pnl_pts:.2f}" if pd.notna(pnl_pts) else "—")
-
-            st.caption(
-                f"Entry: {current_state.get('entry_at') or '—'}"
-                + (" • Mandatory exit: 15:05" if horizon == "Intraday" else "")
-            )
-        else:
-            st.caption("Waiting for the backend option-selling conditions to align.")
-
-        if analysis["recommendation"] == "🟢 SELL STRADDLE" and strategy_name == "SELL STRADDLE":
-            st.success("Conditions aligned for theta collection.")
-        elif analysis["recommendation"] == "🟡 CAUTION":
-            st.warning("Market conditions are not ideal for fresh short-vol exposure.")
-        else:
-            st.info("No fresh short-vol trade is active.")
-
-        if iv_risk["alert"] or oi_risk["alert"]:
-            st.warning("⚠️ Risk alert active - short-vol conditions are being monitored.")
-        else:
-            st.success("Risk checks clear.")
-
-        # Alerts remain fully active in the backend.
-        if "option_alert_states" not in st.session_state:
-            st.session_state.option_alert_states = {}
-
-        alert_key = f"{index_name}|{horizon}|{selected_expiry}"
-        old_state = st.session_state.option_alert_states.get(
-            alert_key, {"iv": False, "oi": False}
-        )
-        new_state = {"iv": bool(iv_risk["alert"]), "oi": bool(oi_risk["alert"])}
-
-        if new_state["iv"] and not old_state["iv"]:
-            warning_text = f"{index_name} implied volatility is rising."
-            st.toast(f"⚠️ Option warning: {warning_text}", icon="⚠️")
-            speak_option_alert(f"Warning. {warning_text}")
-
-        if new_state["oi"] and not old_state["oi"]:
-            side_word = "call" if oi_risk["side"] == "CALL" else "put"
-            warning_text = f"{index_name} heavy {side_word} side positioning buildup."
-            st.toast(f"⚠️ Option warning: {warning_text}", icon="⚠️")
-            speak_option_alert(f"Warning. {warning_text}")
-
-        st.session_state.option_alert_states[alert_key] = new_state
-
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=60000, key="jarvis_refresh")
     except Exception:
-        st.error("Option seller data is currently unavailable.")
-        st.info("Please refresh or try again later.")
+        pass
 
+st.markdown(
+    """
+    <div class="jarvis-hero">
+      <div class="jarvis-title">JARVIS</div>
+      <div class="jarvis-sub">OPTION SELLER ENVIRONMENT</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-elif page == "Sector Analysis":
+# VIX controls
+left, right = st.columns([2.2, 1])
+with left:
+    st.markdown('<div class="section-title">1. INDIA VIX ENVIRONMENT</div>', unsafe_allow_html=True)
+with right:
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        vix_tf = st.selectbox("VIX Timeframe", list(VIX_ALLOWED_TIMEFRAMES.keys()), index=0, key="jarvis_vix_tf")
+    with col_b:
+        vix_box = st.number_input("VIX Box %", min_value=0.05, max_value=10.0, value=DEFAULT_BOX, step=0.05, format="%.2f", key="jarvis_vix_box")
+    with col_c:
+        vix_rev = st.number_input("Reversal", min_value=1, max_value=10, value=DEFAULT_REVERSAL, step=1, key="jarvis_vix_rev")
+
+try:
+    vix_ltp, vix_ltt = live_vix()
+
+    hist_end = local_now().date() + timedelta(days=1)
+    hist_start = local_now().date() - timedelta(days=120 if vix_tf == "Day" else 60)
+    vix_hist = vix_history(vix_tf, hist_start, hist_end)
+    vix_state = vix_pnf_state(vix_hist, vix_box, vix_rev)
+
+    iv_today = current_atm_iv()
+    iv_hist = historical_atm_iv_sessions()
+
+    if not iv_hist.empty:
+        hist_avg_change = float(iv_hist["iv_change"].mean())
+        hist_std_change = float(iv_hist["iv_change"].std(ddof=1)) if len(iv_hist) > 1 else np.nan
+    else:
+        hist_avg_change = np.nan
+        hist_std_change = np.nan
+
+    today_current_iv = iv_today.get("avg_iv", np.nan)
+    today_date = local_now().date()
+
+    if not iv_hist.empty and pd.notna(today_current_iv):
+        # Use the first recorded IV of the current session when available.
+        # If today's session is not returned by rolling history yet, use live
+        # current IV as the current reading and leave open IV unavailable.
+        current_hist = None
+        if "date" in iv_hist.columns:
+            current_hist = iv_hist[iv_hist["date"] == today_date]
+        if current_hist is not None and not current_hist.empty:
+            today_open_iv = float(current_hist.iloc[-1]["open_iv"])
+            today_change = today_current_iv - today_open_iv
+        else:
+            today_open_iv = np.nan
+            today_change = np.nan
+    else:
+        today_open_iv = np.nan
+        today_change = np.nan
+
+    overall, iv_class, reason = environment_assessment(
+        vix_state["state"],
+        today_change,
+        hist_avg_change,
+        hist_std_change,
+    )
+
+    # Top status
+    status_cls = "good" if overall == "FAVOURABLE" else "warn" if overall == "CAUTION" else "bad"
     st.markdown(
-        """
-        <div class="alpha-hero">
-            <div class="alpha-hero-title">SECTOR ANALYSIS</div>
-            <div class="alpha-hero-sub">Sector strength monitor</div>
-        </div>
-        """,
+        f'<div class="jarvis-banner"><span class="{status_cls}">OVERALL ENVIRONMENT: {overall}</span>'
+        f' <span style="color:#93a1b4;font-size:15px;font-weight:500;">— {reason}</span></div>',
         unsafe_allow_html=True,
     )
-    
+
+    # VIX cards
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown(
+        f'<div class="jarvis-card"><div class="metric-label">India VIX</div>'
+        f'<div class="metric-value">{vix_ltp:.2f}' if pd.notna(vix_ltp)
+        else '<div class="jarvis-card"><div class="metric-label">India VIX</div><div class="metric-value">—',
+        unsafe_allow_html=True,
+    )
+    c1.markdown("</div>", unsafe_allow_html=True)
+
+    state_cls = "good" if vix_state["state"] == "ACTIVE SELL" else "bad" if vix_state["state"] == "ACTIVE LONG" else "warn"
+    c2.markdown(
+        f'<div class="jarvis-card"><div class="metric-label">VIX P&F STATE</div>'
+        f'<div class="metric-value {state_cls}" style="font-size:24px">{vix_state["state"]}</div>'
+        f'<div style="color:#8fa0b5">{vix_state["direction"] or "NEUTRAL"} • {vix_tf} • {vix_box:.2f}% • {int(vix_rev)}R</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    c3.markdown(
+        f'<div class="jarvis-card"><div class="metric-label">ATM AVG IV</div>'
+        f'<div class="metric-value">{today_current_iv:.2f}' if pd.notna(today_current_iv)
+        else '<div class="jarvis-card"><div class="metric-label">ATM AVG IV</div><div class="metric-value">—',
+        unsafe_allow_html=True,
+    )
+    c3.markdown("</div>", unsafe_allow_html=True)
+
+    iv_cls = "good" if iv_class == "CONTRACTING" else "bad" if "EXPANDING" in iv_class else "warn"
+    c4.markdown(
+        f'<div class="jarvis-card"><div class="metric-label">IV BEHAVIOUR</div>'
+        f'<div class="metric-value {iv_cls}" style="font-size:24px">{iv_class}</div>'
+        f'<div style="color:#8fa0b5">Today vs 30-session baseline</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # VIX P&F chart
+    st.markdown("#### India VIX • P&F", unsafe_allow_html=True)
+    if vix_hist.empty:
+        st.warning("India VIX historical data is currently unavailable.")
+    elif go is not None:
+        fig = make_pnf_figure(vix_hist, vix_box, int(vix_rev))
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    else:
+        st.info("Plotly is not installed; the VIX state is still calculated.")
+
     st.caption(
-        "Sector market view • Manual refresh only"
+        f"VIX state calculated using: {vix_box:.2f}% box • {int(vix_rev)} box reversal • "
+        f"{vix_tf} timeframe • close only."
     )
 
-    fut = future_universe(master, "NSE")
+    # Current ATM IV details
+    st.markdown("#### Current NIFTY ATM IV", unsafe_allow_html=True)
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Expiry", iv_today.get("expiry", "—").strftime("%d-%b-%Y") if iv_today else "—")
+    d2.metric("ATM Strike", f"{iv_today.get('atm'):.0f}" if iv_today and pd.notna(iv_today.get("atm")) else "—")
+    d3.metric("ATM CE IV", f"{iv_today.get('ce_iv'):.2f}" if iv_today and pd.notna(iv_today.get("ce_iv")) else "—")
+    d4.metric("ATM PE IV", f"{iv_today.get('pe_iv'):.2f}" if iv_today and pd.notna(iv_today.get("pe_iv")) else "—")
 
-    if fut.empty:
-        st.error("No NSE F&O universe available.")
-    else:
-        if st.button(
-            "🔄 Calculate / Refresh Sector Analysis",
-            key="sector_manual_refresh",
-        ):
-            # Only clear the analysis caches. Do not destroy login/session data.
-            try:
-                st.cache_data.clear()
-            except Exception:
-                pass
+    # IV baseline comparison
+    st.markdown("#### Today's IV vs Last 30 Completed Sessions", unsafe_allow_html=True)
 
-            summary, stock_detail = run_sector_analysis_manual(fut)
-            st.session_state.sector_analysis_result = summary
-            st.session_state.sector_stock_detail = stock_detail
+    vals = st.columns(6)
+    vals[0].metric(
+        "Today's Open IV",
+        f"{today_open_iv:.2f}" if pd.notna(today_open_iv) else "—",
+    )
+    vals[1].metric(
+        "Current IV",
+        f"{today_current_iv:.2f}" if pd.notna(today_current_iv) else "—",
+    )
+    vals[2].metric(
+        "Today's IV Change",
+        f"{today_change:+.2f}" if pd.notna(today_change) else "—",
+    )
+    vals[3].metric(
+        "30D Avg Change",
+        f"{hist_avg_change:+.2f}" if pd.notna(hist_avg_change) else "—",
+    )
 
-        result = st.session_state.get(
-            "sector_analysis_result",
-            pd.DataFrame(),
+    z_score = (
+        (today_change - hist_avg_change) / hist_std_change
+        if pd.notna(today_change) and pd.notna(hist_avg_change)
+        and pd.notna(hist_std_change) and hist_std_change > 0
+        else np.nan
+    )
+    deviation = (
+        today_change - hist_avg_change
+        if pd.notna(today_change) and pd.notna(hist_avg_change)
+        else np.nan
+    )
+    ratio = (
+        abs(today_change) / abs(hist_avg_change)
+        if pd.notna(today_change) and pd.notna(hist_avg_change) and abs(hist_avg_change) > 1e-9
+        else np.nan
+    )
+
+    vals[4].metric("Difference vs 30D Avg", f"{deviation:+.2f}" if pd.notna(deviation) else "—")
+    vals[5].metric("Z-Score", f"{z_score:+.2f}" if pd.notna(z_score) else "—")
+
+    # Last 30 session table
+    if not iv_hist.empty:
+        table = iv_hist.copy()
+        table["date"] = pd.to_datetime(table["date"]).dt.strftime("%d-%b-%Y")
+        table["iv_change"] = table["iv_change"].map(lambda x: f"{x:+.2f}")
+        table = table.rename(columns={
+            "date": "Date",
+            "open_iv": "Open IV",
+            "close_iv": "Close IV",
+            "iv_change": "IV Change",
+        })[["Date", "Open IV", "Close IV", "IV Change"]]
+
+        st.dataframe(
+            table.sort_values("Date", ascending=False),
+            use_container_width=True,
+            hide_index=True,
         )
-        stock_detail = st.session_state.get(
-            "sector_stock_detail",
-            pd.DataFrame(),
-        )
 
-        if result.empty:
-            st.info(
-                "Press 'Calculate / Refresh Sector Analysis' to calculate "
-                "sector strength."
-            )
-
-            if not stock_detail.empty:
-                st.warning("Some sector data is currently unavailable. Please refresh.")
-        else:
-            st.subheader("Sector Strength")
-            st.dataframe(
-                result,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            with st.expander("Additional Details"):
-                st.dataframe(
-                    stock_detail.sort_values(
-                        ["Sector", "Bias", "Stock"]
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-
-elif page == "RS Matrix":
     st.markdown(
-        """
-        <div class="alpha-hero">
-            <div class="alpha-hero-title">FUSION MATRIX</div>
-            <div class="alpha-hero-sub">Price + Relative Strength ranking</div>
-            <span class="alpha-badge">MATRIX</span>
+        f"""
+        <div class="jarvis-card">
+          <div class="metric-label">JARVIS CONCLUSION</div>
+          <div style="font-size:24px;font-weight:800;margin:8px 0;" class="{status_cls}">{overall}</div>
+          <div style="color:#c8d2de">{reason}</div>
+          <div style="color:#718197;margin-top:8px;font-size:13px;">
+            This module measures the volatility environment only. It does not generate a CE, PE,
+            straddle or strangle trade by itself.
+          </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    st.caption("Performance + ranking scores • Relative Strength vs NIFTY 50")
-
-    fut = future_universe(master, "NSE")
-
-    if fut.empty:
-        st.error("No NSE F&O universe available.")
-    else:
-        # User-selectable box sizes. Values are percentages.
-        b1, b2, b3, b4 = st.columns(4)
-        with b1:
-            box1 = st.number_input("Box 1 %", min_value=0.05, max_value=20.0, value=3.0, step=0.05, format="%.2f", key="matrix_box1")
-        with b2:
-            box2 = st.number_input("Box 2 %", min_value=0.05, max_value=20.0, value=2.0, step=0.05, format="%.2f", key="matrix_box2")
-        with b3:
-            box3 = st.number_input("Box 3 %", min_value=0.05, max_value=20.0, value=1.0, step=0.05, format="%.2f", key="matrix_box3")
-        with b4:
-            box4 = st.number_input("Box 4 %", min_value=0.05, max_value=20.0, value=0.25, step=0.05, format="%.2f", key="matrix_box4")
-
-        box_values = [box1, box2, box3, box4]
-        if len({round(x, 6) for x in box_values}) != 4:
-            st.warning("Each box size must be different.")
-        else:
-            boxes = [(f"{x:g}%", x / 100.0) for x in box_values]
-
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                if st.button("🔄 Calculate / Refresh Matrix", key="fusion_matrix_refresh"):
-                    st.cache_data.clear()
-                    st.session_state.pf_fusion_matrix_result = run_pf_fusion_matrix_manual(
-                        fut, boxes=boxes
-                    )
-                    st.session_state.pf_fusion_matrix_boxes = boxes
-
-            current = st.session_state.get("pf_fusion_matrix_result", pd.DataFrame())
-
-            # If box configuration changed since last calculation, let the user
-            # see that the matrix needs recalculation.
-            saved_boxes = st.session_state.get("pf_fusion_matrix_boxes")
-            if saved_boxes != boxes and not current.empty:
-                st.warning("Box sizes changed. Click Calculate / Refresh Matrix to rebuild.")
-
-            with c2:
-                sort_col = None
-                if not current.empty:
-                    numeric_cols = [
-                        c for c in current.columns
-                        if c != "Stock" and pd.api.types.is_numeric_dtype(current[c])
-                    ]
-                    if numeric_cols:
-                        sort_col = st.selectbox(
-                            "Rank by",
-                            numeric_cols,
-                            index=numeric_cols.index("Total Performance")
-                            if "Total Performance" in numeric_cols else 0,
-                            key="fusion_matrix_sort_col",
-                        )
-
-            with c3:
-                order = st.selectbox(
-                    "Order",
-                    ["High → Low", "Low → High"],
-                    key="fusion_matrix_order",
-                )
-
-            if current.empty:
-                st.info("Press 'Calculate / Refresh Matrix' to build the Fusion Matrix.")
-            else:
-                display = current.copy()
-
-                core_cols = [
-                    "Stock",
-                    "Price Performance","Price Ranking",
-                    "RS Performance","RS Ranking",
-                    "Total Performance","Total Ranking",
-                    "Net Performance","Net Ranking",
-                    "Price State","RS State",
-                ]
-                core_cols = [c for c in core_cols if c in display.columns]
-
-                if sort_col and sort_col in display.columns:
-                    display = display.sort_values(
-                        sort_col,
-                        ascending=(order == "Low → High"),
-                        kind="stable",
-                    ).reset_index(drop=True)
-
-                # Green: current 0.25% Price P&F has a fresh perfect DTB score (+2).
-                # Red: current 0.25% Price P&F has a fresh perfect DBS score (-2).
-                # Highlight only a perfect TOTAL Performance score:
-                # +16 = 4 box sizes x +2 (perfect bullish)
-                # -16 = 4 box sizes x -2 (perfect bearish)
-                def highlight_matrix_row(row):
-                    try:
-                        total_perf = float(row.get("Total Performance", np.nan))
-                    except Exception:
-                        total_perf = np.nan
-
-                    if total_perf == 16:
-                        return [
-                            "background-color: #d9f2d9; color: #0b5d1e; font-weight: 700"
-                        ] * len(row)
-
-                    if total_perf == -16:
-                        return [
-                            "background-color: #f8d7da; color: #8a1c1c; font-weight: 700"
-                        ] * len(row)
-
-                    return [""] * len(row)
-
-
-                shown = display[core_cols].copy()
-
-                # Highlight only the visible Total Performance score.
-                styled = shown.style.apply(highlight_matrix_row, axis=1)
-
-                # Clear row and column separators.
-                styled = (
-                    styled
-                    .set_properties(**{
-                        "border-bottom": "1px solid #475569",
-                        "border-right": "1px solid #334155",
-                    })
-                    .set_table_styles([
-                        {
-                            "selector": "th",
-                            "props": [
-                                ("border-right", "1px solid #475569"),
-                                ("border-bottom", "2px solid #64748b"),
-                            ],
-                        },
-                    ])
-                )
-
-                st.dataframe(
-                    styled,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                st.caption(
-                    "🟢 Green = perfect +16 Total Performance • "
-                    "🔴 Red = perfect -16 Total Performance"
-                )
-
-
-else:
-    st.title("System Status")
-    st.info("System is running.")
-
-st.caption(f"Last refresh: {local_now().strftime('%d-%b-%Y %H:%M:%S IST')}")
+except Exception as exc:
+    st.error("JARVIS could not complete the latest environment calculation.")
+    st.code(str(exc))
+    st.info("Check the Dhan Client ID / Access Token and refresh. The dashboard does not place orders.")
