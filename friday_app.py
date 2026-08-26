@@ -70,15 +70,29 @@ def parse_data(body):
     return body.get("data", body) if isinstance(body, dict) else {}
 
 
+def _force_ns_timestamp(values):
+    """Convert any timestamp input to one common timezone-naive datetime64[ns] dtype."""
+    s = pd.Series(values)
+    dt = pd.to_datetime(s, errors="coerce", utc=True)
+    dt = dt.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    # Explicitly force nanosecond precision so merge_asof never sees ns vs us/ms mismatch.
+    dt = dt.astype("datetime64[ns]")
+    return dt
+
+
+def _align_merge_timestamp(df, column="timestamp"):
+    """Normalize an existing timestamp column to datetime64[ns] before merge_asof."""
+    out = df.copy()
+    out[column] = _force_ns_timestamp(out[column])
+    return out.dropna(subset=[column]).sort_values(column).reset_index(drop=True)
+
+
 def parse_chart(body):
     d = parse_data(body)
     ts = d.get("timestamp")
     if not ts:
         return pd.DataFrame()
-    dt = pd.to_datetime(
-        pd.to_numeric(pd.Series(ts), errors="coerce"),
-        unit="s", utc=True, errors="coerce"
-    ).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    dt = _force_ns_timestamp(ts)
     out = pd.DataFrame({"timestamp": dt})
     for c in ["open", "high", "low", "close", "volume"]:
         vals = d.get(c)
@@ -115,14 +129,8 @@ def normalize_time(df):
     if c is None:
         raise ValueError("Could not find a timestamp/datetime column.")
     out = df.copy()
-    dt = pd.to_datetime(out[c], errors="coerce")
-    try:
-        if getattr(dt.dt, "tz", None) is not None:
-            dt = dt.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
-    except Exception:
-        pass
-    out["timestamp"] = dt
-    return out.dropna(subset=["timestamp"]).sort_values("timestamp")
+    out["timestamp"] = _force_ns_timestamp(out[c])
+    return out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
 
 def numeric(df, names):
@@ -135,7 +143,7 @@ def normalize_spot(df):
     p = numeric(x, ["close", "ltp", "last_price", "nifty", "spot", "index_close", "price"])
     if x.empty or p is None:
         raise ValueError("Spot data needs a recognizable NIFTY close/price column.")
-    return pd.DataFrame({"timestamp": x.timestamp, "nifty_spot": p}).dropna()
+    return _align_merge_timestamp(pd.DataFrame({"timestamp": x.timestamp, "nifty_spot": p}))
 
 
 def normalize_vix(df):
@@ -143,7 +151,7 @@ def normalize_vix(df):
     p = numeric(x, ["close", "ltp", "last_price", "vix", "vix_close", "price"])
     if x.empty or p is None:
         raise ValueError("VIX data needs a recognizable close/price column.")
-    return pd.DataFrame({"timestamp": x.timestamp, "vix_close": p}).dropna()
+    return _align_merge_timestamp(pd.DataFrame({"timestamp": x.timestamp, "vix_close": p}))
 
 
 def normalize_options(df):
@@ -168,19 +176,22 @@ def normalize_options(df):
     ]:
         v = numeric(x, names)
         r[target] = v if v is not None else np.nan
-    return r.dropna(subset=["timestamp", "strike"])
+    return _align_merge_timestamp(r.dropna(subset=["timestamp", "strike"]))
 
 
 def build_features(options, spot, vix=None):
-    opt = options.sort_values("timestamp")
-    sp = spot.sort_values("timestamp")
+    opt = _align_merge_timestamp(options)
+    sp = _align_merge_timestamp(spot)
+    # Both sides are explicitly datetime64[ns] here; this fixes pandas
+    # "incompatible merge keys" errors caused by ns/us timestamp precision.
     opt = pd.merge_asof(
         opt, sp, on="timestamp", direction="backward",
         tolerance=pd.Timedelta("10min")
     ).dropna(subset=["nifty_spot"])
     if vix is not None and not vix.empty:
         opt = pd.merge_asof(
-            opt.sort_values("timestamp"), vix.sort_values("timestamp"),
+            _align_merge_timestamp(opt),
+            _align_merge_timestamp(vix),
             on="timestamp", direction="backward",
             tolerance=pd.Timedelta("15min")
         )
