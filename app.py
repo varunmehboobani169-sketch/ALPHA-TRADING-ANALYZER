@@ -1023,7 +1023,7 @@ def render_data_vault():
     with b:
         year = st.selectbox("Year", list(range(now_ist().year - 5, now_ist().year + 1)), key="vault_year")
     with c:
-        quarter = st.selectbox("Quarter", [1,2,3,4], index=now_ist().quarter-1, key="vault_quarter")
+        quarter = st.selectbox("Quarter", [1, 2, 3, 4], index=int(pd.Timestamp(now_ist()).quarter) - 1, key="vault_quarter")
 
     if dataset == "NIFTY Futures":
         timeframe_options = [15,1,5,25,60,"Daily"]

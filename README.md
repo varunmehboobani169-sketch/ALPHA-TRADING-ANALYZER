@@ -42,3 +42,9 @@ Each quarter is downloaded automatically in safe historical chunks and can be do
 Dhan's current historical API supports 1/5/15/25/60-minute intraday candles, and intraday history can be requested up to 90 days at a time; the module therefore splits a quarter into multiple requests automatically. citeturn404852search0turn404852search3
 
 This Data Vault is intended to create the exact quarter-wise NIFTY / Futures / VIX files needed for FRIDAY.
+
+
+## V3.1 Fix
+Fixed Data Vault quarter selector crash:
+`AttributeError: ... now_ist().quarter`
+The code now converts the current IST datetime to a pandas Timestamp before reading the quarter number.
