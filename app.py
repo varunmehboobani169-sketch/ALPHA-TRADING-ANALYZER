@@ -125,6 +125,12 @@ def dhan_get(path, token, client_id):
         return json.loads(r.read().decode("utf-8"))
 
 
+def dhan_post(path, payload, token, client_id):
+    req = urllib.request.Request(DHAN_API + path, data=json.dumps(payload).encode("utf-8"), method="POST", headers={"Accept": "application/json", "Content-Type": "application/json", "access-token": token, "client-id": client_id})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
 def dhan_profile(token, client_id):
     if not token:
         return False, "No token entered"
@@ -137,7 +143,7 @@ def dhan_profile(token, client_id):
 
 
 def dhan_nifty_expiries(token, client_id):
-    body = dhan_get("/optionchain/expirylist?Underlyingscrip=13&UnderlyingSeg=IDX_I", token, client_id)
+    body = dhan_post("/optionchain/expirylist", {"UnderlyingScrip": 13, "UnderlyingSeg": "IDX_I"}, token, client_id)
     data = body.get("data", []) if isinstance(body, dict) else []
     dates = pd.to_datetime(pd.Series(data), errors="coerce").dropna().dt.normalize()
     return pd.DatetimeIndex(dates).sort_values().unique()
@@ -158,7 +164,7 @@ def attach_expiry(options, expiry_dates):
     idx = np.searchsorted(exp_ns, ts_day, side="left")
     valid = idx < len(exp_ns)
     inferred = np.full(len(out), np.datetime64("NaT"), dtype="datetime64[ns]")
-    inferred[valid] = exp_ns[np.maximum(idx[valid], 0)].astype("datetime64[ns]")
+    inferred[valid] = exp_ns[idx[valid]].astype("datetime64[ns]")
     out.loc[missing_mask, "expiry"] = pd.to_datetime(inferred[missing_mask.to_numpy()])
     if out.expiry.isna().any():
         raise ValueError(f"Expiry reconstruction failed for {out.expiry.isna().mean()*100:.2f}% of option rows.")
@@ -248,9 +254,7 @@ def forward_values(base, target, source_col, horizon_min, tolerance):
     left = base[["timestamp"]].copy()
     left["target_ts"] = left.timestamp + pd.Timedelta(minutes=horizon_min)
     right = target[["timestamp", source_col]].rename(columns={"timestamp": "future_timestamp", source_col: "future_value"}).sort_values("future_timestamp")
-    left_sorted = left.sort_values("target_ts")
-    joined = pd.merge_asof(left_sorted, right, left_on="target_ts", right_on="future_timestamp", direction="forward", tolerance=tolerance)
-    joined = joined.sort_index()
+    joined = pd.merge_asof(left.sort_values("target_ts"), right, left_on="target_ts", right_on="future_timestamp", direction="forward", tolerance=tolerance)
     return joined["future_value"].reset_index(drop=True)
 
 
@@ -325,13 +329,9 @@ def build_interactions(df, top_features):
 
 def audit_table(options, spot, vix, aligned, pairs, features, missing_before):
     rows = [
-        ("Option rows", len(options), "INFO"),
-        ("Spot rows", len(spot), "INFO"),
-        ("VIX rows", len(vix), "INFO"),
-        ("Option+Spot synced", len(aligned), "INFO"),
-        ("CE rows", int((options.side == "CE").sum()), "INFO"),
-        ("PE rows", int((options.side == "PE").sum()), "INFO"),
-        ("CE/PE pairs", len(pairs), "PASS" if len(pairs) else "FAIL"),
+        ("Option rows", len(options), "INFO"), ("Spot rows", len(spot), "INFO"), ("VIX rows", len(vix), "INFO"),
+        ("Option+Spot synced", len(aligned), "INFO"), ("CE rows", int((options.side == "CE").sum()), "INFO"),
+        ("PE rows", int((options.side == "PE").sum()), "INFO"), ("CE/PE pairs", len(pairs), "PASS" if len(pairs) else "FAIL"),
         ("ATM observations", len(features), "PASS" if len(features) else "FAIL"),
         ("Missing expiry before reconstruction", f"{missing_before*100:.2f}%", "RECONSTRUCTED" if missing_before > 0 else "PASS"),
         ("Option start", str(options.timestamp.min()) if not options.empty else "N/A", "INFO"),
@@ -359,29 +359,13 @@ def md_table(df):
 
 def build_report(q, audit, fruit, interactions, validation, warnings):
     lines = [
-        f"# FRIDAY — DEEP RESEARCH AUDIT — {q}",
-        "",
-        "## Scope",
-        f"Analysis period: **{q}**",
-        "Sources: NIFTY Options + NIFTY Spot + India VIX. Futures excluded.",
-        "",
-        "## Research Clock",
-        "Options: 1-minute event clock. NIFTY Spot: 15-minute state clock. India VIX: 15-minute state clock.",
-        "Spot/VIX state is aligned backward only; future state information is never used.",
-        "",
-        "## Data Integrity / Diagnostics",
-        md_table(audit),
-        "",
-        "## Fruitfulness Discovery",
-        "FRIDAY tests raw and derived numeric variables across multiple threshold regions before interaction research.",
-        md_table(fruit.head(100)),
-        "",
-        "## Interaction Discovery",
-        md_table(interactions.head(100)),
-        "",
-        "## Train/Test Diagnostic",
-        md_table(validation),
-        "",
+        f"# FRIDAY — DEEP RESEARCH AUDIT — {q}", "",
+        "## Scope", f"Analysis period: **{q}**", "Sources: NIFTY Options + NIFTY Spot + India VIX. Futures excluded.", "",
+        "## Research Clock", "Options: 1-minute event clock. NIFTY Spot: 15-minute state clock. India VIX: 15-minute state clock.", "Spot/VIX state is aligned backward only; future state information is never used.", "",
+        "## Data Integrity / Diagnostics", md_table(audit), "",
+        "## Fruitfulness Discovery", "FRIDAY tests raw and derived numeric variables across multiple threshold regions before interaction research.", md_table(fruit.head(100)), "",
+        "## Interaction Discovery", md_table(interactions.head(100)), "",
+        "## Train/Test Diagnostic", md_table(validation), "",
         "## Research Gates / Warnings",
     ]
     lines.extend([f"- {w}" for w in warnings] if warnings else ["- No blocking warnings."])
