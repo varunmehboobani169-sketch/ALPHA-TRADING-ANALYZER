@@ -175,13 +175,13 @@ def align_states(f,spot,vix):
 
 def forward(x, series_ts, series_val, h, tol):
     left=pd.DataFrame({"base":pd.to_datetime(x)}); left["target"]=left.base+pd.Timedelta(minutes=h); right=pd.DataFrame({"future":pd.to_datetime(series_ts),"value":pd.to_numeric(series_val,errors="coerce")}).sort_values("future")
-    j=pd.merge_asof(left.sort_values("target"),right,left_on="target",right_on="future",direction="forward",tolerance=pd.Timedelta(minutes=tol)); return j.value.to_numpy()
+    j=pd.merge_asof(left.sort_values("target"),right,left_on="target",right_on="future",direction="forward",tolerance=pd.Timedelta(minutes=tol)); return np.asarray(j.value, dtype=float)
 
 
 def targets(x,spot):
     x=x.sort_values("timestamp").reset_index(drop=True); ss=spot.rename(columns={"value":"spot"}).sort_values("timestamp"); ats=x[["timestamp","atm_straddle"]].dropna()
     for h in HORIZONS:
-        fs=forward(x.timestamp,ats.timestamp,ats.atm_straddle,h,2); fp=forward(x.timestamp,ss.timestamp,ss.spot,h,16); cs=pd.to_numeric(x.atm_straddle,errors="coerce").to_numpy(); cp=pd.to_numeric(x.spot,errors="coerce").to_numpy()
+        fs=forward(x.timestamp,ats.timestamp,ats.atm_straddle,h,2); fp=forward(x.timestamp,ss.timestamp,ss.spot,h,16); cs=np.asarray(pd.to_numeric(x.atm_straddle,errors="coerce"), dtype=float); cp=np.asarray(pd.to_numeric(x.spot,errors="coerce"), dtype=float)
         x[f"y_straddle_{h}m"]=np.where(np.isfinite(cs)&(cs!=0),fs/cs-1,np.nan); x[f"y_spot_{h}m"]=np.where(np.isfinite(cp)&(cp!=0),fp/cp-1,np.nan); x[f"y_dir_{h}m"]=np.where(np.isfinite(x[f"y_spot_{h}m"]),(x[f"y_spot_{h}m"]>0).astype(int),np.nan)
     return x.replace([np.inf,-np.inf],np.nan)
 
