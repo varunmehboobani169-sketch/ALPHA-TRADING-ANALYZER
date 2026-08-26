@@ -187,7 +187,7 @@ def targets(x,spot):
 
 
 def stats(s):
-    a=pd.to_numeric(s,errors="coerce").to_numpy(float); a=a[np.isfinite(a)]
+    a=np.asarray(pd.to_numeric(s,errors="coerce"), dtype=float); a=a[np.isfinite(a)]
     if not len(a): return {"n":0,"mean":np.nan,"median":np.nan,"trimmed_mean":np.nan,"up_rate":np.nan,"p05":np.nan,"p95":np.nan}
     lo,hi=np.quantile(a,[.05,.95]); return {"n":len(a),"mean":float(a.mean()),"median":float(np.median(a)),"trimmed_mean":float(np.clip(a,lo,hi).mean()),"up_rate":float((a>0).mean()),"p05":float(np.quantile(a,.05)),"p95":float(np.quantile(a,.95))}
 
@@ -201,7 +201,7 @@ def discover(train,target="y_spot_15m"):
     for c in cols:
         s=pd.to_numeric(sample[c],errors="coerce"); ok=s.notna()&y.notna()
         if ok.sum()<200 or s[ok].nunique()<5: continue
-        sv,yv=s[ok].to_numpy(float),y[ok].to_numpy(float); q=np.quantile(sv,[.1,.2,.8,.9]); best=None
+        sv=np.asarray(s[ok], dtype=float); yv=np.asarray(y[ok], dtype=float); q=np.quantile(sv,[.1,.2,.8,.9]); best=None
         for qv,lab,upper in[(q[0],"q10",1),(q[1],"q20",1),(q[2],"q80",0),(q[3],"q90",0)]:
             st=stats(yv[sv<=qv if upper else sv>=qv]); eff=abs(st["trimmed_mean"]-base["trimmed_mean"])
             if st["n"]>=100 and (best is None or eff>best[0]): best=(eff,lab,st)
@@ -209,7 +209,7 @@ def discover(train,target="y_spot_15m"):
     r=pd.DataFrame(rows)
     if r.empty:return r
     top=r.nlargest(min(100,len(r)),"effect")["feature"].tolist(); mi_df=sample[top].replace([np.inf,-np.inf],np.nan).fillna(sample[top].median(numeric_only=True)); good=y.notna()
-    try: mi=mutual_info_regression(mi_df.loc[good].to_numpy(float),y.loc[good].to_numpy(float),random_state=42) if good.sum()>=300 else np.zeros(len(top))
+    try: mi=mutual_info_regression(np.asarray(mi_df.loc[good], dtype=float),y.loc[good].to_numpy(float),random_state=42) if good.sum()>=300 else np.zeros(len(top))
     except Exception: mi=np.zeros(len(top))
     r["mutual_information"]=r.feature.map(dict(zip(top,mi))).fillna(0.0); r["discovery_score"]=r.mutual_information*(1+100*r.effect)*np.sqrt(r.n); return r.sort_values(["discovery_score","effect","n"],ascending=False).reset_index(drop=True)
 
