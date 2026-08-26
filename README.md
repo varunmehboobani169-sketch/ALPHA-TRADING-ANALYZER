@@ -26,3 +26,7 @@ Each selected quarter produces:
 - combined ZIP package
 
 The current design is the foundation for later adversarial validation, research memory and the AI research-analyst layer.
+
+## Maintenance
+- ndarray conversions are normalized through NumPy arrays before statistical/ML operations.
+- GitHub Actions performs a Python syntax check and scans for unsafe ndarray `.to_numpy()` patterns on every main-branch push.
