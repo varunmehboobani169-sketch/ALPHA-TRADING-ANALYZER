@@ -13,6 +13,7 @@ API = "https://api.dhan.co/v2"
 LOCAL_TZ = ZoneInfo("Asia/Kolkata")
 NIFTY_ID = 13
 VIX_ID_FALLBACK = 26
+DEFAULT_CLIENT_ID = "1113195747"
 RATE_LIMIT_SECONDS = 3.2
 
 
@@ -22,16 +23,21 @@ def now_ist():
 
 def init_state():
     defaults = {
-        "client_id": "", "access_token": "", "last_api_call": 0.0,
-        "analysis": None, "analysis_summary": {}
+        "client_id": DEFAULT_CLIENT_ID,
+        "access_token": "",
+        "last_api_call": 0.0,
+        "analysis": None,
+        "analysis_summary": {},
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
+    if not st.session_state.get("client_id"):
+        st.session_state.client_id = DEFAULT_CLIENT_ID
 
 
 def headers():
     if not st.session_state.client_id or not st.session_state.access_token:
-        raise RuntimeError("Enter Dhan Client ID and Access Token.")
+        raise RuntimeError("Enter the Dhan Access Token.")
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -70,20 +76,16 @@ def parse_data(body):
     return body.get("data", body) if isinstance(body, dict) else {}
 
 
-def _force_ns_timestamp(values):
-    """Convert any timestamp input to one common timezone-naive datetime64[ns] dtype."""
+def force_ns_timestamp(values):
     s = pd.Series(values)
     dt = pd.to_datetime(s, errors="coerce", utc=True)
     dt = dt.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
-    # Explicitly force nanosecond precision so merge_asof never sees ns vs us/ms mismatch.
-    dt = dt.astype("datetime64[ns]")
-    return dt
+    return dt.astype("datetime64[ns]")
 
 
-def _align_merge_timestamp(df, column="timestamp"):
-    """Normalize an existing timestamp column to datetime64[ns] before merge_asof."""
+def align_timestamp(df, column="timestamp"):
     out = df.copy()
-    out[column] = _force_ns_timestamp(out[column])
+    out[column] = force_ns_timestamp(out[column])
     return out.dropna(subset=[column]).sort_values(column).reset_index(drop=True)
 
 
@@ -92,7 +94,7 @@ def parse_chart(body):
     ts = d.get("timestamp")
     if not ts:
         return pd.DataFrame()
-    dt = _force_ns_timestamp(ts)
+    dt = force_ns_timestamp(ts)
     out = pd.DataFrame({"timestamp": dt})
     for c in ["open", "high", "low", "close", "volume"]:
         vals = d.get(c)
@@ -101,7 +103,7 @@ def parse_chart(body):
     return out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
 
-def _find_col(df, names):
+def find_col(df, names):
     lookup = {str(c).strip().lower().replace(" ", "_"): c for c in df.columns}
     for name in names:
         key = name.lower().replace(" ", "_")
@@ -125,16 +127,16 @@ def read_csvs(files):
 def normalize_time(df):
     if df.empty:
         return df
-    c = _find_col(df, ["timestamp", "datetime", "date_time", "time", "date"])
+    c = find_col(df, ["timestamp", "datetime", "date_time", "time", "date"])
     if c is None:
         raise ValueError("Could not find a timestamp/datetime column.")
     out = df.copy()
-    out["timestamp"] = _force_ns_timestamp(out[c])
+    out["timestamp"] = force_ns_timestamp(out[c])
     return out.dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
 
 def numeric(df, names):
-    c = _find_col(df, names)
+    c = find_col(df, names)
     return pd.to_numeric(df[c], errors="coerce") if c else None
 
 
@@ -143,7 +145,7 @@ def normalize_spot(df):
     p = numeric(x, ["close", "ltp", "last_price", "nifty", "spot", "index_close", "price"])
     if x.empty or p is None:
         raise ValueError("Spot data needs a recognizable NIFTY close/price column.")
-    return _align_merge_timestamp(pd.DataFrame({"timestamp": x.timestamp, "nifty_spot": p}))
+    return align_timestamp(pd.DataFrame({"timestamp": x.timestamp, "nifty_spot": p}))
 
 
 def normalize_vix(df):
@@ -151,20 +153,20 @@ def normalize_vix(df):
     p = numeric(x, ["close", "ltp", "last_price", "vix", "vix_close", "price"])
     if x.empty or p is None:
         raise ValueError("VIX data needs a recognizable close/price column.")
-    return _align_merge_timestamp(pd.DataFrame({"timestamp": x.timestamp, "vix_close": p}))
+    return align_timestamp(pd.DataFrame({"timestamp": x.timestamp, "vix_close": p}))
 
 
 def normalize_options(df):
     x = normalize_time(df)
-    strike = _find_col(x, ["strike", "strike_price", "strikeprice"])
-    side = _find_col(x, ["side", "option_type", "type", "cp", "ce_pe"])
-    expiry = _find_col(x, ["expiry", "expiry_date", "expirydate", "exp_date"])
+    strike = find_col(x, ["strike", "strike_price", "strikeprice"])
+    side = find_col(x, ["side", "option_type", "type", "cp", "ce_pe"])
+    expiry = find_col(x, ["expiry", "expiry_date", "expirydate", "exp_date"])
     if x.empty or strike is None or side is None:
         raise ValueError("Options need timestamp, strike and CE/PE option type columns.")
     r = pd.DataFrame({
         "timestamp": x.timestamp,
         "strike": pd.to_numeric(x[strike], errors="coerce"),
-        "side": x[side].astype(str).str.upper().str.strip()
+        "side": x[side].astype(str).str.upper().str.strip(),
     })
     r["side"] = r.side.replace({"C": "CE", "CALL": "CE", "P": "PE", "PUT": "PE"})
     r["expiry"] = pd.to_datetime(x[expiry], errors="coerce").dt.date if expiry else pd.NaT
@@ -176,25 +178,30 @@ def normalize_options(df):
     ]:
         v = numeric(x, names)
         r[target] = v if v is not None else np.nan
-    return _align_merge_timestamp(r.dropna(subset=["timestamp", "strike"]))
+    return align_timestamp(r.dropna(subset=["timestamp", "strike"]))
 
 
 def build_features(options, spot, vix=None):
-    opt = _align_merge_timestamp(options)
-    sp = _align_merge_timestamp(spot)
-    # Both sides are explicitly datetime64[ns] here; this fixes pandas
-    # "incompatible merge keys" errors caused by ns/us timestamp precision.
+    opt = align_timestamp(options)
+    sp = align_timestamp(spot)
+
     opt = pd.merge_asof(
-        opt, sp, on="timestamp", direction="backward",
-        tolerance=pd.Timedelta("10min")
+        opt.sort_values("timestamp"),
+        sp.sort_values("timestamp"),
+        on="timestamp",
+        direction="backward",
+        tolerance=pd.Timedelta("10min"),
     ).dropna(subset=["nifty_spot"])
+
     if vix is not None and not vix.empty:
         opt = pd.merge_asof(
-            _align_merge_timestamp(opt),
-            _align_merge_timestamp(vix),
-            on="timestamp", direction="backward",
-            tolerance=pd.Timedelta("15min")
+            align_timestamp(opt),
+            align_timestamp(vix),
+            on="timestamp",
+            direction="backward",
+            tolerance=pd.Timedelta("15min"),
         )
+
     rows = []
     for ts, g in opt.groupby("timestamp", sort=True):
         valid_exp = [e for e in g.expiry.dropna().unique() if e >= ts.date()]
@@ -212,23 +219,34 @@ def build_features(options, spot, vix=None):
         if ce.empty or pe.empty:
             continue
         ce, pe = ce.iloc[-1], pe.iloc[-1]
+
         call_oi = g.loc[g.side == "CE", "oi"].sum(min_count=1)
         put_oi = g.loc[g.side == "PE", "oi"].sum(min_count=1)
         pcr = put_oi / call_oi if pd.notna(call_oi) and call_oi != 0 else np.nan
+
         rows.append({
-            "timestamp": ts, "nifty_spot": spot_px, "atm_strike": float(atm),
-            "ce_close": ce.close, "pe_close": pe.close,
-            "ce_iv": ce.iv, "pe_iv": pe.iv,
-            "ce_oi": ce.oi, "pe_oi": pe.oi,
-            "ce_volume": ce.volume, "pe_volume": pe.volume,
+            "timestamp": ts,
+            "nifty_spot": spot_px,
+            "atm_strike": float(atm),
+            "ce_close": ce.close,
+            "pe_close": pe.close,
+            "ce_iv": ce.iv,
+            "pe_iv": pe.iv,
+            "ce_oi": ce.oi,
+            "pe_oi": pe.oi,
+            "ce_volume": ce.volume,
+            "pe_volume": pe.volume,
             "pcr_oi": pcr,
             "straddle": ce.close + pe.close if pd.notna(ce.close) and pd.notna(pe.close) else np.nan,
             "atm_iv": np.nanmean([ce.iv, pe.iv]),
             "vix_close": g.vix_close.iloc[-1] if "vix_close" in g else np.nan,
         })
-    f = pd.DataFrame(rows).sort_values("timestamp") if rows else pd.DataFrame()
+
+    f = pd.DataFrame(rows)
     if f.empty:
         return f
+    f = align_timestamp(f)
+
     f["spot_ret_1"] = f.nifty_spot.pct_change()
     f["spot_ret_4"] = f.nifty_spot.pct_change(4)
     f["spot_ret_16"] = f.nifty_spot.pct_change(16)
@@ -242,6 +260,7 @@ def build_features(options, spot, vix=None):
     f["vix_change"] = f.vix_close.diff()
     f["vix_ret"] = f.vix_close.pct_change()
     f["pcr_change"] = f.pcr_oi.diff()
+
     f["forward_spot_4"] = f.nifty_spot.shift(-4) / f.nifty_spot - 1
     f["forward_spot_16"] = f.nifty_spot.shift(-16) / f.nifty_spot - 1
     f["forward_straddle_4"] = f.straddle.shift(-4) / f.straddle - 1
@@ -252,7 +271,8 @@ def build_features(options, spot, vix=None):
 def discover_patterns(f):
     x = f.copy()
     if x.empty:
-        return pd.DataFrame(), x
+        return pd.DataFrame()
+
     rules = [
         ("IV rising + spot flat", (x.iv_change > 0) & (x.spot_ret_4.abs() < 0.001)),
         ("IV falling + spot flat", (x.iv_change < 0) & (x.spot_ret_4.abs() < 0.001)),
@@ -265,13 +285,15 @@ def discover_patterns(f):
         ("Spot uptrend", x.spot_trend > 0),
         ("Spot downtrend", x.spot_trend < 0),
     ]
+
     rows = []
     for name, mask in rules:
-        d = x.loc[mask].copy()
+        d = x.loc[mask].dropna(subset=["forward_spot_4", "forward_straddle_4"])
         if len(d) < 10:
             continue
         rows.append({
-            "pattern": name, "observations": len(d),
+            "pattern": name,
+            "observations": len(d),
             "avg_next_4_spot_pct": d.forward_spot_4.mean(),
             "avg_next_16_spot_pct": d.forward_spot_16.mean(),
             "avg_next_4_straddle_pct": d.forward_straddle_4.mean(),
@@ -279,11 +301,10 @@ def discover_patterns(f):
             "next_4_spot_up_rate": (d.forward_spot_4 > 0).mean(),
             "next_4_straddle_up_rate": (d.forward_straddle_4 > 0).mean(),
         })
-    summary = pd.DataFrame(rows).sort_values("observations", ascending=False) if rows else pd.DataFrame()
-    return summary, x
+    return pd.DataFrame(rows).sort_values("observations", ascending=False) if rows else pd.DataFrame()
 
 
-def _resolve_vix_id():
+def resolve_vix_id():
     try:
         master = pd.read_csv(
             "https://images.dhan.co/api-data/api-scrip-master-detailed.csv",
@@ -308,45 +329,57 @@ def _resolve_vix_id():
 
 
 def download_index_quarter(dataset, year, quarter, timeframe):
-    sid = NIFTY_ID if dataset == "NIFTY Spot" else _resolve_vix_id()
+    sid = NIFTY_ID if dataset == "NIFTY Spot" else resolve_vix_id()
     q = pd.Period(f"{year}-Q{quarter}")
     start, end = pd.Timestamp(q.start_time), pd.Timestamp(q.end_time)
+
     if timeframe == "Daily":
         body = api_post(
             "/charts/historical",
             {
-                "securityId": str(sid), "exchangeSegment": "IDX_I",
-                "instrument": "INDEX", "expiryCode": 0, "oi": False,
+                "securityId": str(sid),
+                "exchangeSegment": "IDX_I",
+                "instrument": "INDEX",
+                "expiryCode": 0,
+                "oi": False,
                 "fromDate": start.strftime("%Y-%m-%d"),
-                "toDate": end.strftime("%Y-%m-%d")
+                "toDate": end.strftime("%Y-%m-%d"),
             },
-            f"{dataset} {year} Q{quarter}"
+            f"{dataset} {year} Q{quarter}",
         )
         return parse_chart(body)
+
     interval = {"1-minute": 1, "5-minute": 5, "15-minute": 15, "25-minute": 25, "60-minute": 60}[timeframe]
-    parts, cur = [], start
+    parts = []
+    cur = start
     while cur <= end:
         ce = min(cur + pd.Timedelta(days=89), end)
         body = api_post(
             "/charts/intraday",
             {
-                "securityId": str(sid), "exchangeSegment": "IDX_I",
-                "instrument": "INDEX", "interval": interval, "oi": False,
+                "securityId": str(sid),
+                "exchangeSegment": "IDX_I",
+                "instrument": "INDEX",
+                "interval": interval,
+                "oi": False,
                 "fromDate": cur.strftime("%Y-%m-%d %H:%M:%S"),
-                "toDate": ce.strftime("%Y-%m-%d %H:%M:%S")
+                "toDate": ce.strftime("%Y-%m-%d %H:%M:%S"),
             },
-            f"{dataset} {year} Q{quarter}"
+            f"{dataset} {year} Q{quarter}",
         )
         part = parse_chart(body)
         if not part.empty:
             parts.append(part)
         cur = ce + pd.Timedelta(seconds=1)
-    return pd.concat(parts, ignore_index=True).drop_duplicates("timestamp").sort_values("timestamp") if parts else pd.DataFrame()
+    if not parts:
+        return pd.DataFrame()
+    return align_timestamp(pd.concat(parts, ignore_index=True).drop_duplicates("timestamp"))
 
 
 def render_vault():
     st.markdown("## DATA VAULT")
-    st.caption("NIFTY Spot and India VIX only. Futures are intentionally out of scope for this build.")
+    st.caption("NIFTY Spot and India VIX only. Futures are intentionally out of scope.")
+
     years = list(range(2020, now_ist().year + 1))
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -355,7 +388,13 @@ def render_vault():
         year = st.selectbox("Year", years, index=years.index(2024) if 2024 in years else len(years) - 1)
     with c3:
         quarter = st.selectbox("Quarter", [1, 2, 3, 4], index=0)
-    timeframe = st.selectbox("Timeframe", ["15-minute", "1-minute", "5-minute", "25-minute", "60-minute", "Daily"], index=0)
+
+    timeframe = st.selectbox(
+        "Timeframe",
+        ["15-minute", "1-minute", "5-minute", "25-minute", "60-minute", "Daily"],
+        index=0,
+    )
+
     if st.button("DOWNLOAD QUARTER", use_container_width=True):
         try:
             df = download_index_quarter(dataset, year, quarter, timeframe)
@@ -364,9 +403,11 @@ def render_vault():
             else:
                 st.success(f"Downloaded {len(df):,} rows.")
                 st.download_button(
-                    "DOWNLOAD CSV", df.to_csv(index=False).encode(),
+                    "DOWNLOAD CSV",
+                    df.to_csv(index=False).encode(),
                     f"FRIDAY_{dataset.replace(' ', '_')}_{year}_Q{quarter}_{timeframe}.csv",
-                    "text/csv", use_container_width=True
+                    "text/csv",
+                    use_container_width=True,
                 )
                 st.dataframe(df.head(300), use_container_width=True, hide_index=True)
         except Exception as e:
@@ -376,36 +417,57 @@ def render_vault():
 def render_ai():
     st.markdown("## FRIDAY — OPTION PATTERN RESEARCH")
     st.write("FRIDAY uses Options + NIFTY Spot + India VIX to discover repeatable relationships. Futures are not part of the design.")
+
     opt = st.file_uploader("Option Data (CSV)", type=["csv"], accept_multiple_files=True)
     spot = st.file_uploader("NIFTY Spot Data (CSV)", type=["csv"], accept_multiple_files=True)
     vix = st.file_uploader("India VIX Data (CSV)", type=["csv"], accept_multiple_files=True)
+
     if not (opt and spot):
         st.info("Upload the Q1 Option + Spot data. Upload Q1 India VIX as well for the full context analysis.")
         return
+
     if st.button("ANALYZE PATTERNS", use_container_width=True):
         try:
             options = normalize_options(read_csvs(opt))
             spot_df = normalize_spot(read_csvs(spot))
             vix_df = normalize_vix(read_csvs(vix)) if vix else pd.DataFrame()
+
             features = build_features(options, spot_df, vix_df)
             if features.empty:
                 raise ValueError("No synchronized ATM option/spot observations were created.")
-            patterns, enriched = discover_patterns(features)
-            st.session_state.analysis = enriched
-            st.session_state.analysis_summary = {"rows": len(enriched)}
-            st.success(f"Analyzed {len(enriched):,} synchronized timestamps.")
+
+            patterns = discover_patterns(features)
+            st.session_state.analysis = features
+            st.session_state.analysis_summary = {
+                "rows": len(features),
+                "start": str(features.timestamp.min()),
+                "end": str(features.timestamp.max()),
+            }
+
+            st.success(
+                f"Analyzed {len(features):,} synchronized timestamps "
+                f"({features.timestamp.min()} → {features.timestamp.max()})."
+            )
+
             if not patterns.empty:
                 st.subheader("Pattern Summary")
                 st.dataframe(patterns, use_container_width=True, hide_index=True)
+            else:
+                st.warning("No pattern had at least 10 usable observations in this dataset.")
+
             st.subheader("Feature Data")
-            st.dataframe(enriched.tail(500), use_container_width=True, hide_index=True)
+            st.dataframe(features.tail(500), use_container_width=True, hide_index=True)
+
             b = io.BytesIO()
             with zipfile.ZipFile(b, "w", zipfile.ZIP_DEFLATED) as z:
-                z.writestr("FRIDAY_features.csv", enriched.to_csv(index=False))
+                z.writestr("FRIDAY_features.csv", features.to_csv(index=False))
                 z.writestr("FRIDAY_pattern_summary.csv", patterns.to_csv(index=False))
             st.download_button(
-                "DOWNLOAD ANALYSIS ZIP", b.getvalue(),
-                "FRIDAY_Q1_PATTERN_ANALYSIS.zip", "application/zip", use_container_width=True
+                "DOWNLOAD ANALYSIS ZIP",
+                b.getvalue(),
+                "FRIDAY_Q1_PATTERN_ANALYSIS.zip",
+                "application/zip",
+                use_container_width=True,
             )
         except Exception as e:
             st.error(str(e))
@@ -415,17 +477,26 @@ def inject_css():
     st.markdown(
         "<style>.stApp{background:linear-gradient(180deg,#05080d,#080d15)} "
         ".block-container{max-width:1500px;padding-top:1rem}</style>",
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
 
 init_state()
 inject_css()
+
 with st.sidebar:
     st.title("FRIDAY")
     st.caption("Option Pattern Research Engine")
-    st.session_state.client_id = st.text_input("Dhan Client ID", st.session_state.client_id).strip()
-    st.session_state.access_token = st.text_input("Dhan Access Token", st.session_state.access_token, type="password").strip()
+    st.session_state.client_id = st.text_input(
+        "Dhan Client ID",
+        value=st.session_state.client_id or DEFAULT_CLIENT_ID,
+    ).strip()
+    st.session_state.access_token = st.text_input(
+        "Dhan Access Token",
+        value=st.session_state.access_token,
+        type="password",
+    ).strip()
+    st.caption(f"Client ID: {st.session_state.client_id or DEFAULT_CLIENT_ID}")
 
 view = st.radio("MODULE", ["AI Strategist", "Data Vault"], horizontal=True)
 if view == "Data Vault":
