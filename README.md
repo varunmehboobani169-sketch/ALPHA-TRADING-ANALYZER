@@ -1,50 +1,28 @@
-# FRIDAY V3 — AI Strategist + Data Vault
+# FRIDAY — Autonomous Market Research Engine
 
-FRIDAY now has two modules.
+FRIDAY is rebuilt from scratch around the agreed research specification.
 
-## AI Strategist
+## Research inputs
+- NIFTY Options: 1-minute rolling expired-option surface, ATM-10 to ATM+10, CE/PE, OHLC, IV, OI, volume and option-source spot.
+- NIFTY Spot: 15-minute OHLC/close.
+- India VIX: 15-minute OHLC/close.
 
-Upload multiple year-wise files in four groups:
-- NIFTY Options — 1-minute
-- NIFTY Futures — 15-minute OHLC
-- NIFTY Spot — 15-minute OHLC
-- India VIX
+## Research pipeline
+Raw audit → full option-surface feature factory → fruitfulness discovery → adaptive interactions → machine learning → holdout validation → downloadable research package.
 
-After preparation, FRIDAY automatically creates quarter-wise downloadable reports.
+The discovery stage uses only the chronological discovery segment. Validation and final-test segments stay untouched until after candidate selection, reducing look-ahead and selection leakage.
 
-Each quarter includes:
-- quarterly_summary.csv
-- daily_analysis.csv
-- decision_features.csv
+The system preserves Dhan rolling-option `expiry_flag` and `expiry_code` metadata. The supplied rolling sample does not contain an historical expiry-date field, so FRIDAY does not invent one.
 
-You can download:
-- selected quarterly reports
-- all quarterly reports
-- a later Master 3-Year Review
+## Outputs
+Each selected quarter produces:
+- REPORT.md
+- audit.csv
+- features.csv
+- discovery.csv
+- interactions.csv
+- validation.csv
+- ml.csv
+- combined ZIP package
 
-You can also upload previously downloaded quarterly ZIPs back into FRIDAY for the master review.
-
-## Data Vault
-
-Separate quarter-wise data downloader for:
-- NIFTY Spot
-- NIFTY Futures
-- India VIX
-
-Select:
-- year
-- quarter
-- timeframe
-- OI for futures where supported
-
-Each quarter is downloaded automatically in safe historical chunks and can be downloaded as a CSV. Accumulated quarters can also be downloaded as a ZIP.
-
-Dhan's current historical API supports 1/5/15/25/60-minute intraday candles, and intraday history can be requested up to 90 days at a time; the module therefore splits a quarter into multiple requests automatically. citeturn404852search0turn404852search3
-
-This Data Vault is intended to create the exact quarter-wise NIFTY / Futures / VIX files needed for FRIDAY.
-
-
-## V3.1 Fix
-Fixed Data Vault quarter selector crash:
-`AttributeError: ... now_ist().quarter`
-The code now converts the current IST datetime to a pandas Timestamp before reading the quarter number.
+The current design is the foundation for later adversarial validation, research memory and the AI research-analyst layer.
