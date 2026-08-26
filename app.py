@@ -1,5 +1,6 @@
 import io
 import json
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -45,23 +46,32 @@ def parse_datetime(values):
     return dt.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None).astype("datetime64[ns]")
 
 
-def dhan_call(path, payload, token, client_id):
+def dhan_call(path, payload, token, client_id, max_retries=5):
     if not token:
         raise ValueError("Enter your Dhan Access Token in the sidebar first.")
-    req = urllib.request.Request(
-        DHAN_API + path,
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={"Accept":"application/json","Content-Type":"application/json","access-token":token,"client-id":client_id},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Dhan HTTP {e.code}: {detail[:1200]}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Dhan connection error: {e}") from e
+    last_error = None
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(
+            DHAN_API + path,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Accept":"application/json","Content-Type":"application/json","access-token":token,"client-id":client_id},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            last_error = RuntimeError(f"Dhan HTTP {e.code}: {detail[:1200]}")
+            if e.code not in (429,500,502,503,504) or attempt >= max_retries:
+                raise last_error from e
+        except urllib.error.URLError as e:
+            last_error = RuntimeError(f"Dhan connection error: {e}")
+            if attempt >= max_retries:
+                raise last_error from e
+        if attempt < max_retries:
+            time.sleep(min(2 ** attempt, 12))
+    raise last_error or RuntimeError("Dhan request failed")
 
 
 def dhan_profile(token, client_id):
@@ -78,13 +88,10 @@ def dhan_profile(token, client_id):
 
 
 def series_from_response(body, source_key=None):
-    if not isinstance(body, dict):
-        return pd.DataFrame()
+    if not isinstance(body, dict): return pd.DataFrame()
     data = body.get("data", body)
-    if source_key and isinstance(data, dict) and isinstance(data.get(source_key), dict):
-        data = data[source_key]
-    if not isinstance(data, dict) or not data.get("timestamp"):
-        return pd.DataFrame()
+    if source_key and isinstance(data, dict) and isinstance(data.get(source_key), dict): data = data[source_key]
+    if not isinstance(data, dict) or not data.get("timestamp"): return pd.DataFrame()
     n = len(data["timestamp"])
     cols = {k: data.get(k, [None] * n) for k in ["timestamp","open","high","low","close","iv","volume","oi","strike","spot"]}
     out = pd.DataFrame({k:(v if isinstance(v, list) else [None] * n) for k,v in cols.items()})
@@ -103,7 +110,7 @@ def rolling_option_part(body, offset, option_type):
     return df
 
 
-def month_chunks(start_date, end_date, max_days=30):
+def month_chunks(start_date, end_date, max_days=10):
     chunks=[]
     cur=start_date
     while cur<=end_date:
@@ -117,34 +124,26 @@ def option_quarter_download(q_label, start_date, end_date, token, client_id, pro
     offsets=list(range(-10,11))
     jobs=[(offset,opt) for offset in offsets for opt in ("CALL","PUT")]
     chunks=[]
-    windows=month_chunks(start_date,end_date,30)
+    windows=month_chunks(start_date,end_date,10)
     total=len(windows)*len(jobs)
     done=0
     for cur,ce in windows:
         for offset,opt in jobs:
             strike = "ATM" if offset==0 else f"ATM+{offset}" if offset>0 else f"ATM{offset}"
             payload={
-                "exchangeSegment":"NSE_FNO",
-                "interval":"1",
-                "securityId":13,
-                "instrument":"OPTIDX",
-                "expiryFlag":"WEEK",
-                "expiryCode":1,
-                "strike":strike,
-                "drvOptionType":opt,
+                "exchangeSegment":"NSE_FNO","interval":"1","securityId":13,"instrument":"OPTIDX",
+                "expiryFlag":"WEEK","expiryCode":0,"strike":strike,"drvOptionType":opt,
                 "requiredData":["open","high","low","close","iv","volume","strike","oi","spot"],
-                "fromDate":cur.strftime("%Y-%m-%d"),
-                "toDate":(ce+timedelta(days=1)).strftime("%Y-%m-%d"),
+                "fromDate":cur.strftime("%Y-%m-%d"),"toDate":(ce+timedelta(days=1)).strftime("%Y-%m-%d"),
             }
-            body=dhan_call("/charts/rollingoption",payload,token,client_id)
+            body=dhan_call("/charts/rollingoption",payload,token,client_id,max_retries=5)
             part=rolling_option_part(body,offset,opt)
             if not part.empty:
                 part["quarter"]=q_label
                 chunks.append(part)
             done+=1
             if progress_cb: progress_cb(done/max(1,total))
-    if not chunks:
-        raise ValueError(f"Dhan returned no weekly ATM±10 option candles for {q_label}.")
+    if not chunks: raise ValueError(f"Dhan returned no weekly ATM±10 option candles for {q_label}.")
     out=pd.concat(chunks,ignore_index=True)
     out=out.drop_duplicates(subset=["timestamp","option_type","strike_offset","strike"]).sort_values(["timestamp","option_type","strike_offset"])
     return out.reset_index(drop=True)
@@ -173,53 +172,36 @@ def render_data_vault(token,client_id):
     st.caption("2025 + 2026 historical research collector. 2024 data already owned separately. NIFTY + India VIX + NIFTY weekly options ATM-10 to ATM+10.")
     dataset=st.selectbox("Dataset",["NIFTY Spot","India VIX","NIFTY Weekly Options ATM±10"])
     if dataset=="NIFTY Weekly Options ATM±10":
-        st.info("1-minute weekly expired-option data. 21 strike levels × CE/PE. OI + IV + volume + spot are requested. Each quarter is split into 30-day Dhan requests.")
+        st.info("1-minute weekly expired-option data. 21 strike levels × CE/PE. OI + IV + volume + spot are requested. Requests are deliberately smaller (10 days) and automatically retried on transient Dhan 429/5xx errors to avoid gateway timeouts.")
     else:
         timeframe=st.selectbox("Timeframe",["1-minute","5-minute","15-minute","25-minute","60-minute","Daily"],index=0)
         st.info("Historical OHLC download. OI is disabled for Spot/VIX.")
-
     period=st.selectbox("Research Period",["Q1 2025","Q2 2025","Q3 2025","Q4 2025","FULL 2025","Q1 2026","Q2 2026","Q3 2026","2026 YTD","FULL 2026 AVAILABLE","Custom"])
     custom_start=st.date_input("Custom start",value=date(2025,1,1),min_value=date(2025,1,1),max_value=date(2026,8,26))
     custom_end=st.date_input("Custom end",value=date(2025,3,31),min_value=date(2025,1,1),max_value=date(2026,8,26))
-    ranges={
-        **QUARTERS,
-        "FULL 2025":(date(2025,1,1),date(2025,12,31)),
-        "2026 YTD":(date(2026,1,1),date(2026,8,26)),
-        "FULL 2026 AVAILABLE":(date(2026,1,1),date(2026,8,26)),
-        "Custom":(custom_start,custom_end),
-    }
+    ranges={**QUARTERS,"FULL 2025":(date(2025,1,1),date(2025,12,31)),"2026 YTD":(date(2026,1,1),date(2026,8,26)),"FULL 2026 AVAILABLE":(date(2026,1,1),date(2026,8,26)),"Custom":(custom_start,custom_end)}
     start_sel,end_sel=ranges[period]
     st.caption(f"Selected period: {start_sel} → {end_sel}")
-
     if st.button("DOWNLOAD QUARTER DATA",use_container_width=True):
         if not token:
-            st.error("Enter your Dhan Access Token first.")
-            return
+            st.error("Enter your Dhan Access Token first."); return
         bar=st.progress(0,text="FRIDAY Data Vault: 0%"); status=st.empty()
         try:
-            if period.startswith("FULL 2025"):
-                ranges_to_get=list(QUARTERS.items())[4:8]
-            elif period in ("2026 YTD","FULL 2026 AVAILABLE"):
-                ranges_to_get=list(QUARTERS.items())[8:11]
-            elif period=="Custom":
-                ranges_to_get=[("Custom",(custom_start,custom_end))]
-            else:
-                ranges_to_get=[(period,ranges[period])]
-
+            if period=="FULL 2025": ranges_to_get=list(QUARTERS.items())[4:8]
+            elif period in ("2026 YTD","FULL 2026 AVAILABLE"): ranges_to_get=list(QUARTERS.items())[8:11]
+            elif period=="Custom": ranges_to_get=[("Custom",(custom_start,custom_end))]
+            else: ranges_to_get=[(period,ranges[period])]
             parts=[]
             for qi,(label,(qs,qe)) in enumerate(ranges_to_get):
                 status.info(f"Period {qi+1}/{len(ranges_to_get)} — {label}")
                 if dataset=="NIFTY Weekly Options ATM±10":
                     part=option_quarter_download(label,qs,qe,token,client_id,lambda p: None)
                 else:
-                    part=download_spot_or_vix("NIFTY" if dataset=="NIFTY Spot" else "INDIA VIX",qs,qe,timeframe,token,client_id)
-                    part["period"]=label
+                    part=download_spot_or_vix("NIFTY" if dataset=="NIFTY Spot" else "INDIA VIX",qs,qe,timeframe,token,client_id); part["period"]=label
                 parts.append(part)
                 bar.progress(int((qi+1)/len(ranges_to_get)*100),text=f"FRIDAY Data Vault: {int((qi+1)/len(ranges_to_get)*100)}% — {label} complete")
-
             if len(parts)==1:
-                out_df=parts[0]
-                safe=period.replace(" ","_").replace("±","PLUS_MINUS")
+                out_df=parts[0]; safe=period.replace(" ","_").replace("±","PLUS_MINUS")
                 st.dataframe(out_df.head(500),use_container_width=True,hide_index=True)
                 st.success(f"Ready: {len(out_df):,} rows")
                 st.download_button("DOWNLOAD CSV",out_df.to_csv(index=False).encode(),f"FRIDAY_{safe}_{dataset.replace(' ','_').replace('±','PLUS_MINUS')}.csv","text/csv",use_container_width=True)
@@ -229,7 +211,7 @@ def render_data_vault(token,client_id):
                     for label,part in zip([x[0] for x in ranges_to_get],parts):
                         safe=label.replace(" ","_")
                         z.writestr(f"{safe}_{dataset.replace(' ','_').replace('±','PLUS_MINUS')}.csv",part.to_csv(index=False))
-                    z.writestr("README.txt",f"FRIDAY research data package. Period={period}. Options are 1-minute weekly ATM-10..ATM+10 with OI/IV/volume/spot. NIFTY/VIX are selected OHLC timeframe with OI disabled.")
+                    z.writestr("README.txt",f"FRIDAY research data package. Period={period}. Options are 1-minute weekly ATM-10..ATM+10 with OI/IV/volume/spot. NIFTY/VIX are selected OHLC timeframe with OI disabled. Dhan requests are split into 10-day windows with retries for transient gateway failures.")
                 st.success(f"Quarter-wise package ready: {len(parts)} periods")
                 st.download_button("DOWNLOAD QUARTER-WISE PACKAGE (.ZIP)",out.getvalue(),f"FRIDAY_{period.replace(' ','_')}_{dataset.replace(' ','_').replace('±','PLUS_MINUS')}.zip","application/zip",use_container_width=True)
             bar.progress(100,text="FRIDAY Data Vault: 100% ✅")
@@ -237,7 +219,6 @@ def render_data_vault(token,client_id):
             status.error(f"Download stopped: {e}")
             st.exception(e)
 
-# Existing analysis functions below are intentionally preserved.
 
 def render_analyzer():
     st.title("FRIDAY — OPTION PATTERN RESEARCH")
