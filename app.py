@@ -132,7 +132,7 @@ def option_quarter_download(q_label, start_date, end_date, token, client_id, pro
             strike = "ATM" if offset==0 else f"ATM+{offset}" if offset>0 else f"ATM{offset}"
             payload={
                 "exchangeSegment":"NSE_FNO","interval":"1","securityId":13,"instrument":"OPTIDX",
-                "expiryFlag":"WEEK","expiryCode":0,"strike":strike,"drvOptionType":opt,
+                "expiryFlag":"WEEK","expiryCode":1,"strike":strike,"drvOptionType":opt,
                 "requiredData":["open","high","low","close","iv","volume","strike","oi","spot"],
                 "fromDate":cur.strftime("%Y-%m-%d"),"toDate":(ce+timedelta(days=1)).strftime("%Y-%m-%d"),
             }
