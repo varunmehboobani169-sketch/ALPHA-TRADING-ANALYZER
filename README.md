@@ -17,3 +17,10 @@ Fixes in this build:
 Fixed the `unsupported format string passed to tuple.__format__` error caused by
 the nested tuple returned by the live India VIX request. Added defensive numeric
 formatting and safe expiry formatting.
+
+
+## V3 IV Behaviour Fix
+- Today's IV row is retained so JARVIS can calculate today's Open IV vs current IV.
+- The historical baseline uses ONLY the previous 30 completed sessions.
+- Today's session is never included in the 30-session average or standard deviation.
+- API throttle increased to 3.2 seconds between requests to stay below Dhan's documented 3-second option-chain request limit.

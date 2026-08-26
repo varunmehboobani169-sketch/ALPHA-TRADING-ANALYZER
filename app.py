@@ -39,7 +39,7 @@ HISTORY_SESSIONS = 30
 HISTORY_CALENDAR_DAYS = 60
 INTRADAY_CHUNK_DAYS = 90
 
-API_MIN_INTERVAL_SECONDS = 1.0
+API_MIN_INTERVAL_SECONDS = 3.2
 API_MAX_RETRIES = 4
 
 
@@ -451,18 +451,20 @@ def current_atm_iv():
 
 
 @st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def historical_atm_iv_sessions():
     """
-    Fetch roughly 60 calendar days of weekly ATM CE/PE 1-minute IV, then
-    reduce to the last 30 completed trading sessions.
+    Fetch enough rolling weekly ATM CE/PE IV history to obtain:
+      - today's Open/Close IV where available
+      - the previous 30 completed trading sessions
+    Today's row is intentionally retained here; the dashboard excludes it
+    when calculating the 30-session baseline.
     """
-    end = local_now().date() + timedelta(days=1)
-    start = local_now().date() - timedelta(days=HISTORY_CALENDAR_DAYS)
+    end_date = local_now().date() + timedelta(days=1)
+    start_date = local_now().date() - timedelta(days=60)
     frames = []
 
-    for chunk_start, chunk_end in _date_chunks(
-        start, end, 30
-    ):
+    for chunk_start, chunk_end in _date_chunks(start_date, end_date, 30):
         for side in ["CALL", "PUT"]:
             body = api_post(
                 "/charts/rollingoption",
@@ -491,6 +493,7 @@ def historical_atm_iv_sessions():
                 },
                 f"Historical ATM {side} IV",
             )
+
             data = parse_data(body)
             key = "ce" if side == "CALL" else "pe"
             leg = data.get(key) if isinstance(data, dict) else None
@@ -509,32 +512,32 @@ def historical_atm_iv_sessions():
 
     raw = pd.concat(frames, ignore_index=True)
     raw["date"] = raw["datetime"].dt.date
-    raw = raw.dropna(subset=["iv"])
+    raw = raw.dropna(subset=["iv"]).sort_values("datetime")
 
-    # Per day: first available IV and last available IV for each side.
+    # Keep first and last available IV in every session for each side.
     piv = (
-        raw.sort_values("datetime")
-        .groupby(["date", "side"], as_index=False)
+        raw.groupby(["date", "side"], as_index=False)
         .agg(
             open_iv=("iv", "first"),
             close_iv=("iv", "last"),
         )
     )
 
-    wide = piv.pivot(index="date", columns="side", values=["open_iv", "close_iv"]).reset_index()
+    wide = (
+        piv.pivot(index="date", columns="side", values=["open_iv", "close_iv"])
+        .reset_index()
+    )
     wide.columns = [
         "_".join([str(x) for x in col if str(x) != ""])
         if isinstance(col, tuple) else str(col)
         for col in wide.columns
     ]
-
-    rename = {
+    wide = wide.rename(columns={
         "CALL_open_iv": "ce_open_iv",
         "PUT_open_iv": "pe_open_iv",
         "CALL_close_iv": "ce_close_iv",
         "PUT_close_iv": "pe_close_iv",
-    }
-    wide = wide.rename(columns=rename)
+    })
 
     for col in ["ce_open_iv", "pe_open_iv", "ce_close_iv", "pe_close_iv"]:
         if col not in wide.columns:
@@ -544,11 +547,13 @@ def historical_atm_iv_sessions():
     wide["close_iv"] = wide[["ce_close_iv", "pe_close_iv"]].mean(axis=1)
     wide["iv_change"] = wide["close_iv"] - wide["open_iv"]
 
-    # Only completed sessions for the baseline.
+    # Keep only the latest 31 sessions: today + previous 30 completed.
     today = local_now().date()
-    wide = wide[wide["date"] < today].copy()
     wide = wide.dropna(subset=["open_iv", "close_iv"]).sort_values("date")
-    return wide.tail(HISTORY_SESSIONS).reset_index(drop=True)
+    historical = wide[wide["date"] < today].tail(HISTORY_SESSIONS)
+    today_row = wide[wide["date"] == today]
+
+    return pd.concat([historical, today_row], ignore_index=True).sort_values("date").reset_index(drop=True)
 
 
 def build_pnf(closes, box_pct, reversal):
@@ -917,24 +922,29 @@ try:
     if iv_today is None:
         iv_today = {}
 
+    today_current_iv = iv_today.get("avg_iv", np.nan) if isinstance(iv_today, dict) else np.nan
+    today_date = local_now().date()
+
+    # Historical baseline = previous 30 completed sessions only.
     if not iv_hist.empty:
-        hist_avg_change = float(iv_hist["iv_change"].mean())
-        hist_std_change = float(iv_hist["iv_change"].std(ddof=1)) if len(iv_hist) > 1 else np.nan
+        baseline = iv_hist[iv_hist["date"] < today_date].tail(HISTORY_SESSIONS)
+    else:
+        baseline = pd.DataFrame()
+
+    if not baseline.empty:
+        hist_avg_change = float(baseline["iv_change"].mean())
+        hist_std_change = (
+            float(baseline["iv_change"].std(ddof=1))
+            if len(baseline) > 1 else np.nan
+        )
     else:
         hist_avg_change = np.nan
         hist_std_change = np.nan
 
-    today_current_iv = iv_today.get("avg_iv", np.nan)
-    today_date = local_now().date()
-
+    # Today's Open IV comes from today's retained historical row.
     if not iv_hist.empty and pd.notna(today_current_iv):
-        # Use the first recorded IV of the current session when available.
-        # If today's session is not returned by rolling history yet, use live
-        # current IV as the current reading and leave open IV unavailable.
-        current_hist = None
-        if "date" in iv_hist.columns:
-            current_hist = iv_hist[iv_hist["date"] == today_date]
-        if current_hist is not None and not current_hist.empty:
+        current_hist = iv_hist[iv_hist["date"] == today_date]
+        if not current_hist.empty and pd.notna(current_hist.iloc[-1]["open_iv"]):
             today_open_iv = float(current_hist.iloc[-1]["open_iv"])
             today_change = today_current_iv - today_open_iv
         else:
