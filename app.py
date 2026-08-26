@@ -752,6 +752,21 @@ def environment_assessment(vix_state, iv_change, avg_change, std_change):
     return overall, iv_class, reason
 
 
+
+def fmt_num(value, digits=2, signed=False):
+    """Safe numeric formatter that never applies numeric formatting to tuples."""
+    try:
+        if isinstance(value, (tuple, list, dict)):
+            return "—"
+        value = float(value)
+        if not np.isfinite(value):
+            return "—"
+        spec = f"+.{digits}f" if signed else f".{digits}f"
+        return format(value, spec)
+    except (TypeError, ValueError):
+        return "—"
+
+
 def safe_call(cache_key, fn, *args):
     """Return fresh data or last successful session result on transient API/rate errors."""
     try:
@@ -874,7 +889,12 @@ try:
     master = load_master()
     vix_id = resolve_india_vix_security_id(master)
 
-    vix_ltp, vix_ltt = safe_call("jarvis_live_vix", live_vix, vix_id)
+    live_vix_result, live_vix_error = safe_call("jarvis_live_vix", live_vix, vix_id)
+    if isinstance(live_vix_result, tuple) and len(live_vix_result) == 2:
+        vix_ltp, vix_ltt = live_vix_result
+    else:
+        vix_ltp, vix_ltt = np.nan, np.nan
+
     hist_end = local_now().date() + timedelta(days=1)
     hist_start = local_now().date() - timedelta(days=120 if vix_tf == "Day" else 60)
     vix_hist, vix_hist_error = safe_call(
@@ -931,7 +951,7 @@ try:
         hist_std_change,
     )
 
-    errors = [e for e in [vix_hist_error, iv_today_error, iv_hist_error] if e]
+    errors = [e for e in [live_vix_error, vix_hist_error, iv_today_error, iv_hist_error] if e]
     if errors:
         st.warning(
             "Some live requests were rate-limited. JARVIS is showing the last successful cached data "
@@ -950,7 +970,7 @@ try:
     c1, c2, c3, c4 = st.columns(4)
     c1.markdown(
         f'<div class="jarvis-card"><div class="metric-label">India VIX</div>'
-        f'<div class="metric-value">{vix_ltp:.2f}' if pd.notna(vix_ltp)
+        f'<div class="metric-value">{fmt_num(vix_ltp)}' if pd.notna(vix_ltp)
         else '<div class="jarvis-card"><div class="metric-label">India VIX</div><div class="metric-value">—',
         unsafe_allow_html=True,
     )
@@ -998,7 +1018,11 @@ try:
     # Current ATM IV details
     st.markdown("#### Current NIFTY ATM IV", unsafe_allow_html=True)
     d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Expiry", iv_today.get("expiry", "—").strftime("%d-%b-%Y") if iv_today else "—")
+    expiry_value = iv_today.get("expiry") if isinstance(iv_today, dict) else None
+    d1.metric(
+        "Expiry",
+        expiry_value.strftime("%d-%b-%Y") if hasattr(expiry_value, "strftime") else "—",
+    )
     d2.metric("ATM Strike", f"{iv_today.get('atm'):.0f}" if iv_today and pd.notna(iv_today.get("atm")) else "—")
     d3.metric("ATM CE IV", f"{iv_today.get('ce_iv'):.2f}" if iv_today and pd.notna(iv_today.get("ce_iv")) else "—")
     d4.metric("ATM PE IV", f"{iv_today.get('pe_iv'):.2f}" if iv_today and pd.notna(iv_today.get("pe_iv")) else "—")
