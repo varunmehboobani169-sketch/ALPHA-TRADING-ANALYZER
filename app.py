@@ -142,10 +142,6 @@ def slice_quarter(df, q):
 
 
 def attach_expiry(options):
-    """Use explicit expiry when present. Dhan rolling-option CSVs may omit expiry;
-    in that case keep the fact explicit and use rolling-contract identity for pairing.
-    We never invent an expiry date from the current expiry calendar because that
-    calendar is not a historical contract map."""
     out = options.copy()
     missing_before = float(out.expiry.isna().mean()) if len(out) else 0.0
     has_expiry = missing_before == 0.0
@@ -174,15 +170,28 @@ def pair_ce_pe(aligned, has_expiry):
     if ce.empty or pe.empty:
         return pd.DataFrame()
     pe = pe.rename(columns={"timestamp": "pe_timestamp", "close": "pe_close", "iv": "pe_iv", "oi": "pe_oi", "volume": "pe_volume"})
-    ce = ce.sort_values(["timestamp", "strike"], kind="mergesort")
-    pe = pe.sort_values(["pe_timestamp", "strike"], kind="mergesort")
     by_cols = ["expiry", "strike"] if has_expiry else ["strike"]
-    out = pd.merge_asof(ce, pe, left_on="timestamp", right_on="pe_timestamp", by=by_cols, direction="nearest", tolerance=PAIR_TOLERANCE)
+    ce_sort = ["timestamp"] + by_cols
+    pe_sort = ["pe_timestamp"] + by_cols
+    ce = ce.sort_values(ce_sort, kind="mergesort")
+    pe = pe.sort_values(pe_sort, kind="mergesort")
+    out = pd.merge_asof(ce, pe, left_on="timestamp", right_on="pe_timestamp", by=by_cols, direction="nearest", tolerance=PAIR_TOLERANCE, suffixes=("", "_pe_dup"))
     out = out.dropna(subset=["pe_timestamp", "close", "pe_close"]).copy()
     if out.empty:
         return out
     out["pair_gap_seconds"] = (out.timestamp - out.pe_timestamp).abs().dt.total_seconds()
     out["expiry_pairing_mode"] = "explicit_expiry" if has_expiry else "rolling_contract_same_strike"
+    # merge_asof may rename overlapping state columns; guarantee a canonical spot column.
+    if "spot" not in out.columns:
+        for candidate in ["spot_pe_dup", "spot_pe", "spot_dup"]:
+            if candidate in out.columns:
+                out["spot"] = out[candidate]
+                break
+    if "vix" not in out.columns:
+        for candidate in ["vix_pe_dup", "vix_pe", "vix_dup"]:
+            if candidate in out.columns:
+                out["vix"] = out[candidate]
+                break
     return out.sort_values("timestamp").reset_index(drop=True)
 
 
@@ -190,50 +199,65 @@ def build_market_features(pairs, spot, vix):
     if pairs.empty:
         return pd.DataFrame()
     p = pairs.copy()
-    p["distance_to_spot"] = (p.strike - p.spot).abs()
+    # Never assume the CE-side merge preserved the underlying state columns.
+    if "spot" not in p.columns:
+        p = pd.merge_asof(p.sort_values("timestamp"), spot.sort_values("timestamp"), on="timestamp", direction="backward", tolerance=SPOT_TOLERANCE, suffixes=("", "_state"))
+        if "spot_state" in p.columns and "spot" not in p.columns:
+            p["spot"] = p["spot_state"]
+    if "spot" not in p.columns:
+        raise ValueError("NIFTY Spot could not be attached to paired option observations.")
+    p["spot"] = pd.to_numeric(p["spot"], errors="coerce")
+    if "vix" not in p.columns and not vix.empty:
+        p = pd.merge_asof(p.sort_values("timestamp"), vix.sort_values("timestamp"), on="timestamp", direction="backward", tolerance=SPOT_TOLERANCE, suffixes=("", "_state"))
+        if "vix_state" in p.columns and "vix" not in p.columns:
+            p["vix"] = p["vix_state"]
+    p = p.dropna(subset=["spot"]).copy()
+    p["distance_to_spot"] = (p["strike"] - p["spot"]).abs()
     p["dte"] = np.nan
-    if p["expiry"].notna().any():
-        p["dte"] = (p.expiry - p.timestamp.dt.normalize()).dt.total_seconds() / 86400.0
-    if p["expiry"].notna().any():
+    if "expiry" in p.columns and p["expiry"].notna().any():
+        p["dte"] = (p["expiry"] - p["timestamp"].dt.normalize()).dt.total_seconds() / 86400.0
         atm = p.sort_values(["timestamp", "expiry", "distance_to_spot"], kind="mergesort").drop_duplicates(["timestamp", "expiry"])
     else:
         atm = p.sort_values(["timestamp", "distance_to_spot"], kind="mergesort").drop_duplicates("timestamp")
     primary = atm.sort_values(["timestamp", "dte", "distance_to_spot"], kind="mergesort", na_position="last").drop_duplicates("timestamp")
-    keep = ["timestamp", "strike", "spot", "vix", "close", "pe_close", "iv", "pe_iv", "oi", "pe_oi", "volume", "pe_volume", "pair_gap_seconds", "dte"]
+    keep = ["timestamp", "strike", "spot", "vix", "close", "pe_close", "iv", "pe_iv", "oi", "pe_oi", "volume", "pe_volume", "pair_gap_seconds", "dte", "expiry_pairing_mode"]
     keep = [c for c in keep if c in primary.columns]
     f = primary[keep].copy().rename(columns={"strike": "atm_strike", "close": "ce_close", "iv": "ce_iv", "oi": "ce_oi", "volume": "ce_volume"})
     if "expiry" in primary.columns:
         f["expiry"] = primary["expiry"].values
-    f["pcr_oi"] = f.pe_oi / f.ce_oi.replace(0, np.nan)
-    f["straddle"] = f.ce_close + f.pe_close
+    f["pcr_oi"] = f["pe_oi"] / f["ce_oi"].replace(0, np.nan)
+    f["straddle"] = f["ce_close"] + f["pe_close"]
     f["iv_mid"] = f[["ce_iv", "pe_iv"]].mean(axis=1)
-    f["iv_skew"] = f.ce_iv - f.pe_iv
-    f["oi_imbalance"] = (f.pe_oi - f.ce_oi) / (f.pe_oi + f.ce_oi).replace(0, np.nan)
-    f["volume_imbalance"] = (f.pe_volume - f.ce_volume) / (f.pe_volume + f.ce_volume).replace(0, np.nan)
+    f["iv_skew"] = f["ce_iv"] - f["pe_iv"]
+    f["oi_imbalance"] = (f["pe_oi"] - f["ce_oi"]) / (f["pe_oi"] + f["ce_oi"]).replace(0, np.nan)
+    f["volume_imbalance"] = (f["pe_volume"] - f["ce_volume"]) / (f["pe_volume"] + f["ce_volume"]).replace(0, np.nan)
+
     s = spot.copy().sort_values("timestamp")
-    s["spot_ret_15"] = s.spot.pct_change(1); s["spot_ret_30"] = s.spot.pct_change(2); s["spot_ret_60"] = s.spot.pct_change(4); s["spot_vol_60"] = s.spot.pct_change().rolling(4).std()
+    s["spot_ret_15"] = s["spot"].pct_change(1); s["spot_ret_30"] = s["spot"].pct_change(2); s["spot_ret_60"] = s["spot"].pct_change(4); s["spot_vol_60"] = s["spot"].pct_change().rolling(4).std()
     v = vix.copy().sort_values("timestamp")
     if not v.empty:
-        v["vix_chg_15"] = v.vix.diff(1); v["vix_ret_15"] = v.vix.pct_change(1); v["vix_chg_30"] = v.vix.diff(2); v["vix_chg_60"] = v.vix.diff(4)
+        v["vix_chg_15"] = v["vix"].diff(1); v["vix_ret_15"] = v["vix"].pct_change(1); v["vix_chg_30"] = v["vix"].diff(2); v["vix_chg_60"] = v["vix"].diff(4)
     f = pd.merge_asof(f.sort_values("timestamp"), s[["timestamp", "spot_ret_15", "spot_ret_30", "spot_ret_60", "spot_vol_60"]], on="timestamp", direction="backward", tolerance=SPOT_TOLERANCE)
     if not v.empty:
         f = pd.merge_asof(f.sort_values("timestamp"), v[["timestamp", "vix", "vix_chg_15", "vix_ret_15", "vix_chg_30", "vix_chg_60"]], on="timestamp", direction="backward", tolerance=SPOT_TOLERANCE, suffixes=("", "_state"))
         if "vix_state" in f.columns:
-            f["vix"] = f["vix_state"].combine_first(f["vix"]); f = f.drop(columns=["vix_state"])
+            f["vix"] = f["vix_state"].combine_first(f.get("vix", np.nan)); f = f.drop(columns=["vix_state"])
     for c in ["ce_close", "pe_close", "straddle", "ce_iv", "pe_iv", "iv_mid", "pcr_oi", "oi_imbalance", "volume_imbalance"]:
         f[f"{c}_chg_1"] = f[c].pct_change(1); f[f"{c}_chg_5"] = f[c].pct_change(5); f[f"{c}_chg_15"] = f[c].pct_change(15)
-    f["time_minute"] = f.timestamp.dt.hour * 60 + f.timestamp.dt.minute
-    f["minute_bucket"] = pd.cut(f.time_minute, bins=[0, 570, 630, 720, 840, 960, 1440], labels=["open", "morning", "midday", "afternoon", "close", "other"], right=False)
-    f["straddle_level_log"] = np.log(f.straddle.clip(lower=1e-6))
+    f["time_minute"] = f["timestamp"].dt.hour * 60 + f["timestamp"].dt.minute
+    f["minute_bucket"] = pd.cut(f["time_minute"], bins=[0, 570, 630, 720, 840, 960, 1440], labels=["open", "morning", "midday", "afternoon", "close", "other"], right=False)
+    if "expiry" in f.columns:
+        f["is_expiry_day"] = f["timestamp"].dt.normalize().eq(f["expiry"])
+    f["straddle_level_log"] = np.log(f["straddle"].clip(lower=1e-6))
     return f.sort_values("timestamp").reset_index(drop=True)
 
 
 def forward_values(base, target, source_col, horizon_min, tolerance):
-    left = base[["timestamp"]].copy()
-    left["target_ts"] = left.timestamp + pd.Timedelta(minutes=horizon_min)
-    right = target[["timestamp", source_col]].rename(columns={"timestamp": "future_timestamp", source_col: "future_value"}).sort_values("future_timestamp")
-    joined = pd.merge_asof(left.sort_values("target_ts"), right, left_on="target_ts", right_on="future_timestamp", direction="nearest", tolerance=tolerance)
-    return joined["future_value"].reset_index(drop=True)
+    left = base[["timestamp"]].copy().sort_values("timestamp").reset_index(drop=True)
+    left["target_ts"] = left["timestamp"] + pd.Timedelta(minutes=horizon_min)
+    right = target[["timestamp", source_col]].rename(columns={"timestamp": "future_timestamp", source_col: "future_value"}).sort_values("future_timestamp").reset_index(drop=True)
+    joined = pd.merge_asof(left, right, left_on="target_ts", right_on="future_timestamp", direction="forward", tolerance=tolerance)
+    return joined["future_value"]
 
 
 def add_forward_outcomes(f, spot):
@@ -243,8 +267,8 @@ def add_forward_outcomes(f, spot):
     for h in HORIZONS_MIN:
         fut_str = forward_values(x, opt_series, "straddle", h, FUTURE_OPTION_TOLERANCE)
         fut_spot = forward_values(x, spot_series, "spot", h, FUTURE_SPOT_TOLERANCE)
-        x[f"future_straddle_ret_{h}m"] = fut_str.to_numpy() / x.straddle.to_numpy() - 1
-        x[f"future_spot_ret_{h}m"] = fut_spot.to_numpy() / x.spot.to_numpy() - 1
+        x[f"future_straddle_ret_{h}m"] = fut_str.to_numpy() / x["straddle"].to_numpy() - 1
+        x[f"future_spot_ret_{h}m"] = fut_spot.to_numpy() / x["spot"].to_numpy() - 1
     return x
 
 
@@ -258,8 +282,7 @@ def robust_stats(series):
 
 def build_candidate_rules(df):
     target_col = "future_spot_ret_15m"
-    if target_col not in df.columns:
-        return pd.DataFrame()
+    if target_col not in df.columns: return pd.DataFrame()
     numeric = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in {"atm_strike", "time_minute"}]
     base_stats = robust_stats(df[target_col]); rows = []
     for c in numeric:
@@ -270,7 +293,7 @@ def build_candidate_rules(df):
             d = df.loc[mask & df[target_col].notna(), target_col]; stt = robust_stats(d)
             if stt["n"] < 50: continue
             effect = abs(stt["trimmed_mean"] - base_stats["trimmed_mean"]); score = effect * math.sqrt(stt["n"]) if pd.notna(effect) else 0.0
-            rows.append({"rule": name, "feature": c, **stt, "baseline_trimmed_mean": base_stats["trimmed_mean"], "effect_vs_baseline": effect, "priority_score": score})
+            rows.append({"rule": name, "feature": c, "n": stt["n"], "mean": stt["mean"], "median": stt["median"], "trimmed_mean": stt["trimmed_mean"], "up_rate": stt["up_rate"], "baseline_trimmed_mean": base_stats["trimmed_mean"], "effect_vs_baseline": effect, "priority_score": score})
     return pd.DataFrame(rows).sort_values(["priority_score", "n"], ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
 
 
@@ -283,19 +306,13 @@ def build_interactions(df, top_features):
             a, b = cols[i], cols[j]; sa, sb = pd.to_numeric(df[a], errors="coerce"), pd.to_numeric(df[b], errors="coerce"); qa, qb = sa.quantile([.2, .8]), sb.quantile([.2, .8])
             masks = {f"{a} low + {b} low": (sa <= qa[.2]) & (sb <= qb[.2]), f"{a} high + {b} high": (sa >= qa[.8]) & (sb >= qb[.8]), f"{a} high + {b} low": (sa >= qa[.8]) & (sb <= qb[.2]), f"{a} low + {b} high": (sa <= qa[.2]) & (sb >= qb[.8])}
             for name, mask in masks.items():
-                d = df.loc[mask & df[target].notna(), target]; stt = robust_stats(d)
+                stt = robust_stats(df.loc[mask & df[target].notna(), target])
                 if stt["n"] >= 40: rows.append({"interaction": name, "feature_a": a, "feature_b": b, **stt})
     return pd.DataFrame(rows).sort_values(["trimmed_mean", "n"], ascending=[False, False]).reset_index(drop=True) if rows else pd.DataFrame()
 
 
 def audit_table(options, spot, vix, aligned, pairs, features, missing_before, has_expiry):
-    rows = [
-        ("Option rows", len(options), "INFO"), ("Spot rows", len(spot), "INFO"), ("VIX rows", len(vix), "INFO"), ("Option+Spot synced", len(aligned), "INFO"),
-        ("CE rows", int((options.side == "CE").sum()), "INFO"), ("PE rows", int((options.side == "PE").sum()), "INFO"), ("CE/PE pairs", len(pairs), "PASS" if len(pairs) else "FAIL"),
-        ("ATM observations", len(features), "PASS" if len(features) else "FAIL"), ("Expiry supplied by data", "YES" if has_expiry else "NO — rolling-contract mode", "PASS" if has_expiry else "RECONSTRUCTED/UNAVAILABLE"),
-        ("Missing expiry before processing", f"{missing_before*100:.2f}%", "INFO"), ("Option start", str(options.timestamp.min()) if not options.empty else "N/A", "INFO"), ("Option end", str(options.timestamp.max()) if not options.empty else "N/A", "INFO"),
-        ("Spot start", str(spot.timestamp.min()) if not spot.empty else "N/A", "INFO"), ("Spot end", str(spot.timestamp.max()) if not spot.empty else "N/A", "INFO"),
-    ]
+    rows = [("Option rows", len(options), "INFO"), ("Spot rows", len(spot), "INFO"), ("VIX rows", len(vix), "INFO"), ("Option+Spot synced", len(aligned), "INFO"), ("CE rows", int((options.side == "CE").sum()), "INFO"), ("PE rows", int((options.side == "PE").sum()), "INFO"), ("CE/PE pairs", len(pairs), "PASS" if len(pairs) else "FAIL"), ("ATM observations", len(features), "PASS" if len(features) else "FAIL"), ("Expiry mode", "explicit" if has_expiry else "rolling-contract same-strike", "PASS"), ("Missing expiry in raw file", f"{missing_before*100:.2f}%", "INFO"), ("Option start", str(options.timestamp.min()) if not options.empty else "N/A", "INFO"), ("Option end", str(options.timestamp.max()) if not options.empty else "N/A", "INFO"), ("Spot start", str(spot.timestamp.min()) if not spot.empty else "N/A", "INFO"), ("Spot end", str(spot.timestamp.max()) if not spot.empty else "N/A", "INFO")]
     return pd.DataFrame(rows, columns=["check", "value", "status"])
 
 
@@ -333,13 +350,14 @@ def process_quarter(q, options_all, spot_all, vix_all):
     fruit = build_candidate_rules(features)
     top_features = fruit.sort_values("priority_score", ascending=False).feature.drop_duplicates().head(20).tolist() if not fruit.empty else []
     interactions = build_interactions(features, top_features)
-    n = len(features); split = max(1, int(n * 0.6)); train = features.iloc[:split]; test = features.iloc[split:]
+    split = max(1, int(len(features) * 0.6)); train = features.iloc[:split]; test = features.iloc[split:]
     validation = pd.DataFrame([{"sample": "train", **robust_stats(train.get("future_spot_ret_15m", pd.Series(dtype=float)))}, {"sample": "test", **robust_stats(test.get("future_spot_ret_15m", pd.Series(dtype=float)))}])
     warnings = []
-    if not has_expiry: warnings.append("Raw CSV did not provide expiry. FRIDAY used rolling-contract same-strike pairing and did not invent a historical expiry date. Expiry-specific conclusions are disabled for this run.")
-    if missing_before > 0 and has_expiry: warnings.append(f"Expiry was missing in {missing_before*100:.2f}% of raw rows; rows with explicit expiry were used for safe pairing and missing rows were not cross-inferred.")
-    if fruit.empty: warnings.append("No single-variable candidate met the minimum sample/quality threshold.")
-    return {"audit": audit_table(options, spot, vix, aligned, pairs, features, missing_before, has_expiry), "features": features, "fruitfulness": fruit, "interactions": interactions, "validation": validation, "pairs": pairs, "report": build_report(q, audit_table(options, spot, vix, aligned, pairs, features, missing_before, has_expiry), fruit, interactions, validation, warnings)}
+    if not has_expiry: warnings.append("Options file has no historical expiry field; FRIDAY used rolling-contract same-strike pairing and did not infer expiry from a current calendar.")
+    if fruit.empty: warnings.append("No single-variable candidate met the minimum quality threshold.")
+    audit = audit_table(options, spot, vix, aligned, pairs, features, missing_before, has_expiry)
+    report = build_report(q, audit, fruit, interactions, validation, warnings)
+    return {"audit": audit, "features": features, "fruitfulness": fruit, "interactions": interactions, "validation": validation, "pairs": pairs, "report": report}
 
 
 def make_zip(results):
@@ -348,13 +366,9 @@ def make_zip(results):
         for q, r in results.items():
             safe = q.replace(" ", "_")
             z.writestr(f"FRIDAY_{safe}_DEEP_AUDIT.md", r["report"])
-            z.writestr(f"FRIDAY_{safe}_features.csv", r["features"].to_csv(index=False))
-            z.writestr(f"FRIDAY_{safe}_fruitfulness.csv", r["fruitfulness"].to_csv(index=False))
-            z.writestr(f"FRIDAY_{safe}_interactions.csv", r["interactions"].to_csv(index=False))
-            z.writestr(f"FRIDAY_{safe}_validation.csv", r["validation"].to_csv(index=False))
-            z.writestr(f"FRIDAY_{safe}_pairs.csv", r["pairs"].to_csv(index=False))
-            z.writestr(f"FRIDAY_{safe}_audit.csv", r["audit"].to_csv(index=False))
-        z.writestr("README.txt", "FRIDAY research engine. Options 1m, Spot 15m, VIX 15m. Explicit expiry is preferred; when Dhan rolling-option CSVs omit expiry, FRIDAY uses rolling-contract same-strike pairing and disables expiry-specific conclusions. Future Spot/VIX state is never used.")
+            for key in ["features", "fruitfulness", "interactions", "validation", "pairs", "audit"]:
+                z.writestr(f"FRIDAY_{safe}_{key}.csv", r[key].to_csv(index=False))
+        z.writestr("README.txt", "FRIDAY research engine. Options 1m, NIFTY Spot 15m, India VIX 15m. Expiry is preserved when present; otherwise rolling-contract same-strike mode is used without inventing expiry.")
     return buf.getvalue()
 
 
@@ -362,11 +376,11 @@ def main():
     with st.sidebar:
         st.subheader("FRIDAY")
         client_id = st.text_input("Dhan Client ID", DEFAULT_CLIENT_ID).strip()
-        token = st.text_input("Dhan Access Token (optional for research)", type="password").strip()
+        token = st.text_input("Dhan Access Token", type="password").strip()
         if token:
             ok, msg = dhan_profile(token, client_id); (st.success if ok else st.error)(msg)
     st.title("FRIDAY — AUTONOMOUS MARKET RESEARCH ENGINE")
-    st.caption("Options 1m + NIFTY Spot 15m + India VIX 15m. Raw-data fruitfulness discovery with no future-state leakage.")
+    st.caption("Options 1m + NIFTY Spot 15m + India VIX 15m. Raw-data fruitfulness discovery with safe pairing.")
     selected = st.multiselect("Quarters", list(QUARTERS.keys()), default=["Q1 2025"])
     opt_files = st.file_uploader("NIFTY Options CSV(s)", type=["csv"], accept_multiple_files=True)
     spot_files = st.file_uploader("NIFTY Spot CSV(s)", type=["csv"], accept_multiple_files=True)
@@ -379,7 +393,7 @@ def main():
             options_all = normalize_options(read_csv_files(opt_files)); spot_all = normalize_spot(read_csv_files(spot_files)); vix_all = normalize_vix(read_csv_files(vix_files)) if vix_files else pd.DataFrame(columns=["timestamp", "vix"])
             results = {}; errors = []
             for i, q in enumerate(selected, start=1):
-                status.info(f"FRIDAY: {q} — audit → expiry state → synchronization → feature discovery → interactions...")
+                status.info(f"FRIDAY: {q} — auditing → aligning → discovering → testing interactions...")
                 try: results[q] = process_quarter(q, options_all, spot_all, vix_all)
                 except Exception as exc: errors.append((q, str(exc)))
                 bar.progress(i / len(selected), text=f"FRIDAY: {i/len(selected)*100:.1f}% — {q}")
