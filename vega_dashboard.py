@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 DHAN_API = "https://api.dhan.co/v2"
 IST = ZoneInfo("Asia/Kolkata")
@@ -217,6 +216,20 @@ def sound_alert():
     )
 
 
+def auto_refresh_every_3_minutes():
+    st.components.v1.html(
+        """
+        <script>
+        setTimeout(function() {
+            try { window.parent.location.reload(); }
+            catch (e) { window.location.reload(); }
+        }, 180000);
+        </script>
+        """,
+        height=1,
+    )
+
+
 connect_box()
 
 st.sidebar.markdown("## ⚙️ SETTINGS")
@@ -241,6 +254,8 @@ if not st.session_state.dhan_connected:
     st.info("Connect your Dhan account from the left sidebar.")
     st.stop()
 
+auto_refresh_every_3_minutes()
+
 client_id = st.session_state.dhan_client_id
 token = st.session_state.dhan_token
 now = datetime.now(IST)
@@ -261,9 +276,6 @@ if st.session_state.get("vega_day") != day_key:
         st.session_state.pop(key, None)
     st.session_state.vega_day = day_key
 
-# Auto refresh every 3 minutes.
-st_autorefresh(interval=180_000, limit=None, key="vega_3min_refresh")
-
 try:
     expiries = expiry_list(client_id, token, security_id, segment)
 except Exception as exc:
@@ -276,7 +288,7 @@ if not expiries:
 
 expiry = expiries[0 if expiry_choice == "NEAREST" else min(1, len(expiries) - 1)]
 
-# Lock ATM from the 10:00 underlying close.
+# Lock ATM from the 10:00 underlying close, even when dashboard is opened later.
 atm_locked = st.session_state.get("vega_atm_locked", False)
 if not atm_locked:
     if now.time() < ATM_LOCK_TIME:
@@ -289,7 +301,7 @@ if not atm_locked:
                 eligible = underlying[underlying["timestamp"].dt.time <= ATM_LOCK_TIME]
                 exact = eligible.tail(1)
             if exact.empty:
-                st.warning("10:00 underlying candle is not available yet. Retrying on the next 3-minute refresh.")
+                st.warning("10:00 underlying candle is not available yet. Retrying on the next refresh.")
                 st.stop()
             ref_spot = float(exact.iloc[-1]["close"])
             current_chain = option_chain(client_id, token, security_id, segment, expiry)
@@ -355,7 +367,7 @@ if not history or history[-1]["time"] != refresh_time:
     history.append(sample)
 st.session_state.vega_history = history[-60:]
 
-# Alert only once per 3-minute sample.
+# Alert only once per refresh sample.
 spike_key = f"{day_key}|{refresh_time}|{spike_side}"
 new_spike = bool(spike_side and st.session_state.get("vega_last_spike_key") != spike_key)
 if new_spike:
