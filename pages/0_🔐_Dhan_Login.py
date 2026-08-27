@@ -5,39 +5,44 @@ import urllib.request
 import streamlit as st
 
 DHAN_API = "https://api.dhan.co/v2"
-DEFAULT_CLIENT_ID = ""
+DEFAULT_CLIENT_ID = "1113195747"
 
 st.set_page_config(page_title="FRIDAY — Dhan Login", layout="wide")
 
 st.title("🔐 FRIDAY — Dhan Login")
-st.caption("Enter your Dhan Client ID and Access Token. Credentials are kept only in this Streamlit session and are not written to the repository.")
+st.caption("Enter your Dhan Client ID and Access Token. The credentials are kept in this Streamlit session and are shared with the Vega Dashboard; they are not written to GitHub.")
 
-if "dhan_client_id" not in st.session_state:
-    st.session_state.dhan_client_id = DEFAULT_CLIENT_ID
-if "dhan_access_token" not in st.session_state:
-    st.session_state.dhan_access_token = ""
-if "dhan_verified" not in st.session_state:
-    st.session_state.dhan_verified = False
+# Shared session keys used by both FRIDAY and the Vega Dashboard.
+st.session_state.setdefault("dhan_client_id", DEFAULT_CLIENT_ID)
+st.session_state.setdefault("dhan_access_token", "")
+st.session_state.setdefault("dhan_token", st.session_state.dhan_access_token)
+st.session_state.setdefault("dhan_connected", False)
+st.session_state.setdefault("dhan_verified", False)
 
-with st.form("dhan_login_form"):
+# Keep aliases synchronized so either page can consume the same credentials.
+if st.session_state.dhan_access_token and not st.session_state.dhan_token:
+    st.session_state.dhan_token = st.session_state.dhan_access_token
+elif st.session_state.dhan_token and not st.session_state.dhan_access_token:
+    st.session_state.dhan_access_token = st.session_state.dhan_token
+
+with st.form("dhan_login_form", clear_on_submit=False):
     client_id = st.text_input(
         "Dhan Client ID",
         value=st.session_state.dhan_client_id,
-        placeholder="Enter Dhan Client ID",
-        help="Example format: 1113195747",
+        placeholder="1113195747",
     ).strip()
     token = st.text_input(
         "Dhan Access Token",
         value=st.session_state.dhan_access_token,
         type="password",
         placeholder="Paste your Dhan access token",
-        help="Your access token is masked on screen.",
     ).strip()
     submitted = st.form_submit_button("LOGIN / VERIFY", use_container_width=True, type="primary")
 
 if submitted:
     if not client_id or not token:
         st.session_state.dhan_verified = False
+        st.session_state.dhan_connected = False
         st.error("Please enter both Dhan Client ID and Access Token.")
     else:
         req = urllib.request.Request(
@@ -54,34 +59,42 @@ if submitted:
                 payload = json.loads(response.read().decode("utf-8"))
             st.session_state.dhan_client_id = client_id
             st.session_state.dhan_access_token = token
+            st.session_state.dhan_token = token
+            st.session_state.dhan_connected = True
             st.session_state.dhan_verified = True
+            st.success("✅ Dhan login verified. The same session is now available to the Vega Dashboard.")
             validity = None
             if isinstance(payload, dict):
                 data = payload.get("data")
                 if isinstance(data, dict):
                     validity = data.get("tokenValidity")
                 validity = validity or payload.get("tokenValidity")
-            st.success("Dhan login verified for this session.")
             if validity:
                 st.info(f"Token validity reported by Dhan: {validity}")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:600]
             st.session_state.dhan_verified = False
+            st.session_state.dhan_connected = False
             st.error(f"Dhan authentication failed (HTTP {exc.code}).")
             st.code(detail)
         except Exception as exc:
             st.session_state.dhan_verified = False
+            st.session_state.dhan_connected = False
             st.error(f"Could not verify Dhan credentials: {exc}")
 
 st.divider()
 
-if st.session_state.dhan_verified:
-    st.success("✅ Dhan credentials are active in this Streamlit session.")
+if st.session_state.dhan_verified and st.session_state.dhan_token:
+    st.success("✅ Dhan credentials are active and shared across the app.")
     st.write(f"Client ID: `{st.session_state.dhan_client_id}`")
+    st.caption("The access token is masked and remains session-only.")
     if st.button("LOGOUT / CLEAR CREDENTIALS", use_container_width=True):
-        st.session_state.dhan_client_id = ""
+        st.session_state.dhan_client_id = DEFAULT_CLIENT_ID
         st.session_state.dhan_access_token = ""
+        st.session_state.dhan_token = ""
+        st.session_state.dhan_connected = False
         st.session_state.dhan_verified = False
+        st.cache_resource.clear()
         st.rerun()
 else:
     st.warning("Not logged in.")
