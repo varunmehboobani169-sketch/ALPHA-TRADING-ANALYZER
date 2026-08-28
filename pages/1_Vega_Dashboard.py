@@ -16,7 +16,6 @@ st.session_state.cid = st.session_state.dhan_client_id
 st.session_state.token = st.session_state.dhan_access_token or st.session_state.dhan_token
 st.session_state.connected = bool(st.session_state.dhan_verified or st.session_state.dhan_connected) and bool(st.session_state.token)
 
-# Defensive defaults for fresh/reloaded sessions.
 for key, value in {
     "locked": False, "strike": 0.0, "spot10": 0.0, "expiry": "",
     "ce_id": "", "pe_id": "", "wing_ids": {},
