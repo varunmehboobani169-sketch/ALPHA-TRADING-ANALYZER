@@ -22,7 +22,9 @@ for key, value in {
     "instruments": (("IDX_I", "13"),), "prev_ce": None, "prev_pe": None,
     "prev_atm_iv": None, "history": [], "last_alert": None,
     "sample": {"atm_iv": None, "legs": {}}, "sample_bucket": None,
+    "setup_retry_at": 0.0, "setup_error": "", "expiry_cache": [], "expiry_day": "",
+    "day": "",
 }.items():
     st.session_state.setdefault(key, value)
 
-exec(open("vega_monitor_v10.py", encoding="utf-8").read(), globals())
+exec(open("vega_monitor_v11.py", encoding="utf-8").read(), globals())
