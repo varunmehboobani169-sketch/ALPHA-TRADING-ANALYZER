@@ -6,25 +6,19 @@ st.session_state.setdefault("dhan_access_token", "")
 st.session_state.setdefault("dhan_token", "")
 st.session_state.setdefault("dhan_verified", False)
 st.session_state.setdefault("dhan_connected", False)
-
 if st.session_state.dhan_access_token and not st.session_state.dhan_token:
     st.session_state.dhan_token = st.session_state.dhan_access_token
 if st.session_state.dhan_token and not st.session_state.dhan_access_token:
     st.session_state.dhan_access_token = st.session_state.dhan_token
-
 st.session_state.cid = st.session_state.dhan_client_id
 st.session_state.token = st.session_state.dhan_access_token or st.session_state.dhan_token
 st.session_state.connected = bool(st.session_state.dhan_verified or st.session_state.dhan_connected) and bool(st.session_state.token)
-
 for key, value in {
-    "locked": False, "strike": 0.0, "spot10": 0.0, "expiry": "",
-    "ce_id": "", "pe_id": "", "wing_ids": {},
-    "instruments": (("IDX_I", "13"),), "prev_ce": None, "prev_pe": None,
-    "prev_atm_iv": None, "history": [], "last_alert": None,
-    "sample": {"atm_iv": None, "legs": {}}, "sample_bucket": None,
-    "setup_retry_at": 0.0, "setup_error": "", "expiry_cache": [], "expiry_day": "",
-    "day": "",
+    "locked": False, "strike": 0.0, "spot10": 0.0, "expiry": "", "ce_id": "", "pe_id": "",
+    "wing_ids": {}, "instruments": (("IDX_I", "13"),), "snapshot": {}, "prev_ce": None,
+    "prev_pe": None, "prev_atm_iv": None, "history": [], "last_alert": None,
+    "sample": {"atm_iv": None, "legs": {}}, "sample_bucket": None, "setup_retry_at": 0.0,
+    "setup_error": "", "expiry_cache": [], "expiry_day": "", "day": "", "feed": None,
 }.items():
     st.session_state.setdefault(key, value)
-
-exec(open("vega_monitor_v11.py", encoding="utf-8").read(), globals())
+exec(open("vega_monitor_v12.py", encoding="utf-8").read(), globals())
