@@ -10,7 +10,7 @@ st.session_state.setdefault("dhan_connected", False)
 if st.session_state.dhan_access_token and not st.session_state.dhan_token:
     st.session_state.dhan_token = st.session_state.dhan_access_token
 if st.session_state.dhan_token and not st.session_state.dhan_access_token:
-    st.session_state.dhan_access_token = st.session_state.dhan_access_token
+    st.session_state.dhan_access_token = st.session_state.dhan_token
 
 st.session_state.cid = st.session_state.dhan_client_id
 st.session_state.token = st.session_state.dhan_access_token or st.session_state.dhan_token
