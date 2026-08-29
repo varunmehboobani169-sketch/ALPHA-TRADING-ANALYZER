@@ -90,19 +90,17 @@ def rolling(index_name, level, side, start, end):
                 vals = leg.get(name) or []
                 return vals[i] if i < len(vals) else None
 
-            rows.append(
-                {
-                    "date": ts.date(),
-                    "index": index_name,
-                    "level": "ATM" if level == 0 else f"ATM{level:+d}",
-                    "side": side,
-                    "strike": value("strike"),
-                    "spot": value("spot"),
-                    "iv": value("iv"),
-                    "oi": value("oi"),
-                    "close": value("close"),
-                }
-            )
+            rows.append({
+                "date": ts.date(),
+                "index": index_name,
+                "level": "ATM" if level == 0 else f"ATM{level:+d}",
+                "side": side,
+                "strike": value("strike"),
+                "spot": value("spot"),
+                "iv": value("iv"),
+                "oi": value("oi"),
+                "close": value("close"),
+            })
     return rows
 
 
@@ -139,8 +137,7 @@ def fetch_monitor_data():
                 done += 1
                 progress.progress(done / total)
 
-    data = safe_df(all_rows)
-    return data, errors
+    return safe_df(all_rows), errors
 
 
 def render_results(data, errors):
@@ -191,11 +188,27 @@ if st.button("FETCH LAST 30 DAYS", type="primary", use_container_width=True):
 
 cached = st.session_state.get(cached_key)
 cached_errors = st.session_state.get(error_key, [])
-if cached is not None and not cached.empty:
-    render_results(cached, cached_errors)
-else:
-    st.info("Click FETCH LAST 30 DAYS to load the historical monitor.")
 
-if auto_refresh and cached is not None:
-    st.caption("Auto-refresh: ON • next refresh in 1 minute")
-    st.rerun()
+@st.fragment(run_every="60s")
+def auto_refresh_panel():
+    data, errors = fetch_monitor_data()
+    if not data.empty:
+        st.session_state[cached_key] = data
+        st.session_state[error_key] = errors
+        render_results(data, errors)
+    elif cached is not None and not cached.empty:
+        render_results(cached, cached_errors)
+    else:
+        st.info("Click FETCH LAST 30 DAYS to load the historical monitor.")
+
+if cached is not None and not cached.empty:
+    if auto_refresh:
+        auto_refresh_panel()
+    else:
+        render_results(cached, cached_errors)
+else:
+    if auto_refresh:
+        auto_refresh_panel()
+    else:
+        st.info("Click FETCH LAST 30 DAYS to load the historical monitor.")
+        
