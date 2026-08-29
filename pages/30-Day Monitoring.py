@@ -7,7 +7,6 @@ import streamlit as st
 
 API = "https://api.dhan.co/v2"
 IST = ZoneInfo("Asia/Kolkata")
-DHAN_EPOCH = datetime(1980, 1, 1, 5, 30, tzinfo=IST)
 
 INDEXES = {
     "NIFTY": {"security_id": 13, "segment": "NSE_FNO"},
@@ -34,36 +33,58 @@ if not client_id or not access_token:
     st.stop()
 
 
-def dhan_timestamp(value):
-    """Convert the historical API's custom epoch timestamp to IST."""
-    try:
-        return DHAN_EPOCH + timedelta(seconds=int(value))
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-
 def post(path: str, payload: dict) -> dict:
+    """POST to the data API, with a narrow compatibility retry for expiryCode=0."""
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "access-token": access_token,
+        "client-id": client_id,
+    }
     try:
-        response = requests.post(
-            API + path,
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "access-token": access_token,
-                "client-id": client_id,
-            },
-            json=payload,
-            timeout=90,
-        )
+        response = requests.post(API + path, headers=headers, json=payload, timeout=90)
     except requests.RequestException as exc:
         raise RuntimeError(f"Network error: {exc}") from exc
 
     if response.status_code >= 400:
-        raise RuntimeError(f"API error {response.status_code}: {response.text[:500]}")
+        error_text = response.text[:1000]
+        # Some API gateway/backend versions incorrectly treat numeric 0 as missing.
+        if (
+            path == "/charts/rollingoption"
+            and payload.get("expiryCode") == 0
+            and "expiryCode is required" in error_text
+        ):
+            retry_payload = dict(payload)
+            retry_payload["expiryCode"] = "0"
+            try:
+                response = requests.post(
+                    API + path,
+                    headers=headers,
+                    json=retry_payload,
+                    timeout=90,
+                )
+            except requests.RequestException as exc:
+                raise RuntimeError(f"Network error on expiryCode retry: {exc}") from exc
+            if response.status_code < 400:
+                try:
+                    return response.json()
+                except ValueError as exc:
+                    raise RuntimeError("API returned invalid JSON after expiryCode retry.") from exc
+            error_text = response.text[:1000]
+        raise RuntimeError(f"API error {response.status_code}: {error_text}")
+
     try:
         return response.json()
     except ValueError as exc:
         raise RuntimeError("API returned invalid JSON.") from exc
+
+
+def historical_timestamp(value):
+    """Rolling-options timestamps are standard Unix epoch seconds, converted to IST."""
+    try:
+        return datetime.fromtimestamp(int(value), IST)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
 
 
 def rolling(index_name: str, level: int, side: str, start, end):
@@ -93,7 +114,7 @@ def rolling(index_name: str, level: int, side: str, start, end):
     rows = []
 
     for i, stamp in enumerate(timestamps):
-        ts = dhan_timestamp(stamp)
+        ts = historical_timestamp(stamp)
         if ts is None or ts.date() < start or ts.date() > end:
             continue
         if ts.hour != 10 or ts.minute not in (0, 1):
@@ -185,10 +206,7 @@ def fetch_monitor_data():
 
 
 def render_results(data, errors, diagnostics, fetched_at):
-    st.success(
-        f"Loaded {len(data):,} 10:00 observations • "
-        f"Last update: {fetched_at.strftime('%H:%M:%S IST')}"
-    )
+    st.success(f"Loaded {len(data):,} 10:00 observations • Last update: {fetched_at.strftime('%H:%M:%S IST')}")
 
     st.subheader("10:00 ATM IV Trend")
     atm = data[data["Level"] == "ATM"].copy()
