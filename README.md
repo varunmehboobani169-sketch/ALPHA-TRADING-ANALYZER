@@ -1,30 +1,31 @@
-# Dhan Options Data Downloader
+# Dhan NSE / BSE Options Data Downloader
 
-A dedicated Streamlit dashboard for downloading year-wise NSE/BSE options data from DhanHQ v2.
+The repository's default Streamlit application is a dedicated DhanHQ v2 historical options-data downloader.
 
-## What it downloads
+## Data coverage
 - NSE and BSE index options: ATM-10 through ATM+10.
-- NSE and BSE F&O stocks: ATM-3 through ATM+3, matching Dhan's documented rolling expired-options limit for non-index contracts.
+- NSE and BSE F&O stock options: ATM-3 through ATM+3, matching Dhan's documented rolling-options range for non-index contracts.
 - CE and PE legs.
-- 1-minute OHLC, IV, volume, OI, actual strike, underlying spot, requested ATM-relative strike, expiry flag/code and timestamps.
-- One CSV per calendar year inside a ZIP package.
+- 1-minute OHLC, IV, volume, OI, actual strike, underlying spot, requested ATM-relative strike, expiry metadata and timestamps.
+- One CSV per calendar year inside a downloadable ZIP.
 
-## Important Dhan limits
-Dhan's `/charts/rollingoption` API supports historical expired options on a rolling basis for up to five years and accepts at most 30 days in one request. Index options support ATM±10; other contracts support ATM±3. The app therefore splits every selected year into 30-day requests and assembles the result by year.
+## Year-wise downloads
+Enter years such as `2022-2026`, `2024,2025`, or a single year. Each selected calendar year is exported separately inside the final ZIP.
+
+The downloader automatically splits historical requests into 30-day windows to stay within the Dhan rolling-options request limit.
 
 ## Universe discovery
-The app downloads Dhan's detailed instrument master and builds the underlying universe from option contracts, preserving exchange, segment, underlying security ID, symbol, instrument family, expiry information and contract counts.
+The app downloads Dhan's detailed instrument master and builds the option-underlying universe from the master itself, preserving exchange, segment, underlying security ID, symbol, instrument family, expiry information and contract counts.
 
 ## Authentication
-Enter the Dhan Client ID and Access Token in the Streamlit sidebar. Credentials are held only in the app session and are never written to the repository. Dhan documents access tokens and API-key based authentication separately; use the current token/authentication method available for your account.
+Enter the Dhan Client ID and Access Token in the sidebar. Credentials remain in the Streamlit session and are not written to the repository.
 
 ## Run
 ```bash
 pip install -r requirements.txt
-streamlit run app_new.py
+streamlit run app.py
 ```
 
-See the DhanHQ v2 documentation for the authoritative API contract:
-https://dhanhq.co/docs/v2/
+`app.py` is the only Streamlit application entry point in the current repository. The legacy FRIDAY/Vega application and its multipage files/workflows have been removed from the current repository tree.
 
-The current app is intentionally focused on data acquisition. Strategy research, ML, backtesting and the previous FRIDAY dashboard have been removed from the active data-downloader workflow.
+Authoritative API reference: https://dhanhq.co/docs/v2/
