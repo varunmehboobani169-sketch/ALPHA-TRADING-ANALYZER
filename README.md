@@ -1,32 +1,30 @@
-# FRIDAY — Autonomous Market Research Engine
+# Dhan Options Data Downloader
 
-FRIDAY is rebuilt from scratch around the agreed research specification.
+A dedicated Streamlit dashboard for downloading year-wise NSE/BSE options data from DhanHQ v2.
 
-## Research inputs
-- NIFTY Options: 1-minute rolling expired-option surface, ATM-10 to ATM+10, CE/PE, OHLC, IV, OI, volume and option-source spot.
-- NIFTY Spot: 15-minute OHLC/close.
-- India VIX: 15-minute OHLC/close.
+## What it downloads
+- NSE and BSE index options: ATM-10 through ATM+10.
+- NSE and BSE F&O stocks: ATM-3 through ATM+3, matching Dhan's documented rolling expired-options limit for non-index contracts.
+- CE and PE legs.
+- 1-minute OHLC, IV, volume, OI, actual strike, underlying spot, requested ATM-relative strike, expiry flag/code and timestamps.
+- One CSV per calendar year inside a ZIP package.
 
-## Research pipeline
-Raw audit → full option-surface feature factory → fruitfulness discovery → adaptive interactions → machine learning → holdout validation → downloadable research package.
+## Important Dhan limits
+Dhan's `/charts/rollingoption` API supports historical expired options on a rolling basis for up to five years and accepts at most 30 days in one request. Index options support ATM±10; other contracts support ATM±3. The app therefore splits every selected year into 30-day requests and assembles the result by year.
 
-The discovery stage uses only the chronological discovery segment. Validation and final-test segments stay untouched until after candidate selection, reducing look-ahead and selection leakage.
+## Universe discovery
+The app downloads Dhan's detailed instrument master and builds the underlying universe from option contracts, preserving exchange, segment, underlying security ID, symbol, instrument family, expiry information and contract counts.
 
-The system preserves Dhan rolling-option `expiry_flag` and `expiry_code` metadata. The supplied rolling sample does not contain an historical expiry-date field, so FRIDAY does not invent one.
+## Authentication
+Enter the Dhan Client ID and Access Token in the Streamlit sidebar. Credentials are held only in the app session and are never written to the repository. Dhan documents access tokens and API-key based authentication separately; use the current token/authentication method available for your account.
 
-## Outputs
-Each selected quarter produces:
-- REPORT.md
-- audit.csv
-- features.csv
-- discovery.csv
-- interactions.csv
-- validation.csv
-- ml.csv
-- combined ZIP package
+## Run
+```bash
+pip install -r requirements.txt
+streamlit run app_new.py
+```
 
-The current design is the foundation for later adversarial validation, research memory and the AI research-analyst layer.
+See the DhanHQ v2 documentation for the authoritative API contract:
+https://dhanhq.co/docs/v2/
 
-## Maintenance
-- ndarray conversions are normalized through NumPy arrays before statistical/ML operations.
-- GitHub Actions performs a Python syntax check and scans for unsafe ndarray `.to_numpy()` patterns on every main-branch push.
+The current app is intentionally focused on data acquisition. Strategy research, ML, backtesting and the previous FRIDAY dashboard have been removed from the active data-downloader workflow.
