@@ -34,7 +34,6 @@ if not client_id or not access_token:
 
 
 def post(path: str, payload: dict) -> dict:
-    """POST to the data API, with a narrow compatibility retry for expiryCode=0."""
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -48,7 +47,6 @@ def post(path: str, payload: dict) -> dict:
 
     if response.status_code >= 400:
         error_text = response.text[:1000]
-        # Some API gateway/backend versions incorrectly treat numeric 0 as missing.
         if (
             path == "/charts/rollingoption"
             and payload.get("expiryCode") == 0
@@ -57,20 +55,20 @@ def post(path: str, payload: dict) -> dict:
             retry_payload = dict(payload)
             retry_payload["expiryCode"] = "0"
             try:
-                response = requests.post(
+                retry_response = requests.post(
                     API + path,
                     headers=headers,
                     json=retry_payload,
                     timeout=90,
                 )
             except requests.RequestException as exc:
-                raise RuntimeError(f"Network error on expiryCode retry: {exc}") from exc
-            if response.status_code < 400:
+                raise RuntimeError(f"Network error during expiryCode retry: {exc}") from exc
+            if retry_response.status_code < 400:
                 try:
-                    return response.json()
+                    return retry_response.json()
                 except ValueError as exc:
                     raise RuntimeError("API returned invalid JSON after expiryCode retry.") from exc
-            error_text = response.text[:1000]
+            error_text = retry_response.text[:1000]
         raise RuntimeError(f"API error {response.status_code}: {error_text}")
 
     try:
