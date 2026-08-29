@@ -9,15 +9,17 @@ import streamlit as st
 
 DHAN_API = "https://api.dhan.co/v2"
 MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
-
-# Dhan v2 Data APIs: 5 requests/sec and 100,000/day.
-# Keep application traffic below the hard limit and back off on 805/429/904.
+TARGET_INDEXES = {
+    "BANKNIFTY": {"BANKNIFTY", "NIFTY BANK"},
+    "FINNIFTY": {"FINNIFTY", "NIFTY FIN SERVICE", "NIFTY FINANCIAL SERVICES"},
+    "SENSEX": {"SENSEX", "BSE SENSEX"},
+}
 SAFE_RPS = 4.0
 MIN_INTERVAL = 1.0 / SAFE_RPS
 MAX_RETRIES = 7
 DAILY_REQUEST_BUDGET = 95000
 
-st.set_page_config(page_title="Dhan Options Data Downloader", page_icon="📥", layout="wide")
+st.set_page_config(page_title="Dhan Index Options Data Downloader", page_icon="📥", layout="wide")
 
 
 def col(df, *names):
@@ -55,17 +57,26 @@ def build_universe(d):
     x["exchange_segment"] = ""
     x.loc[(x.exchange == "NSE") & (x.segment == "D"), "exchange_segment"] = "NSE_FNO"
     x.loc[(x.exchange == "BSE") & (x.segment == "D"), "exchange_segment"] = "BSE_FNO"
-    x = x[x.instrument.isin(["OPTIDX", "OPTSTK"])]
+    x = x[x.instrument.eq("OPTIDX")]
     x = x[x.exchange_segment.isin(["NSE_FNO", "BSE_FNO"])]
     x = x.dropna(subset=["underlying_security_id"])
-    x["family"] = x.instrument.map({"OPTIDX": "INDEX", "OPTSTK": "STOCK"})
+    x["family"] = "INDEX"
     return x
+
+
+def filter_target_indexes(x):
+    norm = x["underlying_symbol"].str.upper().str.strip()
+    mask = pd.Series(False, index=x.index)
+    for names in TARGET_INDEXES.values():
+        for name in names:
+            mask |= norm.eq(name)
+    return x.loc[mask].copy()
 
 
 def get_underlyings(x):
     return (x.groupby(["exchange", "exchange_segment", "underlying_security_id", "underlying_symbol", "family"], dropna=False)
         .agg(first_expiry=("expiry_date", "min"), last_expiry=("expiry_date", "max"), contracts=("security_id", "count"))
-        .reset_index().sort_values(["exchange", "family", "underlying_symbol"]))
+        .reset_index().sort_values(["exchange", "underlying_symbol"]))
 
 
 def years(text):
@@ -113,6 +124,10 @@ RATE_LIMITER = DhanRateLimiter()
 def post(client, token, payload):
     delay = 1.0
     for attempt in range(MAX_RETRIES + 1):
+        if RATE_LIMITER.total_requests >= DAILY_REQUEST_BUDGET:
+            raise RuntimeError(
+                f"Daily downloader safety budget reached at {DAILY_REQUEST_BUDGET:,} API requests."
+            )
         RATE_LIMITER.wait()
         try:
             r = requests.post(
@@ -153,13 +168,12 @@ def post(client, token, payload):
 
 def fetch_one(client, token, row, year, offset, side, expiry_flag, expiry_code):
     frames = []
-    instrument = "OPTIDX" if row.family == "INDEX" else "OPTSTK"
     for a, b in windows(year):
         payload = {
             "exchangeSegment": row.exchange_segment,
             "interval": "1",
             "securityId": str(int(row.underlying_security_id)),
-            "instrument": instrument,
+            "instrument": "OPTIDX",
             "expiryFlag": expiry_flag,
             "expiryCode": int(expiry_code),
             "strike": offset,
@@ -188,7 +202,7 @@ def fetch_one(client, token, row, year, offset, side, expiry_flag, expiry_code):
         f["underlying_symbol"] = row.underlying_symbol
         f["underlying_security_id"] = int(row.underlying_security_id)
         f["exchange_segment"] = row.exchange_segment
-        f["family"] = row.family
+        f["family"] = "INDEX"
         f["option_type"] = side
         f["requested_strike"] = offset
         f["expiry_flag"] = expiry_flag
@@ -206,8 +220,8 @@ def zip_by_year(df):
     return b.getvalue()
 
 
-st.title("📥 Dhan NSE / BSE Options Data Downloader")
-st.caption("Dedicated data-download dashboard • no trading analytics")
+st.title("📥 Dhan Index Options Data Downloader")
+st.caption("Current scope: BANKNIFTY + FINNIFTY + SENSEX • ATM−10 … ATM+10 • CE + PE")
 
 with st.sidebar:
     st.header("Dhan Connection")
@@ -215,26 +229,27 @@ with st.sidebar:
     token = st.text_input("Dhan Access Token", type="password")
     st.divider()
     years_text = st.text_input("Years", "2022-2026")
-    stock_mode = st.selectbox("F&O stock strikes", ["ATM-3 to ATM+3", "ATM only"])
     expiry_codes = st.multiselect("Expiry codes", [0, 1, 2], default=[0, 1, 2])
-    st.number_input("Safety rate limit (requests/sec)", 1.0, 4.0, 4.0, 0.5, disabled=True)
+    st.caption("Index strikes are fixed at 21 levels: ATM−10 through ATM+10.")
+    st.caption("Requests are paced below Dhan's published 5 requests/sec Data API limit.")
 
-st.info("Index options: ATM-10 to ATM+10 (21 strikes). Stock F&O: ATM-3 to ATM+3 because that is the documented rolling-option range for non-index contracts.")
-st.warning("Built-in protection: maximum 4 requests/sec, exponential backoff on Dhan rate-limit responses, and a 95,000-request safety ceiling for a single run.")
+st.info("Only these three indexes are enabled right now: BANKNIFTY, FINNIFTY and SENSEX. Each download requests 21 ATM-relative strikes (−10 to +10) for both CALL and PUT.")
+st.warning("Built-in protection: 4 requests/sec application cap, exponential backoff for rate-limit errors, and a 95,000-request safety ceiling.")
 
 if not client or not token:
     st.warning("Enter Dhan Client ID and Access Token in the sidebar.")
     st.stop()
 
-if st.button("LOAD NSE + BSE F&O UNIVERSE", type="primary"):
+if st.button("LOAD BANKNIFTY + FINNIFTY + SENSEX", type="primary"):
     try:
         with st.spinner("Loading Dhan instrument master..."):
             raw = load_master()
-            u = build_universe(raw)
+            u = filter_target_indexes(build_universe(raw))
             st.session_state["contracts"] = u
             st.session_state["underlyings"] = get_underlyings(u)
-        st.success(f"Loaded {len(st.session_state['underlyings']):,} option underlyings.")
-        st.caption(f"Master rows: {len(raw):,} | option contracts: {len(u):,} | segments: {sorted(u.exchange_segment.unique())}")
+        found = sorted(st.session_state["underlyings"].underlying_symbol.unique())
+        st.success(f"Loaded {len(found):,} requested indexes: {', '.join(found)}")
+        st.caption(f"Master rows: {len(raw):,} | matching index-option contracts: {len(u):,} | segments: {sorted(u.exchange_segment.unique())}")
     except Exception as e:
         st.error(str(e))
 
@@ -242,57 +257,57 @@ u = st.session_state.get("underlyings", pd.DataFrame())
 if u.empty:
     st.stop()
 
-c1, c2 = st.columns(2)
-with c1:
-    ex = st.multiselect("Exchange", sorted(u.exchange.unique()), default=sorted(u.exchange.unique()))
-with c2:
-    fam = st.multiselect("Type", ["INDEX", "STOCK"], default=["INDEX", "STOCK"])
-f = u[u.exchange.isin(ex) & u.family.isin(fam)].copy()
+st.subheader("Requested index universe")
+st.dataframe(u, use_container_width=True, height=240)
 
-st.subheader("Available underlyings")
-st.dataframe(f, use_container_width=True, height=380)
-
-symbols = st.multiselect("Select underlyings", sorted(f.underlying_symbol.unique()), default=sorted(f.underlying_symbol.unique())[:5])
-selected = f[f.underlying_symbol.isin(symbols)]
+available = sorted(u.underlying_symbol.unique())
+default_selected = [name for name in available if any(name.upper() in names for names in TARGET_INDEXES.values())]
+selected_symbols = st.multiselect("Indexes", available, default=default_selected)
+selected = u[u.underlying_symbol.isin(selected_symbols)].copy()
 st.metric("Selected", len(selected))
 
 if st.button("DOWNLOAD YEAR-WISE DATA", type="primary", use_container_width=True):
     ys = years(years_text)
     if not ys or not expiry_codes or selected.empty:
-        st.error("Select valid years, expiry codes and at least one underlying.")
+        st.error("Select valid years, expiry codes and at least one index.")
         st.stop()
 
     idx_offsets = [f"ATM{n:+d}" if n else "ATM" for n in range(-10, 11)]
-    stk_offsets = [f"ATM{n:+d}" if n else "ATM" for n in (range(-3, 4) if stock_mode.startswith("ATM-3") else [0])]
     jobs = []
     for _, r in selected.iterrows():
-        offs = idx_offsets if r.family == "INDEX" else stk_offsets
-        flags = ["WEEK", "MONTH"] if r.family == "INDEX" else ["MONTH"]
         for y in ys:
-            for ef in flags:
+            for ef in ["WEEK", "MONTH"]:
                 for ec in expiry_codes:
-                    for off in offs:
+                    for off in idx_offsets:
                         for side in ["CALL", "PUT"]:
                             jobs.append((r, y, off, side, ef, ec))
 
-    if len(jobs) > DAILY_REQUEST_BUDGET:
-        st.error(f"This selection would schedule {len(jobs):,} request groups, above the safety ceiling of {DAILY_REQUEST_BUDGET:,}. Reduce years, underlyings or expiry codes.")
+    total_windows_per_job = len(windows(ys[0])) if ys else 0
+    estimated_requests = sum(len(windows(y)) for y in ys) * len(selected) * 2 * len(expiry_codes) * 21 * 1 * 2
+    if estimated_requests > DAILY_REQUEST_BUDGET:
+        st.error(
+            f"This selection is estimated at about {estimated_requests:,} API requests, above the 95,000-request safety ceiling. "
+            "Reduce years or expiry codes for this run."
+        )
         st.stop()
 
-    st.caption(f"Total request groups: {len(jobs):,}. Each group is split into 30-day historical windows. API traffic is paced below Dhan's 5 requests/sec Data API ceiling.")
+    st.caption(f"Estimated API requests: ~{estimated_requests:,}. Each request covers one 30-day historical window.")
     prog = st.progress(0.0)
     status = st.empty()
     frames, errors = [], []
+    total_jobs = len(jobs)
 
     for i, (r, y, off, side, ef, ec) in enumerate(jobs, 1):
-        status.write(f"{r.underlying_symbol} | {y} | {ef} {ec} | {off} | {side} | API requests: {RATE_LIMITER.total_requests}")
+        status.write(f"{r.underlying_symbol} | {r.exchange_segment} | {y} | {ef} {ec} | {off} | {side} | API calls: {RATE_LIMITER.total_requests}")
         try:
             z = fetch_one(client, token, r, y, off, side, ef, ec)
             if not z.empty:
                 frames.append(z)
         except Exception as e:
             errors.append({"underlying": r.underlying_symbol, "year": y, "expiry_flag": ef, "expiry_code": ec, "strike": off, "side": side, "error": str(e)})
-        prog.progress(i / len(jobs))
+            if "Daily downloader safety budget reached" in str(e):
+                break
+        prog.progress(i / total_jobs)
 
     if not frames:
         st.error("No data returned. Check Dhan API/data subscription, token validity, date range and expiry parameters.")
@@ -301,7 +316,7 @@ if st.button("DOWNLOAD YEAR-WISE DATA", type="primary", use_container_width=True
     else:
         data = pd.concat(frames, ignore_index=True).drop_duplicates()
         st.success(f"Downloaded {len(data):,} rows across {data.year.nunique()} year(s). API requests sent: {RATE_LIMITER.total_requests:,}.")
-        st.download_button("DOWNLOAD YEAR-WISE ZIP", zip_by_year(data), "dhan_options_yearwise.zip", "application/zip", use_container_width=True)
+        st.download_button("DOWNLOAD YEAR-WISE ZIP", zip_by_year(data), "banknifty_finnifty_sensex_yearwise.zip", "application/zip", use_container_width=True)
         if errors:
-            st.warning(f"{len(errors):,} request groups failed after controlled retries.")
+            st.warning(f"{len(errors):,} request groups had errors or were stopped by the safety budget.")
             st.dataframe(pd.DataFrame(errors), use_container_width=True)
