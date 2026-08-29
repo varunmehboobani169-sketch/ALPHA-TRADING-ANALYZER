@@ -24,7 +24,13 @@ with st.sidebar:
     client_id = st.text_input("Client ID", key="history_client_id")
     access_token = st.text_input("Access Token", type="password", key="history_access_token")
     expiry_flag = st.selectbox("Expiry series", ["WEEK", "MONTH"], index=0, key="history_expiry_flag")
-    expiry_code = st.selectbox("Expiry code", [0, 1, 2], index=0, key="history_expiry_code")
+    expiry_code = st.selectbox(
+        "Expiry code",
+        [1, 2, 3],
+        index=0,
+        help="For expired-options history: 1 = near/current, 2 = next, 3 = far.",
+        key="history_expiry_code",
+    )
     days = st.slider("Lookback", 7, 30, 30, key="history_days")
     auto_refresh = st.checkbox("Auto-refresh every 1 minute", value=True, key="history_auto_refresh")
 
@@ -44,33 +50,8 @@ def post(path: str, payload: dict) -> dict:
         response = requests.post(API + path, headers=headers, json=payload, timeout=90)
     except requests.RequestException as exc:
         raise RuntimeError(f"Network error: {exc}") from exc
-
     if response.status_code >= 400:
-        error_text = response.text[:1000]
-        if (
-            path == "/charts/rollingoption"
-            and payload.get("expiryCode") == 0
-            and "expiryCode is required" in error_text
-        ):
-            retry_payload = dict(payload)
-            retry_payload["expiryCode"] = "0"
-            try:
-                retry_response = requests.post(
-                    API + path,
-                    headers=headers,
-                    json=retry_payload,
-                    timeout=90,
-                )
-            except requests.RequestException as exc:
-                raise RuntimeError(f"Network error during expiryCode retry: {exc}") from exc
-            if retry_response.status_code < 400:
-                try:
-                    return retry_response.json()
-                except ValueError as exc:
-                    raise RuntimeError("API returned invalid JSON after expiryCode retry.") from exc
-            error_text = retry_response.text[:1000]
-        raise RuntimeError(f"API error {response.status_code}: {error_text}")
-
+        raise RuntimeError(f"API error {response.status_code}: {response.text[:1000]}")
     try:
         return response.json()
     except ValueError as exc:
@@ -78,7 +59,6 @@ def post(path: str, payload: dict) -> dict:
 
 
 def historical_timestamp(value):
-    """Rolling-options timestamps are standard Unix epoch seconds, converted to IST."""
     try:
         return datetime.fromtimestamp(int(value), IST)
     except (TypeError, ValueError, OverflowError, OSError):
@@ -96,10 +76,14 @@ def rolling(index_name: str, level: int, side: str, start, end):
             "securityId": str(spec["security_id"]),
             "instrument": "OPTIDX",
             "expiryFlag": expiry_flag,
+            # This endpoint currently requires 1/2/3 for near/next/far expiry.
             "expiryCode": int(expiry_code),
             "strike": "ATM" if level == 0 else f"ATM{level:+d}",
             "drvOptionType": api_side,
-            "requiredData": ["open", "high", "low", "close", "iv", "volume", "strike", "oi", "spot"],
+            "requiredData": [
+                "open", "high", "low", "close", "iv", "volume",
+                "strike", "oi", "spot",
+            ],
             "fromDate": start.isoformat(),
             "toDate": (end + timedelta(days=1)).isoformat(),
         },
@@ -117,7 +101,6 @@ def rolling(index_name: str, level: int, side: str, start, end):
             continue
         if ts.hour != 10 or ts.minute not in (0, 1):
             continue
-
         rows.append(
             {
                 "Date": ts.date(),
@@ -140,7 +123,6 @@ def safe_df(rows):
     columns = ["Date", "Time", "Index", "Level", "Side", "Strike", "Spot", "IV", "OI", "Close"]
     if not rows:
         return pd.DataFrame(columns=columns)
-
     frame = pd.DataFrame(rows)
     frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce").dt.date
     for col in ("Strike", "Spot", "IV", "OI", "Close"):
@@ -159,7 +141,6 @@ def fetch_monitor_data():
     rows = []
     diagnostics = []
     errors = []
-
     total = len(INDEXES) * len(LEVELS) * 2
     done = 0
     progress = st.progress(0.0)
@@ -173,28 +154,24 @@ def fetch_monitor_data():
                 try:
                     chunk, raw_bars = rolling(index_name, level, side, start, today)
                     rows.extend(chunk)
-                    diagnostics.append(
-                        {
-                            "Index": index_name,
-                            "Level": label,
-                            "Side": side,
-                            "Raw minute bars": raw_bars,
-                            "10:00 observations": len(chunk),
-                            "Status": "OK" if chunk else "NO 10:00 BAR",
-                        }
-                    )
+                    diagnostics.append({
+                        "Index": index_name,
+                        "Level": label,
+                        "Side": side,
+                        "Raw minute bars": raw_bars,
+                        "10:00 observations": len(chunk),
+                        "Status": "OK" if chunk else "NO 10:00 BAR",
+                    })
                 except Exception as exc:
                     errors.append(f"{index_name} {label} {side}: {exc}")
-                    diagnostics.append(
-                        {
-                            "Index": index_name,
-                            "Level": label,
-                            "Side": side,
-                            "Raw minute bars": 0,
-                            "10:00 observations": 0,
-                            "Status": f"ERROR: {exc}",
-                        }
-                    )
+                    diagnostics.append({
+                        "Index": index_name,
+                        "Level": label,
+                        "Side": side,
+                        "Raw minute bars": 0,
+                        "10:00 observations": 0,
+                        "Status": f"ERROR: {exc}",
+                    })
                 done += 1
                 progress.progress(done / total)
 
@@ -204,7 +181,10 @@ def fetch_monitor_data():
 
 
 def render_results(data, errors, diagnostics, fetched_at):
-    st.success(f"Loaded {len(data):,} 10:00 observations • Last update: {fetched_at.strftime('%H:%M:%S IST')}")
+    st.success(
+        f"Loaded {len(data):,} 10:00 observations • "
+        f"Last update: {fetched_at.strftime('%H:%M:%S IST')}"
+    )
 
     st.subheader("10:00 ATM IV Trend")
     atm = data[data["Level"] == "ATM"].copy()
@@ -215,7 +195,9 @@ def render_results(data, errors, diagnostics, fetched_at):
     st.subheader("ATM ±2 OI Monitoring")
     oi = data.copy()
     oi["OI"] = pd.to_numeric(oi["OI"], errors="coerce")
-    oi["OI Change vs Previous Day"] = oi.sort_values("Date").groupby(["Index", "Level", "Side"])["OI"].diff()
+    oi["OI Change vs Previous Day"] = oi.sort_values("Date").groupby(
+        ["Index", "Level", "Side"]
+    )["OI"].diff()
     st.dataframe(
         oi[["Date", "Index", "Level", "Strike", "Side", "OI", "OI Change vs Previous Day"]],
         use_container_width=True,
