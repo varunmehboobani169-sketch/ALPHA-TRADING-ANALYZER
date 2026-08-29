@@ -10,7 +10,7 @@ INDEXES = {
     "SENSEX": {"security_id": 51, "segment": "BSE_FNO"},
 }
 LEVELS = [-2, -1, 0, 1, 2]
-AUTO_REFRESH_SECONDS = 60
+REFRESH_SECONDS = 60
 
 st.set_page_config(page_title="30-Day Monitoring", page_icon="📈", layout="wide")
 
@@ -78,29 +78,27 @@ def rolling(index_name, level, side, start, end):
         )
         leg = ((body.get("data") or {}).get("ce" if side == "CE" else "pe") or {})
         stamps = leg.get("timestamp") or []
+        values = {name: (leg.get(name) or []) for name in ("strike", "spot", "iv", "oi", "close")}
         for i, stamp in enumerate(stamps):
             try:
                 ts = pd.to_datetime(int(stamp), unit="s", utc=True).tz_convert("Asia/Kolkata").tz_localize(None)
             except Exception:
                 continue
-            if ts.time().hour != 10 or ts.time().minute != 0:
+            if ts.hour != 10 or ts.minute != 0:
                 continue
-
-            def value(name):
-                vals = leg.get(name) or []
-                return vals[i] if i < len(vals) else None
-
-            rows.append({
-                "date": ts.date(),
-                "index": index_name,
-                "level": "ATM" if level == 0 else f"ATM{level:+d}",
-                "side": side,
-                "strike": value("strike"),
-                "spot": value("spot"),
-                "iv": value("iv"),
-                "oi": value("oi"),
-                "close": value("close"),
-            })
+            rows.append(
+                {
+                    "date": ts.date(),
+                    "index": index_name,
+                    "level": "ATM" if level == 0 else f"ATM{level:+d}",
+                    "side": side,
+                    "strike": values["strike"][i] if i < len(values["strike"]) else None,
+                    "spot": values["spot"][i] if i < len(values["spot"]) else None,
+                    "iv": values["iv"][i] if i < len(values["iv"]) else None,
+                    "oi": values["oi"][i] if i < len(values["oi"]) else None,
+                    "close": values["close"][i] if i < len(values["close"]) else None,
+                }
+            )
     return rows
 
 
@@ -123,9 +121,9 @@ def fetch_monitor_data():
     start = today - timedelta(days=days - 1)
     all_rows = []
     errors = []
-    progress = st.progress(0.0)
     total = len(INDEXES) * len(LEVELS) * 2
     done = 0
+    progress = st.progress(0.0)
 
     for index_name in INDEXES:
         for level in LEVELS:
@@ -140,11 +138,11 @@ def fetch_monitor_data():
     return safe_df(all_rows), errors
 
 
-def render_results(data, errors):
-    st.success(f"Loaded {len(data):,} 10:00 observations. Last update: {datetime.now().strftime('%H:%M:%S')}")
+def render_results(data, errors, fetched_at):
+    st.success(f"Loaded {len(data):,} observations • Last update: {fetched_at.strftime('%H:%M:%S')}")
 
     st.subheader("ATM IV trend")
-    atm = data[data["level"] == "ATM"].copy()
+    atm = data[data["level"] == "ATM"]
     if not atm.empty:
         pivot = atm.pivot_table(index="date", columns=["index", "side"], values="iv", aggfunc="last")
         st.line_chart(pivot)
@@ -154,9 +152,8 @@ def render_results(data, errors):
     st.dataframe(oi, use_container_width=True, hide_index=True)
 
     st.subheader("Daily IV comparison")
-    iv = data.copy()
+    iv = data.copy().sort_values("date")
     iv["IV"] = pd.to_numeric(iv["iv"], errors="coerce")
-    iv = iv.sort_values("date")
     iv["IV Change vs Prior Observation"] = iv.groupby(["index", "level", "side"])["IV"].diff()
     st.dataframe(
         iv[["date", "index", "level", "side", "strike", "spot", "IV", "IV Change vs Prior Observation", "oi"]],
@@ -178,37 +175,45 @@ def render_results(data, errors):
     )
 
 
-cached_key = "iv_monitor_30d_data"
-error_key = "iv_monitor_30d_errors"
+DATA_KEY = "iv_monitor_30d_data"
+ERROR_KEY = "iv_monitor_30d_errors"
+TIME_KEY = "iv_monitor_30d_fetched_at"
+PARAM_KEY = "iv_monitor_30d_params"
 
-if st.button("FETCH LAST 30 DAYS", type="primary", use_container_width=True):
+current_params = (expiry_flag, int(expiry_code), int(days), client_id)
+
+# The fetch button loads and persists the full table in session state.
+fetch_clicked = st.button("FETCH / REFRESH LAST 30 DAYS", type="primary", use_container_width=True)
+if fetch_clicked or st.session_state.get(PARAM_KEY) != current_params:
     data, errors = fetch_monitor_data()
-    st.session_state[cached_key] = data
-    st.session_state[error_key] = errors
+    st.session_state[DATA_KEY] = data
+    st.session_state[ERROR_KEY] = errors
+    st.session_state[TIME_KEY] = datetime.now()
+    st.session_state[PARAM_KEY] = current_params
 
-cached = st.session_state.get(cached_key)
-cached_errors = st.session_state.get(error_key, [])
 
 @st.fragment(run_every="60s")
-def auto_refresh_panel():
-    data, errors = fetch_monitor_data()
-    if not data.empty:
-        st.session_state[cached_key] = data
-        st.session_state[error_key] = errors
-        render_results(data, errors)
-    elif cached is not None and not cached.empty:
-        render_results(cached, cached_errors)
-    else:
-        st.info("Click FETCH LAST 30 DAYS to load the historical monitor.")
+def monitoring_view():
+    data = st.session_state.get(DATA_KEY)
+    errors = st.session_state.get(ERROR_KEY, [])
+    fetched_at = st.session_state.get(TIME_KEY)
 
-if cached is not None and not cached.empty:
+    if data is None or data.empty:
+        st.info("Click FETCH / REFRESH LAST 30 DAYS to load the historical monitor.")
+        return
+
+    render_results(data, errors, fetched_at or datetime.now())
+
     if auto_refresh:
-        auto_refresh_panel()
+        # Refresh only this panel; the fetched table remains in session state.
+        fresh_data, fresh_errors = fetch_monitor_data()
+        if not fresh_data.empty:
+            st.session_state[DATA_KEY] = fresh_data
+            st.session_state[ERROR_KEY] = fresh_errors
+            st.session_state[TIME_KEY] = datetime.now()
+        st.caption("Auto-refresh: ON • data refreshes every 1 minute")
     else:
-        render_results(cached, cached_errors)
-else:
-    if auto_refresh:
-        auto_refresh_panel()
-    else:
-        st.info("Click FETCH LAST 30 DAYS to load the historical monitor.")
-        
+        st.caption("Auto-refresh: OFF")
+
+
+monitoring_view()
