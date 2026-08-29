@@ -10,6 +10,7 @@ INDEXES = {
     "SENSEX": {"security_id": 51, "segment": "BSE_FNO"},
 }
 LEVELS = [-2, -1, 0, 1, 2]
+AUTO_REFRESH_SECONDS = 60
 
 st.set_page_config(page_title="30-Day Monitoring", page_icon="📈", layout="wide")
 
@@ -23,6 +24,7 @@ with st.sidebar:
     expiry_flag = st.selectbox("Expiry series", ["WEEK", "MONTH"], index=0)
     expiry_code = st.selectbox("Expiry code", [0, 1, 2], index=0, help="0 = near, 1 = next, 2 = farther expiry")
     days = st.slider("Lookback", 7, 30, 30)
+    auto_refresh = st.checkbox("Auto-refresh every 1 minute", value=True)
 
 if not client_id or not access_token:
     st.info("Enter Client ID and Access Token to use the historical monitor.")
@@ -83,20 +85,24 @@ def rolling(index_name, level, side, start, end):
                 continue
             if ts.time().hour != 10 or ts.time().minute != 0:
                 continue
+
             def value(name):
                 vals = leg.get(name) or []
                 return vals[i] if i < len(vals) else None
-            rows.append({
-                "date": ts.date(),
-                "index": index_name,
-                "level": "ATM" if level == 0 else f"ATM{level:+d}",
-                "side": side,
-                "strike": value("strike"),
-                "spot": value("spot"),
-                "iv": value("iv"),
-                "oi": value("oi"),
-                "close": value("close"),
-            })
+
+            rows.append(
+                {
+                    "date": ts.date(),
+                    "index": index_name,
+                    "level": "ATM" if level == 0 else f"ATM{level:+d}",
+                    "side": side,
+                    "strike": value("strike"),
+                    "spot": value("spot"),
+                    "iv": value("iv"),
+                    "oi": value("oi"),
+                    "close": value("close"),
+                }
+            )
     return rows
 
 
@@ -104,22 +110,24 @@ def safe_df(rows):
     if not rows:
         return pd.DataFrame()
     frame = pd.DataFrame(rows)
-    if "date" in frame.columns:
-        frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.date
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.date
     for col in ("strike", "spot", "iv", "oi", "close"):
-        if col in frame.columns:
-            frame[col] = pd.to_numeric(frame[col], errors="coerce")
-    return frame.drop_duplicates(["date", "index", "level", "side"], keep="last").sort_values(["date", "index", "level", "side"])
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    return (
+        frame.drop_duplicates(["date", "index", "level", "side"], keep="last")
+        .sort_values(["date", "index", "level", "side"])
+        .reset_index(drop=True)
+    )
 
 
-if st.button("FETCH LAST 30 DAYS", type="primary", use_container_width=True):
+def fetch_monitor_data():
     today = datetime.now().date()
     start = today - timedelta(days=days - 1)
     all_rows = []
+    errors = []
     progress = st.progress(0.0)
     total = len(INDEXES) * len(LEVELS) * 2
     done = 0
-    errors = []
 
     for index_name in INDEXES:
         for level in LEVELS:
@@ -132,13 +140,11 @@ if st.button("FETCH LAST 30 DAYS", type="primary", use_container_width=True):
                 progress.progress(done / total)
 
     data = safe_df(all_rows)
-    if data.empty:
-        st.error("No historical rows were returned. Check credentials, subscription, expiry series/code, and available history.")
-        if errors:
-            st.write("\n".join(errors))
-        st.stop()
+    return data, errors
 
-    st.success(f"Loaded {len(data):,} 10:00 observations.")
+
+def render_results(data, errors):
+    st.success(f"Loaded {len(data):,} 10:00 observations. Last update: {datetime.now().strftime('%H:%M:%S')}")
 
     st.subheader("ATM IV trend")
     atm = data[data["level"] == "ATM"].copy()
@@ -153,8 +159,13 @@ if st.button("FETCH LAST 30 DAYS", type="primary", use_container_width=True):
     st.subheader("Daily IV comparison")
     iv = data.copy()
     iv["IV"] = pd.to_numeric(iv["iv"], errors="coerce")
-    iv["IV Change vs Prior Observation"] = iv.sort_values("date").groupby(["index", "level", "side"])["IV"].diff()
-    st.dataframe(iv[["date", "index", "level", "side", "strike", "spot", "IV", "IV Change vs Prior Observation", "oi"]], use_container_width=True, hide_index=True)
+    iv = iv.sort_values("date")
+    iv["IV Change vs Prior Observation"] = iv.groupby(["index", "level", "side"])["IV"].diff()
+    st.dataframe(
+        iv[["date", "index", "level", "side", "strike", "spot", "IV", "IV Change vs Prior Observation", "oi"]],
+        use_container_width=True,
+        hide_index=True,
+    )
 
     if errors:
         st.warning(f"{len(errors)} series were unavailable or returned an API error; the remaining series were retained.")
@@ -168,3 +179,23 @@ if st.button("FETCH LAST 30 DAYS", type="primary", use_container_width=True):
         "text/csv",
         use_container_width=True,
     )
+
+
+cached_key = "iv_monitor_30d_data"
+error_key = "iv_monitor_30d_errors"
+
+if st.button("FETCH LAST 30 DAYS", type="primary", use_container_width=True):
+    data, errors = fetch_monitor_data()
+    st.session_state[cached_key] = data
+    st.session_state[error_key] = errors
+
+cached = st.session_state.get(cached_key)
+cached_errors = st.session_state.get(error_key, [])
+if cached is not None and not cached.empty:
+    render_results(cached, cached_errors)
+else:
+    st.info("Click FETCH LAST 30 DAYS to load the historical monitor.")
+
+if auto_refresh and cached is not None:
+    st.caption("Auto-refresh: ON • next refresh in 1 minute")
+    st.rerun()
