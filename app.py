@@ -1,304 +1,283 @@
 import math
 import time
-from datetime import datetime, timedelta, time as clock_time
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 import streamlit as st
 
-# Internal API endpoint. Provider branding is intentionally absent from the UI.
 API = "https://api.dhan.co/v2"
 IST = ZoneInfo("Asia/Kolkata")
 
 INDEXES = {
-    "NIFTY": {"security_id": "13", "index_segment": "IDX_I", "option_segment": "NSE_FNO"},
-    "SENSEX": {"security_id": "51", "index_segment": "IDX_I", "option_segment": "BSE_FNO"},
+    "NIFTY": {"security_id": 13, "segment": "IDX_I", "option_segment": "NSE_FNO"},
+    "SENSEX": {"security_id": 51, "segment": "IDX_I", "option_segment": "BSE_FNO"},
 }
-MONITORED_LEVELS = [-2, -1, 0, 1, 2]
-CHAIN_GAP_SECONDS = 3.1
-MAX_HISTORY_YEARS = 5
+LEVELS = [-2, -1, 0, 1, 2]
+CHAIN_GAP_SECONDS = 3.2
+REFRESH_SECONDS = 60
+RISK_FREE_RATE = 0.065
 
 st.set_page_config(page_title="IV Monitor", page_icon="📊", layout="wide")
 
 
-def auth_headers(client_id: str, token: str) -> dict:
-    return {"Accept": "application/json", "Content-Type": "application/json", "access-token": token, "client-id": client_id}
+def auth_headers(client_id: str, access_token: str) -> dict:
+    return {"Accept": "application/json", "Content-Type": "application/json", "access-token": access_token, "client-id": client_id}
 
 
-def post_api(client_id: str, token: str, path: str, payload: dict, timeout: int = 45) -> dict:
+def post_api(client_id: str, access_token: str, path: str, payload: dict, timeout: int = 45) -> dict:
     try:
-        r = requests.post(API + path, headers=auth_headers(client_id, token), json=payload, timeout=timeout)
-        if r.status_code >= 400:
-            raise RuntimeError(f"API error {r.status_code}: {r.text[:500]}")
-        return r.json()
+        response = requests.post(API + path, headers=auth_headers(client_id, access_token), json=payload, timeout=timeout)
     except requests.RequestException as exc:
         raise RuntimeError(f"Network error: {exc}") from exc
+    if response.status_code >= 400:
+        raise RuntimeError(f"API error {response.status_code}: {response.text[:500]}")
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError("API returned invalid JSON.") from exc
 
 
-def get_expiries(client_id: str, token: str, security_id: str) -> list[str]:
-    body = post_api(client_id, token, "/optionchain/expirylist", {"UnderlyingScrip": int(security_id), "UnderlyingSeg": "IDX_I"})
+def throttle_chain():
+    last = st.session_state.get("last_chain_request", 0.0)
+    elapsed = time.monotonic() - last
+    if elapsed < CHAIN_GAP_SECONDS:
+        time.sleep(CHAIN_GAP_SECONDS - elapsed)
+    st.session_state["last_chain_request"] = time.monotonic()
+
+
+def expiry_list(client_id: str, access_token: str, security_id: int) -> list[str]:
+    body = post_api(client_id, access_token, "/optionchain/expirylist", {"UnderlyingScrip": security_id, "UnderlyingSeg": "IDX_I"})
     return [str(x) for x in (body.get("data") or [])]
 
 
-def choose_expiry(expiries: list[str], day) -> str | None:
-    valid = []
-    for value in expiries:
+def nearest_expiry(expiries: list[str], today) -> str:
+    dates = []
+    for item in expiries:
         try:
-            d = pd.Timestamp(value).date()
-            if d >= day:
-                valid.append(d)
+            d = pd.Timestamp(item).date()
         except Exception:
             continue
-    return min(valid).isoformat() if valid else None
+        if d >= today:
+            dates.append(d)
+    if not dates:
+        raise RuntimeError("No active option expiry was returned.")
+    return min(dates).isoformat()
 
 
-def get_option_chain(client_id: str, token: str, index_name: str, expiry: str) -> dict:
-    now = time.monotonic()
-    last = st.session_state.get("last_chain_call", 0.0)
-    delay = CHAIN_GAP_SECONDS - (now - last)
-    if delay > 0:
-        time.sleep(delay)
-    st.session_state["last_chain_call"] = time.monotonic()
-    body = post_api(
-        client_id,
-        token,
-        "/optionchain",
-        {"UnderlyingScrip": int(INDEXES[index_name]["security_id"]), "UnderlyingSeg": "IDX_I", "Expiry": expiry},
-    )
+def option_chain(client_id: str, access_token: str, security_id: int, expiry: str) -> dict:
+    throttle_chain()
+    body = post_api(client_id, access_token, "/optionchain", {"UnderlyingScrip": security_id, "UnderlyingSeg": "IDX_I", "Expiry": expiry})
     return body.get("data") or {}
 
 
-def daily_history(client_id: str, token: str, index_name: str, start: str, end: str) -> dict:
-    return post_api(
-        client_id,
-        token,
-        "/charts/historical",
-        {"securityId": INDEXES[index_name]["security_id"], "exchangeSegment": "IDX_I", "instrument": "INDEX", "expiryCode": 0, "oi": False, "fromDate": start, "toDate": end},
-    )
+def intraday(client_id: str, access_token: str, security_id: int, segment: str, instrument: str, start: str, end: str, oi: bool = False) -> dict:
+    return post_api(client_id, access_token, "/charts/intraday", {"securityId": str(security_id), "exchangeSegment": segment, "instrument": instrument, "interval": "1", "oi": oi, "fromDate": start, "toDate": end})
 
 
-def intraday(client_id: str, token: str, index_name: str, security_id: str, segment: str, instrument: str, day) -> dict:
-    return post_api(
-        client_id,
-        token,
-        "/charts/intraday",
-        {"securityId": str(security_id), "exchangeSegment": segment, "instrument": instrument, "interval": "1", "oi": True, "fromDate": f"{day.isoformat()} 10:00:00", "toDate": f"{day.isoformat()} 10:02:00"},
-    )
+def daily_history(client_id: str, access_token: str, security_id: int, start: str, end: str) -> dict:
+    return post_api(client_id, access_token, "/charts/historical", {"securityId": str(security_id), "exchangeSegment": "IDX_I", "instrument": "INDEX", "expiryCode": 0, "oi": False, "fromDate": start, "toDate": end})
 
 
-def bar_at_10(body: dict, day) -> dict | None:
+def extract_ohlc_bar(body: dict, target_date, target_time: dtime):
     timestamps = body.get("timestamp") or []
     closes = body.get("close") or []
-    oi = body.get("open_interest") or []
     if not timestamps or not closes:
         return None
-    target = datetime.combine(day, clock_time(10, 0), IST)
-    for i, stamp in enumerate(timestamps):
-        dt = datetime.fromtimestamp(int(stamp), IST)
-        if dt.date() == day and dt >= target:
-            return {"datetime": dt, "price": float(closes[i]), "oi": float(oi[i]) if i < len(oi) and oi[i] is not None else None}
+    target = datetime.combine(target_date, target_time, IST)
+    for ts, close in zip(timestamps, closes):
+        dt = datetime.fromtimestamp(int(ts), IST)
+        if dt.date() == target_date and dt >= target and close is not None:
+            return {"datetime": dt, "price": float(close)}
     return None
 
 
-def index_at_10(client_id: str, token: str, name: str, day):
-    cfg = INDEXES[name]
-    body = intraday(client_id, token, name, cfg["security_id"], "IDX_I", "INDEX", day)
-    return bar_at_10(body, day)
+def get_spot_10am(client_id: str, access_token: str, index_name: str, day):
+    spec = INDEXES[index_name]
+    body = intraday(client_id, access_token, spec["security_id"], spec["segment"], "INDEX", f"{day.isoformat()} 10:00:00", f"{day.isoformat()} 10:02:00")
+    return extract_ohlc_bar(body, day, dtime(10, 0))
 
 
-def option_at_10(client_id: str, token: str, name: str, security_id: str, day):
-    cfg = INDEXES[name]
-    body = intraday(client_id, token, name, security_id, cfg["option_segment"], "OPTIDX", day)
-    return bar_at_10(body, day)
-
-
-def previous_close(client_id: str, token: str, name: str, today):
-    body = daily_history(client_id, token, name, (today - timedelta(days=10)).isoformat(), (today + timedelta(days=1)).isoformat())
+def get_previous_close(client_id: str, access_token: str, index_name: str, day) -> tuple[float, datetime]:
+    spec = INDEXES[index_name]
+    body = daily_history(client_id, access_token, spec["security_id"], (day - timedelta(days=10)).isoformat(), (day + timedelta(days=1)).isoformat())
     rows = []
-    for stamp, close in zip(body.get("timestamp") or [], body.get("close") or []):
-        dt = datetime.fromtimestamp(int(stamp), IST)
-        if dt.date() < today and close is not None:
+    for ts, close in zip(body.get("timestamp") or [], body.get("close") or []):
+        if close is None:
+            continue
+        dt = datetime.fromtimestamp(int(ts), IST)
+        if dt.date() < day:
             rows.append((dt, float(close)))
     if not rows:
-        raise RuntimeError("No previous trading-day close was returned.")
-    return rows[-1]
+        raise RuntimeError(f"No previous close found for {index_name}.")
+    return rows[-1][1], rows[-1][0]
 
 
-def bs_price(spot, strike, years, sigma, is_call, rate):
-    if years <= 0 or sigma <= 0:
-        return max(spot - strike, 0.0) if is_call else max(strike - spot, 0.0)
-    root = math.sqrt(years)
-    d1 = (math.log(spot / strike) + (rate + 0.5 * sigma * sigma) * years) / (sigma * root)
-    d2 = d1 - sigma * root
-    nd1 = 0.5 * (1 + math.erf(d1 / math.sqrt(2)))
-    nd2 = 0.5 * (1 + math.erf(d2 / math.sqrt(2)))
-    dk = strike * math.exp(-rate * years)
-    return spot * nd1 - dk * nd2 if is_call else dk * (1 - nd2) - spot * (1 - nd1)
-
-
-def solve_iv(price, spot, strike, expiry, asof, is_call, rate):
-    if any(v is None for v in (price, spot, strike, expiry, asof)) or price <= 0 or spot <= 0 or strike <= 0:
-        return None
-    expiry_dt = datetime.combine(pd.Timestamp(expiry).date(), clock_time(15, 30), IST)
-    years = max((expiry_dt - asof).total_seconds() / (365 * 24 * 3600), 1e-8)
-    intrinsic = max(spot - strike, 0.0) if is_call else max(strike - spot, 0.0)
-    if price < intrinsic - 1e-8:
-        return None
-    lo, hi = 0.0001, 5.0
-    if price > bs_price(spot, strike, years, hi, is_call, rate) + 1e-7:
-        return None
-    for _ in range(80):
-        mid = (lo + hi) / 2
-        if bs_price(spot, strike, years, mid, is_call, rate) > price:
-            hi = mid
-        else:
-            lo = mid
-    return ((lo + hi) / 2) * 100
-
-
-def chain_frame(data: dict) -> pd.DataFrame:
+def normalize_chain(chain: dict) -> pd.DataFrame:
     rows = []
-    for strike_text, node in (data.get("oc") or {}).items():
+    for strike_key, node in (chain.get("oc") or {}).items():
         try:
-            strike = float(strike_text)
+            strike = float(strike_key)
         except Exception:
             continue
-        for side, key in (("CE", "ce"), ("PE", "pe")):
-            leg = node.get(key) or {}
-            if leg:
-                rows.append({
-                    "strike": strike,
-                    "side": side,
-                    "security_id": str(leg.get("security_id") or ""),
-                    "ltp": leg.get("last_price"),
-                    "iv": leg.get("implied_volatility"),
-                    "oi": leg.get("oi"),
-                    "previous_oi": leg.get("previous_oi"),
-                    "previous_close": leg.get("previous_close_price"),
-                })
+        for side in ("CE", "PE"):
+            leg = node.get("ce" if side == "CE" else "pe") or {}
+            if not leg:
+                continue
+            rows.append({"strike": strike, "side": side, "security_id": leg.get("security_id"), "ltp": leg.get("last_price"), "iv": leg.get("implied_volatility"), "oi": leg.get("oi"), "previous_oi": leg.get("previous_oi"), "previous_close_price": leg.get("previous_close_price")})
     return pd.DataFrame(rows)
 
 
-def nearest_strike(frame, spot):
-    strikes = sorted(pd.to_numeric(frame["strike"], errors="coerce").dropna().unique())
+def nearest_strike(strikes, spot: float) -> float:
     if not strikes:
-        raise RuntimeError("No option strikes were returned.")
+        raise RuntimeError("No strikes returned in option chain.")
     return min(strikes, key=lambda x: abs(x - spot))
 
 
-def monitored_strikes(frame, atm):
-    strikes = sorted(pd.to_numeric(frame["strike"], errors="coerce").dropna().unique())
-    atm = min(strikes, key=lambda x: abs(x - atm))
+def offset_strikes(df: pd.DataFrame, atm: float) -> dict[int, float]:
+    strikes = sorted(pd.to_numeric(df["strike"], errors="coerce").dropna().unique().tolist())
+    if atm not in strikes:
+        atm = nearest_strike(strikes, atm)
     idx = strikes.index(atm)
-    return {level: strikes[idx + level] for level in MONITORED_LEVELS if 0 <= idx + level < len(strikes)}
+    return {level: strikes[idx + level] for level in LEVELS if 0 <= idx + level < len(strikes)}
 
 
-def make_snapshot(client_id, token, name, day, rate):
-    cfg = INDEXES[name]
-    expiry = choose_expiry(get_expiries(client_id, token, cfg["security_id"]), day)
-    if not expiry:
-        raise RuntimeError(f"No active expiry found for {name}.")
-    chain = get_option_chain(client_id, token, name, expiry)
-    frame = chain_frame(chain)
-    if frame.empty:
-        raise RuntimeError(f"No option-chain data returned for {name}.")
-    spot10 = index_at_10(client_id, token, name, day)
-    if not spot10:
-        raise RuntimeError(f"10:00 index bar is not available for {name}.")
-    prev_spot, prev_dt = previous_close(client_id, token, name, day)
-    atm = nearest_strike(frame, spot10["price"])
-    prev_atm = nearest_strike(frame, prev_spot)
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def option_theoretical_price(spot, strike, t, sigma, call=True, rate=RISK_FREE_RATE):
+    if t <= 0:
+        return max(spot - strike, 0.0) if call else max(strike - spot, 0.0)
+    d1 = (math.log(spot / strike) + (rate + 0.5 * sigma * sigma) * t) / (sigma * math.sqrt(t))
+    d2 = d1 - sigma * math.sqrt(t)
+    if call:
+        return spot * norm_cdf(d1) - strike * math.exp(-rate * t) * norm_cdf(d2)
+    return strike * math.exp(-rate * t) * norm_cdf(-d2) - spot * norm_cdf(-d1)
+
+
+def calculate_iv(price, spot, strike, expiry, asof, call=True):
+    try:
+        price, spot, strike = float(price), float(spot), float(strike)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0 or spot <= 0 or strike <= 0:
+        return None
+    expiry_dt = datetime.combine(pd.Timestamp(expiry).date(), dtime(15, 30), IST)
+    t = (expiry_dt - asof).total_seconds() / (365.0 * 24.0 * 3600.0)
+    if t <= 0:
+        return None
+    intrinsic = max(spot - strike, 0.0) if call else max(strike - spot, 0.0)
+    if price < intrinsic:
+        return None
+    lo, hi = 1e-6, 5.0
+    if option_theoretical_price(spot, strike, t, hi, call) < price:
+        return None
+    for _ in range(80):
+        mid = (lo + hi) / 2.0
+        model = option_theoretical_price(spot, strike, t, mid, call)
+        if model > price:
+            hi = mid
+        else:
+            lo = mid
+    return ((lo + hi) / 2.0) * 100.0
+
+
+def option_price_at_10am(client_id: str, access_token: str, option_security_id: int, option_segment: str, day):
+    body = intraday(client_id, access_token, int(option_security_id), option_segment, "OPTIDX", f"{day.isoformat()} 10:00:00", f"{day.isoformat()} 10:02:00", oi=True)
+    return extract_ohlc_bar(body, day, dtime(10, 0))
+
+
+def create_snapshot(client_id: str, access_token: str, index_name: str, day):
+    spec = INDEXES[index_name]
+    expiry = nearest_expiry(expiry_list(client_id, access_token, spec["security_id"]), day)
+    chain = option_chain(client_id, access_token, spec["security_id"], expiry)
+    df = normalize_chain(chain)
+    if df.empty:
+        raise RuntimeError(f"No option-chain data returned for {index_name}.")
+    spot10 = get_spot_10am(client_id, access_token, index_name, day)
+    if spot10 is None:
+        raise RuntimeError(f"No 10:00 spot bar found for {index_name}.")
+    previous_close, previous_close_dt = get_previous_close(client_id, access_token, index_name, day)
+    strikes = sorted(pd.to_numeric(df["strike"], errors="coerce").dropna().unique().tolist())
+    atm = nearest_strike(strikes, spot10["price"])
+    previous_atm = nearest_strike(strikes, previous_close)
 
     iv_rows = []
     for side in ("CE", "PE"):
-        today_row = frame[(frame.strike == atm) & (frame.side == side)]
-        prev_row = frame[(frame.strike == prev_atm) & (frame.side == side)]
-        if today_row.empty:
+        current = df[(df["strike"] == atm) & (df["side"] == side)]
+        previous = df[(df["strike"] == previous_atm) & (df["side"] == side)]
+        if current.empty:
             continue
-        t = today_row.iloc[0]
-        p = prev_row.iloc[0] if not prev_row.empty else None
-        today_iv = None
-        if t.security_id:
+        cur = current.iloc[0]
+        prev = previous.iloc[0] if not previous.empty else None
+        current_iv = None
+        if pd.notna(cur["security_id"]):
             try:
-                bar = option_at_10(client_id, token, name, t.security_id, day)
-                if bar:
-                    today_iv = solve_iv(bar["price"], spot10["price"], atm, expiry, bar["datetime"], side == "CE", rate)
+                option_bar = option_price_at_10am(client_id, access_token, int(cur["security_id"]), spec["option_segment"], day)
             except Exception:
-                pass
-        if today_iv is None and t.iv is not None:
-            today_iv = float(t.iv)
-        yday_iv = None
-        if p is not None and p.previous_close is not None:
-            yday_iv = solve_iv(float(p.previous_close), prev_spot, prev_atm, expiry, prev_dt, side == "CE", rate)
-        iv_rows.append({
-            "side": side,
-            "today_iv": today_iv,
-            "yday_iv": yday_iv,
-            "change": today_iv - yday_iv if today_iv is not None and yday_iv is not None else None,
-            "today_strike": atm,
-            "yday_strike": prev_atm,
-        })
+                option_bar = None
+            if option_bar:
+                current_iv = calculate_iv(option_bar["price"], spot10["price"], atm, expiry, option_bar["datetime"], call=(side == "CE"))
+        if current_iv is None and pd.notna(cur["iv"]):
+            current_iv = float(cur["iv"])
+        previous_iv = None
+        if prev is not None and pd.notna(prev["previous_close_price"]):
+            previous_iv = calculate_iv(float(prev["previous_close_price"]), previous_close, previous_atm, expiry, previous_close_dt, call=(side == "CE"))
+        iv_rows.append({"Side": side, "10:00 IV": current_iv, "Yesterday ATM-close IV": previous_iv, "IV Change": current_iv - previous_iv if current_iv is not None and previous_iv is not None else None, "10:00 ATM Strike": atm, "Yesterday ATM Strike": previous_atm})
 
     oi_rows = []
-    for level, strike in monitored_strikes(frame, atm).items():
+    for level, strike in offset_strikes(df, atm).items():
         for side in ("CE", "PE"):
-            row = frame[(frame.strike == strike) & (frame.side == side)]
+            row = df[(df["strike"] == strike) & (df["side"] == side)]
             if row.empty:
                 continue
             r = row.iloc[0]
             lock_oi = None
             if r.security_id:
                 try:
-                    bar = option_at_10(client_id, token, name, r.security_id, day)
-                    if bar:
-                        lock_oi = bar["oi"]
+                    bar = option_price_at_10am(client_id, access_token, int(r["security_id"]), spec["option_segment"], day)
+                    if bar and bar.get("oi") is not None:
+                        lock_oi = float(bar["oi"])
                 except Exception:
-                    pass
+                    lock_oi = None
             if lock_oi is None and r.oi is not None:
                 lock_oi = float(r.oi)
-            oi_rows.append({
-                "level": "ATM" if level == 0 else f"ATM{level:+d}",
-                "offset": level,
-                "strike": strike,
-                "side": side,
-                "security_id": r.security_id,
-                "lock_oi": lock_oi,
-            })
-    return {"index": name, "expiry": expiry, "spot10": spot10["price"], "previous_spot": prev_spot, "lock_time": spot10["datetime"], "atm": atm, "iv": pd.DataFrame(iv_rows), "oi": pd.DataFrame(oi_rows)}
+            oi_rows.append({"Level": "ATM" if level == 0 else f"ATM{level:+d}", "Strike": strike, "Side": side, "OI at 10:00": lock_oi, "Yesterday OI": float(r["previous_oi"]) if pd.notna(r["previous_oi"]) else None, "Option Security ID": r["security_id"]})
+    return {"index": index_name, "expiry": expiry, "spot10": spot10["price"], "lock_time": spot10["datetime"], "atm": atm, "iv": pd.DataFrame(iv_rows), "oi": pd.DataFrame(oi_rows)}
 
 
-def refresh_oi(client_id, token, snapshot):
-    frame = chain_frame(get_option_chain(client_id, token, snapshot["index"], snapshot["expiry"]))
+def refresh_current_oi(client_id: str, access_token: str, snapshot: dict) -> pd.DataFrame:
+    spec = INDEXES[snapshot["index"]]
+    df = normalize_chain(option_chain(client_id, access_token, spec["security_id"], snapshot["expiry"]))
+    if df.empty:
+        return pd.DataFrame()
     rows = []
     for _, base in snapshot["oi"].iterrows():
-        row = frame[(frame.strike == base.strike) & (frame.side == base.side)]
-        if row.empty:
+        current = df[(df["strike"] == float(base["Strike"])) & (df["side"] == base["Side"])]
+        if current.empty:
             continue
-        r = row.iloc[0]
-        current = float(r.oi) if r.oi is not None else None
-        prev = float(r.previous_oi) if r.previous_oi is not None else None
-        lock = float(base.lock_oi) if base.lock_oi is not None else None
-        rows.append({
-            "Level": base.level,
-            "Strike": base.strike,
-            "Side": base.side,
-            "OI Now": current,
-            "Δ OI since 10:00": current - lock if current is not None and lock is not None else None,
-            "Δ OI vs yesterday": current - prev if current is not None and prev is not None else None,
-            "Yesterday OI": prev,
-            "LTP": r.ltp,
-            "IV now": r.iv,
-        })
+        r = current.iloc[0]
+        now_oi = float(r["oi"]) if pd.notna(r["oi"]) else None
+        lock_oi = float(base["OI at 10:00"]) if pd.notna(base["OI at 10:00"]) else None
+        prev_oi = float(r["previous_oi"]) if pd.notna(r["previous_oi"]) else None
+        rows.append({"Level": base["Level"], "Strike": float(base["Strike"]), "Side": base["Side"], "OI Now": now_oi, "Change Since 10:00": now_oi - lock_oi if now_oi is not None and lock_oi is not None else None, "Change vs Yesterday": now_oi - prev_oi if now_oi is not None and prev_oi is not None else None, "Yesterday OI": prev_oi, "Option LTP": float(r["ltp"]) if pd.notna(r["ltp"]) else None, "IV Now": float(r["iv"]) if pd.notna(r["iv"]) else None})
     return pd.DataFrame(rows)
 
 
-def fnum(x, decimals=2):
-    return "—" if x is None or pd.isna(x) else f"{x:,.{decimals}f}"
+def run_monitor(client_id: str, access_token: str, day):
+    snapshots, errors = {}, {}
+    for index_name in ("NIFTY", "SENSEX"):
+        try:
+            snapshots[index_name] = create_snapshot(client_id, access_token, index_name, day)
+        except Exception as exc:
+            errors[index_name] = str(exc)
+    return snapshots, errors
 
 
 st.title("📊 IV Monitor")
-st.caption("NIFTY + SENSEX • daily 10:00 ATM lock • IV change • ATM±1/±2 OI movement")
+st.caption("NIFTY + SENSEX • daily 10:00 ATM lock • IV change • OI monitoring at ATM−2, ATM−1, ATM, ATM+1, ATM+2")
 
 with st.sidebar:
     st.subheader("Market Access")
@@ -316,8 +295,8 @@ today = now.date()
 if now.weekday() >= 5:
     st.warning("The monitor is waiting for the next market day.")
     st.stop()
-if now.time() < clock_time(10, 0):
-    remaining = datetime.combine(today, clock_time(10, 0), IST) - now
+if now.time() < dtime(10, 0):
+    remaining = datetime.combine(today, dtime(10, 0), IST) - now
     st.info(f"10:00 ATM lock is pending. Time remaining: {str(remaining).split('.')[0]}.")
     st.stop()
 
@@ -332,52 +311,28 @@ def monitor():
         try:
             snapshot = st.session_state["snapshots"].get(key)
             if snapshot is None:
-                snapshot = make_snapshot(client_id, access_token, name, today, rate)
+                snapshot = create_snapshot(client_id, access_token, name, today)
                 st.session_state["snapshots"][key] = snapshot
 
             st.subheader(name)
-            a, b, c, d = st.columns(4)
-            a.metric("10:00 Spot", fnum(snapshot["spot10"]))
-            b.metric("Locked ATM", fnum(snapshot["atm"]))
-            c.metric("Yesterday Close", fnum(snapshot["previous_spot"]))
-            d.metric("Nearest Expiry", snapshot["expiry"])
-            st.caption(f"ATM locked from the {snapshot['lock_time'].strftime('%H:%M:%S IST')} bar.")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("10:00 Spot", f"{snapshot['spot10']:,.2f}")
+            c2.metric("ATM", f"{snapshot['atm']:,.2f}")
+            c3.metric("Expiry", snapshot["expiry"])
 
-            iv = snapshot["iv"]
-            if iv.empty:
-                st.warning("IV comparison is unavailable for this index.")
-            else:
-                x, y = st.columns(2)
-                for holder, side in ((x, "CE"), (y, "PE")):
-                    row = iv[iv.side == side]
-                    if row.empty:
-                        continue
-                    r = row.iloc[0]
-                    arrow = "↑" if r.change is not None and r.change > 0 else ("↓" if r.change is not None and r.change < 0 else "→")
-                    with holder:
-                        st.metric(f"{side} IV @ 10:00", f"{fnum(r.today_iv)}%")
-                        st.metric(f"{side} IV vs yesterday {arrow}", f"{fnum(r.change)} vol pts")
-                        st.caption(f"Yesterday ATM strike: {fnum(r.yday_strike)}")
+            iv_df = snapshot["iv"].copy()
+            for col_name in ("10:00 IV", "Yesterday ATM-close IV", "IV Change"):
+                if col_name in iv_df.columns:
+                    iv_df[col_name] = pd.to_numeric(iv_df[col_name], errors="coerce").round(2)
+            st.write("**ATM IV comparison**")
+            st.dataframe(iv_df, use_container_width=True, hide_index=True)
 
-            try:
-                live = refresh_oi(client_id, access_token, snapshot)
-                if not live.empty:
-                    st.markdown("**Open-interest movement around locked ATM**")
-                    view = live.copy()
-                    view["Strike"] = view["Strike"].map(fnum)
-                    for col in ("OI Now", "Yesterday OI", "Δ OI since 10:00", "Δ OI vs yesterday"):
-                        view[col] = view[col].map(lambda x: fnum(x, 0))
-                    view["LTP"] = view["LTP"].map(fnum)
-                    view["IV now"] = view["IV now"].map(lambda x: f"{fnum(x)}%")
-                    st.dataframe(view, use_container_width=True, hide_index=True)
-                else:
-                    st.info("No OI rows returned on the latest refresh.")
-            except Exception as exc:
-                st.warning(f"OI refresh temporarily unavailable: {exc}")
-            st.divider()
+            oi_df = refresh_current_oi(client_id, access_token, snapshot)
+            st.write("**OI movement: ATM−2 to ATM+2**")
+            st.dataframe(oi_df, use_container_width=True, hide_index=True)
+            st.caption(f"10:00 lock: {snapshot['lock_time'].strftime('%Y-%m-%d %H:%M:%S')} IST")
+        except Exception as exc:
+            st.error(f"{name}: {exc}")
 
 
-try:
-    monitor()
-except Exception as exc:
-    st.error(f"Monitor error: {exc}")
+monitor()
