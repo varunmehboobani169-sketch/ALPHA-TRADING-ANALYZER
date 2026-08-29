@@ -7,6 +7,8 @@ import streamlit as st
 
 API = "https://api.dhan.co/v2"
 IST = ZoneInfo("Asia/Kolkata")
+DHAN_EPOCH = datetime(1980, 1, 1, 5, 30, tzinfo=IST)
+
 INDEXES = {
     "NIFTY": {"security_id": 13, "segment": "NSE_FNO"},
     "SENSEX": {"security_id": 51, "segment": "BSE_FNO"},
@@ -23,17 +25,21 @@ with st.sidebar:
     client_id = st.text_input("Client ID", key="history_client_id")
     access_token = st.text_input("Access Token", type="password", key="history_access_token")
     expiry_flag = st.selectbox("Expiry series", ["WEEK", "MONTH"], index=0, key="history_expiry_flag")
-    expiry_code = st.selectbox(
-        "Expiry code", [0, 1, 2], index=1,
-        help="0 = current/near, 1 = next, 2 = far",
-        key="history_expiry_code",
-    )
+    expiry_code = st.selectbox("Expiry code", [0, 1, 2], index=0, key="history_expiry_code")
     days = st.slider("Lookback", 7, 30, 30, key="history_days")
     auto_refresh = st.checkbox("Auto-refresh every 1 minute", value=True, key="history_auto_refresh")
 
 if not client_id or not access_token:
     st.info("Enter Client ID and Access Token to use the historical monitor.")
     st.stop()
+
+
+def dhan_timestamp(value):
+    """Convert the historical API's custom epoch timestamp to IST."""
+    try:
+        return DHAN_EPOCH + timedelta(seconds=int(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def post(path: str, payload: dict) -> dict:
@@ -51,6 +57,7 @@ def post(path: str, payload: dict) -> dict:
         )
     except requests.RequestException as exc:
         raise RuntimeError(f"Network error: {exc}") from exc
+
     if response.status_code >= 400:
         raise RuntimeError(f"API error {response.status_code}: {response.text[:500]}")
     try:
@@ -59,107 +66,70 @@ def post(path: str, payload: dict) -> dict:
         raise RuntimeError("API returned invalid JSON.") from exc
 
 
-def date_windows(start, end):
-    current = start
-    while current <= end:
-        nxt = min(current + timedelta(days=29), end)
-        yield current, nxt
-        current = nxt + timedelta(days=1)
+def rolling(index_name: str, level: int, side: str, start, end):
+    spec = INDEXES[index_name]
+    api_side = "CALL" if side == "CE" else "PUT"
+    body = post(
+        "/charts/rollingoption",
+        {
+            "exchangeSegment": spec["segment"],
+            "interval": "1",
+            "securityId": str(spec["security_id"]),
+            "instrument": "OPTIDX",
+            "expiryFlag": expiry_flag,
+            "expiryCode": int(expiry_code),
+            "strike": "ATM" if level == 0 else f"ATM{level:+d}",
+            "drvOptionType": api_side,
+            "requiredData": ["open", "high", "low", "close", "iv", "volume", "strike", "oi", "spot"],
+            "fromDate": start.isoformat(),
+            "toDate": (end + timedelta(days=1)).isoformat(),
+        },
+    )
 
-
-def extract_raw_rows(body: dict, index_name: str, level: int, side: str) -> tuple[list[dict], int]:
     data = body.get("data") or {}
     leg = data.get("ce" if side == "CE" else "pe") or {}
     timestamps = leg.get("timestamp") or []
-    fields = {name: (leg.get(name) or []) for name in ("strike", "spot", "iv", "oi", "close")}
-    raw_count = len(timestamps)
+    arrays = {name: leg.get(name) or [] for name in ("strike", "spot", "iv", "oi", "close")}
     rows = []
 
     for i, stamp in enumerate(timestamps):
-        try:
-            ts = datetime.fromtimestamp(int(stamp), IST)
-        except (TypeError, ValueError, OSError):
+        ts = dhan_timestamp(stamp)
+        if ts is None or ts.date() < start or ts.date() > end:
             continue
-
-        if ts.minute not in (58, 59, 0, 1, 2) and ts.hour == 10:
-            continue
-
-        if ts.hour != 10 and not (ts.hour == 9 and ts.minute >= 58):
+        if ts.hour != 10 or ts.minute not in (0, 1):
             continue
 
         rows.append(
             {
-                "timestamp": ts,
-                "date": ts.date(),
-                "index": index_name,
-                "level": "ATM" if level == 0 else f"ATM{level:+d}",
-                "side": side,
-                "strike": fields["strike"][i] if i < len(fields["strike"]) else None,
-                "spot": fields["spot"][i] if i < len(fields["spot"]) else None,
-                "iv": fields["iv"][i] if i < len(fields["iv"]) else None,
-                "oi": fields["oi"][i] if i < len(fields["oi"]) else None,
-                "close": fields["close"][i] if i < len(fields["close"]) else None,
+                "Date": ts.date(),
+                "Time": ts.strftime("%H:%M:%S"),
+                "Index": index_name,
+                "Level": "ATM" if level == 0 else f"ATM{level:+d}",
+                "Side": side,
+                "Strike": arrays["strike"][i] if i < len(arrays["strike"]) else None,
+                "Spot": arrays["spot"][i] if i < len(arrays["spot"]) else None,
+                "IV": arrays["iv"][i] if i < len(arrays["iv"]) else None,
+                "OI": arrays["oi"][i] if i < len(arrays["oi"]) else None,
+                "Close": arrays["close"][i] if i < len(arrays["close"]) else None,
             }
         )
-    return rows, raw_count
 
-
-def rolling(index_name: str, level: int, side: str, start, end):
-    spec = INDEXES[index_name]
-    api_side = "CALL" if side == "CE" else "PUT"
-    rows = []
-    raw_bars = 0
-
-    for win_start, win_end in date_windows(start, end):
-        # toDate is non-inclusive, so add one day to include win_end.
-        body = post(
-            "/charts/rollingoption",
-            {
-                "exchangeSegment": spec["segment"],
-                "interval": "1",
-                "securityId": str(spec["security_id"]),
-                "instrument": "OPTIDX",
-                "expiryFlag": expiry_flag,
-                "expiryCode": int(expiry_code),
-                "strike": "ATM" if level == 0 else f"ATM{level:+d}",
-                "drvOptionType": api_side,
-                "requiredData": ["open", "high", "low", "close", "iv", "volume", "strike", "oi", "spot"],
-                "fromDate": win_start.isoformat(),
-                "toDate": (win_end + timedelta(days=1)).isoformat(),
-            },
-        )
-        chunk, count = extract_raw_rows(body, index_name, level, side)
-        raw_bars += count
-        rows.extend(chunk)
-
-    # From the raw minute series, select the closest available bar to 10:00 for each trading day.
-    if not rows:
-        return [], raw_bars
-
-    frame = pd.DataFrame(rows)
-    frame["delta_seconds"] = frame["timestamp"].map(
-        lambda x: abs((x - datetime.combine(x.date(), datetime.min.time(), IST).replace(hour=10)).total_seconds())
-    )
-    frame = frame[frame["delta_seconds"] <= 120].copy()
-    if frame.empty:
-        return [], raw_bars
-    frame = frame.sort_values(["date", "delta_seconds"]).drop_duplicates("date", keep="first")
-    return frame.drop(columns=["delta_seconds"]).to_dict("records"), raw_bars
+    return rows, len(timestamps)
 
 
 def safe_df(rows):
-    columns = ["timestamp", "date", "index", "level", "side", "strike", "spot", "iv", "oi", "close"]
+    columns = ["Date", "Time", "Index", "Level", "Side", "Strike", "Spot", "IV", "OI", "Close"]
     if not rows:
         return pd.DataFrame(columns=columns)
+
     frame = pd.DataFrame(rows)
-    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.date
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
-    for col in ("strike", "spot", "iv", "oi", "close"):
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce").dt.date
+    for col in ("Strike", "Spot", "IV", "OI", "Close"):
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
     return (
-        frame.dropna(subset=["date"])
-        .drop_duplicates(["date", "index", "level", "side"], keep="last")
-        .sort_values(["date", "index", "level", "side"])
+        frame.dropna(subset=["Date"])
+        .drop_duplicates(["Date", "Index", "Level", "Side"], keep="last")
+        .sort_values(["Date", "Index", "Level", "Side"])
         .reset_index(drop=True)
     )
 
@@ -168,8 +138,9 @@ def fetch_monitor_data():
     today = datetime.now(IST).date()
     start = today - timedelta(days=days - 1)
     rows = []
-    errors = []
     diagnostics = []
+    errors = []
+
     total = len(INDEXES) * len(LEVELS) * 2
     done = 0
     progress = st.progress(0.0)
@@ -190,10 +161,21 @@ def fetch_monitor_data():
                             "Side": side,
                             "Raw minute bars": raw_bars,
                             "10:00 observations": len(chunk),
+                            "Status": "OK" if chunk else "NO 10:00 BAR",
                         }
                     )
                 except Exception as exc:
                     errors.append(f"{index_name} {label} {side}: {exc}")
+                    diagnostics.append(
+                        {
+                            "Index": index_name,
+                            "Level": label,
+                            "Side": side,
+                            "Raw minute bars": 0,
+                            "10:00 observations": 0,
+                            "Status": f"ERROR: {exc}",
+                        }
+                    )
                 done += 1
                 progress.progress(done / total)
 
@@ -203,36 +185,38 @@ def fetch_monitor_data():
 
 
 def render_results(data, errors, diagnostics, fetched_at):
-    st.success(f"Loaded {len(data):,} 10:00 observations • Last update: {fetched_at.strftime('%H:%M:%S IST')}")
+    st.success(
+        f"Loaded {len(data):,} 10:00 observations • "
+        f"Last update: {fetched_at.strftime('%H:%M:%S IST')}"
+    )
 
     st.subheader("10:00 ATM IV Trend")
-    atm = data[data["level"] == "ATM"]
+    atm = data[data["Level"] == "ATM"].copy()
     if not atm.empty:
-        pivot = atm.pivot_table(index="date", columns=["index", "side"], values="iv", aggfunc="last")
+        pivot = atm.pivot_table(index="Date", columns=["Index", "Side"], values="IV", aggfunc="last")
         st.line_chart(pivot)
 
     st.subheader("ATM ±2 OI Monitoring")
     oi = data.copy()
-    oi["OI"] = pd.to_numeric(oi["oi"], errors="coerce")
-    oi["OI Change vs Prior Day"] = oi.sort_values("date").groupby(["index", "level", "side"])["OI"].diff()
+    oi["OI"] = pd.to_numeric(oi["OI"], errors="coerce")
+    oi["OI Change vs Previous Day"] = oi.sort_values("Date").groupby(["Index", "Level", "Side"])["OI"].diff()
     st.dataframe(
-        oi[["date", "index", "level", "strike", "side", "OI", "OI Change vs Prior Day"]],
+        oi[["Date", "Index", "Level", "Strike", "Side", "OI", "OI Change vs Previous Day"]],
         use_container_width=True,
         hide_index=True,
     )
 
     st.subheader("Daily IV Comparison")
-    iv = data.copy().sort_values("date")
-    iv["IV"] = pd.to_numeric(iv["iv"], errors="coerce")
-    iv["IV Change vs Prior Day"] = iv.groupby(["index", "level", "side"])["IV"].diff()
+    iv = data.copy().sort_values("Date")
+    iv["IV"] = pd.to_numeric(iv["IV"], errors="coerce")
+    iv["IV Change vs Previous Day"] = iv.groupby(["Index", "Level", "Side"])["IV"].diff()
     st.dataframe(
-        iv[["date", "index", "level", "strike", "side", "spot", "IV", "IV Change vs Prior Day", "oi"]],
+        iv[["Date", "Index", "Level", "Strike", "Side", "Spot", "IV", "IV Change vs Previous Day", "OI"]],
         use_container_width=True,
         hide_index=True,
     )
 
-    with st.expander("Data diagnostics"):
-        st.caption("Raw minute bars returned by the API and 10:00 observations extracted from them.")
+    with st.expander("Fetch diagnostics"):
         st.dataframe(diagnostics, use_container_width=True, hide_index=True)
 
     if errors:
@@ -287,9 +271,10 @@ def monitoring_panel():
 
     if not active or data is None or data.empty:
         st.info("Click FETCH / REFRESH LAST 30 DAYS to load the historical monitor.")
+        if not diagnostics.empty:
+            st.subheader("Fetch diagnostics")
+            st.dataframe(diagnostics, use_container_width=True, hide_index=True)
         return
-
-    render_results(data, errors, diagnostics, fetched_at or datetime.now(IST))
 
     if auto_refresh:
         try:
@@ -299,12 +284,15 @@ def monitoring_panel():
                 st.session_state[ERROR_KEY] = fresh_errors
                 st.session_state[DIAG_KEY] = fresh_diag
                 st.session_state[TIME_KEY] = datetime.now(IST)
-                render_results(fresh_data, fresh_errors, fresh_diag, st.session_state[TIME_KEY])
+                data = fresh_data
+                errors = fresh_errors
+                diagnostics = fresh_diag
+                fetched_at = st.session_state[TIME_KEY]
         except Exception as exc:
             st.warning(f"Automatic refresh failed; showing the last good dataset. {exc}")
-        st.caption("Auto-refresh: ON • every 1 minute")
-    else:
-        st.caption("Auto-refresh: OFF")
+
+    render_results(data, errors, diagnostics, fetched_at or datetime.now(IST))
+    st.caption("Auto-refresh: ON • every 1 minute" if auto_refresh else "Auto-refresh: OFF")
 
 
 monitoring_panel()
