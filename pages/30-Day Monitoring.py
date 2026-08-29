@@ -13,7 +13,7 @@ INDEXES = {
     "SENSEX": {"security_id": 51, "segment": "BSE_FNO"},
 }
 LEVELS = [-2, -1, 0, 1, 2]
-REFRESH_SECONDS = 60
+API_EXPIRY_CODES = {"Near expiry": 1, "Next expiry": 2, "Far expiry": 3}
 
 st.set_page_config(page_title="30-Day Monitoring", page_icon="📈", layout="wide")
 st.title("📈 30-Day Monitoring")
@@ -24,13 +24,8 @@ with st.sidebar:
     client_id = st.text_input("Client ID", key="history_client_id")
     access_token = st.text_input("Access Token", type="password", key="history_access_token")
     expiry_flag = st.selectbox("Expiry series", ["WEEK", "MONTH"], index=0, key="history_expiry_flag")
-    expiry_code = st.selectbox(
-        "Expiry code",
-        [1, 2, 3],
-        index=0,
-        help="For expired-options history: 1 = near/current, 2 = next, 3 = far.",
-        key="history_expiry_code",
-    )
+    expiry_label = st.selectbox("Expiry", list(API_EXPIRY_CODES), index=0, key="history_expiry_label")
+    expiry_code = API_EXPIRY_CODES[expiry_label]
     days = st.slider("Lookback", 7, 30, 30, key="history_days")
     auto_refresh = st.checkbox("Auto-refresh every 1 minute", value=True, key="history_auto_refresh")
 
@@ -76,14 +71,10 @@ def rolling(index_name: str, level: int, side: str, start, end):
             "securityId": str(spec["security_id"]),
             "instrument": "OPTIDX",
             "expiryFlag": expiry_flag,
-            # This endpoint currently requires 1/2/3 for near/next/far expiry.
-            "expiryCode": int(expiry_code),
+            "expiryCode": expiry_code,
             "strike": "ATM" if level == 0 else f"ATM{level:+d}",
             "drvOptionType": api_side,
-            "requiredData": [
-                "open", "high", "low", "close", "iv", "volume",
-                "strike", "oi", "spot",
-            ],
+            "requiredData": ["open", "high", "low", "close", "iv", "volume", "strike", "oi", "spot"],
             "fromDate": start.isoformat(),
             "toDate": (end + timedelta(days=1)).isoformat(),
         },
@@ -101,51 +92,40 @@ def rolling(index_name: str, level: int, side: str, start, end):
             continue
         if ts.hour != 10 or ts.minute not in (0, 1):
             continue
-        rows.append(
-            {
-                "Date": ts.date(),
-                "Time": ts.strftime("%H:%M:%S"),
-                "Index": index_name,
-                "Level": "ATM" if level == 0 else f"ATM{level:+d}",
-                "Side": side,
-                "Strike": arrays["strike"][i] if i < len(arrays["strike"]) else None,
-                "Spot": arrays["spot"][i] if i < len(arrays["spot"]) else None,
-                "IV": arrays["iv"][i] if i < len(arrays["iv"]) else None,
-                "OI": arrays["oi"][i] if i < len(arrays["oi"]) else None,
-                "Close": arrays["close"][i] if i < len(arrays["close"]) else None,
-            }
-        )
-
+        rows.append({
+            "Date": ts.date(),
+            "Time": ts.strftime("%H:%M:%S"),
+            "Index": index_name,
+            "Level": "ATM" if level == 0 else f"ATM{level:+d}",
+            "Side": side,
+            "Strike": arrays["strike"][i] if i < len(arrays["strike"]) else None,
+            "Spot": arrays["spot"][i] if i < len(arrays["spot"]) else None,
+            "IV": arrays["iv"][i] if i < len(arrays["iv"]) else None,
+            "OI": arrays["oi"][i] if i < len(arrays["oi"]) else None,
+            "Close": arrays["close"][i] if i < len(arrays["close"]) else None,
+        })
     return rows, len(timestamps)
 
 
 def safe_df(rows):
-    columns = ["Date", "Time", "Index", "Level", "Side", "Strike", "Spot", "IV", "OI", "Close"]
+    cols = ["Date", "Time", "Index", "Level", "Side", "Strike", "Spot", "IV", "OI", "Close"]
     if not rows:
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=cols)
     frame = pd.DataFrame(rows)
     frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce").dt.date
     for col in ("Strike", "Spot", "IV", "OI", "Close"):
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
-    return (
-        frame.dropna(subset=["Date"])
-        .drop_duplicates(["Date", "Index", "Level", "Side"], keep="last")
-        .sort_values(["Date", "Index", "Level", "Side"])
-        .reset_index(drop=True)
-    )
+    return frame.dropna(subset=["Date"]).drop_duplicates(["Date", "Index", "Level", "Side"], keep="last").sort_values(["Date", "Index", "Level", "Side"]).reset_index(drop=True)
 
 
 def fetch_monitor_data():
     today = datetime.now(IST).date()
     start = today - timedelta(days=days - 1)
-    rows = []
-    diagnostics = []
-    errors = []
+    rows, errors, diagnostics = [], [], []
     total = len(INDEXES) * len(LEVELS) * 2
     done = 0
     progress = st.progress(0.0)
     status = st.empty()
-
     for index_name in INDEXES:
         for level in LEVELS:
             for side in ("CE", "PE"):
@@ -154,82 +134,48 @@ def fetch_monitor_data():
                 try:
                     chunk, raw_bars = rolling(index_name, level, side, start, today)
                     rows.extend(chunk)
-                    diagnostics.append({
-                        "Index": index_name,
-                        "Level": label,
-                        "Side": side,
-                        "Raw minute bars": raw_bars,
-                        "10:00 observations": len(chunk),
-                        "Status": "OK" if chunk else "NO 10:00 BAR",
-                    })
+                    diagnostics.append({"Index": index_name, "Level": label, "Side": side, "Expiry code": expiry_code, "Raw minute bars": raw_bars, "10:00 observations": len(chunk), "Status": "OK" if chunk else "NO 10:00 BAR"})
                 except Exception as exc:
                     errors.append(f"{index_name} {label} {side}: {exc}")
-                    diagnostics.append({
-                        "Index": index_name,
-                        "Level": label,
-                        "Side": side,
-                        "Raw minute bars": 0,
-                        "10:00 observations": 0,
-                        "Status": f"ERROR: {exc}",
-                    })
+                    diagnostics.append({"Index": index_name, "Level": label, "Side": side, "Expiry code": expiry_code, "Raw minute bars": 0, "10:00 observations": 0, "Status": f"ERROR: {exc}"})
                 done += 1
                 progress.progress(done / total)
-
-    progress.empty()
-    status.empty()
+    progress.empty(); status.empty()
     return safe_df(rows), errors, pd.DataFrame(diagnostics)
 
 
 def render_results(data, errors, diagnostics, fetched_at):
-    st.success(
-        f"Loaded {len(data):,} 10:00 observations • "
-        f"Last update: {fetched_at.strftime('%H:%M:%S IST')}"
-    )
-
+    st.success(f"Loaded {len(data):,} 10:00 observations • Last update: {fetched_at.strftime('%H:%M:%S IST')}")
     st.subheader("10:00 ATM IV Trend")
     atm = data[data["Level"] == "ATM"].copy()
     if not atm.empty:
         pivot = atm.pivot_table(index="Date", columns=["Index", "Side"], values="IV", aggfunc="last")
-        st.line_chart(pivot)
-
+        pivot.columns = [f"{index_name}_{side}" for index_name, side in pivot.columns.to_flat_index()]
+        pivot.index.name = "Date"
+        pivot = pivot.reset_index()
+        for col in pivot.columns[1:]:
+            pivot[col] = pd.to_numeric(pivot[col], errors="coerce")
+        try:
+            st.line_chart(pivot, x="Date")
+        except Exception:
+            st.dataframe(pivot, use_container_width=True, hide_index=True)
     st.subheader("ATM ±2 OI Monitoring")
     oi = data.copy()
     oi["OI"] = pd.to_numeric(oi["OI"], errors="coerce")
-    oi["OI Change vs Previous Day"] = oi.sort_values("Date").groupby(
-        ["Index", "Level", "Side"]
-    )["OI"].diff()
-    st.dataframe(
-        oi[["Date", "Index", "Level", "Strike", "Side", "OI", "OI Change vs Previous Day"]],
-        use_container_width=True,
-        hide_index=True,
-    )
-
+    oi["OI Change vs Previous Day"] = oi.sort_values("Date").groupby(["Index", "Level", "Side"])["OI"].diff()
+    st.dataframe(oi[["Date", "Index", "Level", "Strike", "Side", "OI", "OI Change vs Previous Day"]], use_container_width=True, hide_index=True)
     st.subheader("Daily IV Comparison")
     iv = data.copy().sort_values("Date")
     iv["IV"] = pd.to_numeric(iv["IV"], errors="coerce")
     iv["IV Change vs Previous Day"] = iv.groupby(["Index", "Level", "Side"])["IV"].diff()
-    st.dataframe(
-        iv[["Date", "Index", "Level", "Strike", "Side", "Spot", "IV", "IV Change vs Previous Day", "OI"]],
-        use_container_width=True,
-        hide_index=True,
-    )
-
+    st.dataframe(iv[["Date", "Index", "Level", "Strike", "Side", "Spot", "IV", "IV Change vs Previous Day", "OI"]], use_container_width=True, hide_index=True)
     with st.expander("Fetch diagnostics"):
         st.dataframe(diagnostics, use_container_width=True, hide_index=True)
-
     if errors:
         st.warning(f"{len(errors)} series could not be loaded; available series are still displayed.")
         with st.expander("Show unavailable series"):
             st.write("\n".join(errors))
-
-    st.download_button(
-        "DOWNLOAD 30-DAY CSV",
-        data.to_csv(index=False).encode("utf-8"),
-        "iv_monitor_30_day.csv",
-        "text/csv",
-        use_container_width=True,
-    )
-
+    st.download_button("DOWNLOAD 30-DAY CSV", data.to_csv(index=False).encode("utf-8"), "iv_monitor_30_day.csv", "text/csv", use_container_width=True)
 
 DATA_KEY = "iv_monitor_30d_data"
 ERROR_KEY = "iv_monitor_30d_errors"
@@ -238,9 +184,8 @@ TIME_KEY = "iv_monitor_30d_fetched_at"
 PARAM_KEY = "iv_monitor_30d_params"
 ACTIVE_KEY = "iv_monitor_30d_active"
 
-params = (expiry_flag, int(expiry_code), int(days), client_id)
+params = (expiry_flag, expiry_code, int(days), client_id)
 fetch_clicked = st.button("FETCH / REFRESH LAST 30 DAYS", type="primary", use_container_width=True)
-
 if st.session_state.get(PARAM_KEY) != params:
     st.session_state.pop(DATA_KEY, None)
     st.session_state.pop(ERROR_KEY, None)
@@ -266,14 +211,12 @@ def monitoring_panel():
     diagnostics = st.session_state.get(DIAG_KEY, pd.DataFrame())
     fetched_at = st.session_state.get(TIME_KEY)
     active = bool(st.session_state.get(ACTIVE_KEY, False))
-
     if not active or data is None or data.empty:
         st.info("Click FETCH / REFRESH LAST 30 DAYS to load the historical monitor.")
-        if not diagnostics.empty:
+        if diagnostics is not None and not diagnostics.empty:
             st.subheader("Fetch diagnostics")
             st.dataframe(diagnostics, use_container_width=True, hide_index=True)
         return
-
     if auto_refresh:
         try:
             fresh_data, fresh_errors, fresh_diag = fetch_monitor_data()
@@ -282,15 +225,10 @@ def monitoring_panel():
                 st.session_state[ERROR_KEY] = fresh_errors
                 st.session_state[DIAG_KEY] = fresh_diag
                 st.session_state[TIME_KEY] = datetime.now(IST)
-                data = fresh_data
-                errors = fresh_errors
-                diagnostics = fresh_diag
-                fetched_at = st.session_state[TIME_KEY]
+                data, errors, diagnostics, fetched_at = fresh_data, fresh_errors, fresh_diag, st.session_state[TIME_KEY]
         except Exception as exc:
             st.warning(f"Automatic refresh failed; showing the last good dataset. {exc}")
-
     render_results(data, errors, diagnostics, fetched_at or datetime.now(IST))
     st.caption("Auto-refresh: ON • every 1 minute" if auto_refresh else "Auto-refresh: OFF")
-
 
 monitoring_panel()
