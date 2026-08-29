@@ -10,10 +10,12 @@ import streamlit as st
 DHAN_API = "https://api.dhan.co/v2"
 MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 
-# Index options: exactly 21 ATM-relative strikes = ATM-10 through ATM+10.
-INDEX_OFFSETS = tuple(range(-10, 11))
-# Stock F&O: Dhan rolling historical API supports ATM-3 through ATM+3.
-STOCK_OFFSETS = tuple(range(-3, 4))
+# Dhan v2 Data APIs: 5 requests/sec and 100,000/day.
+# Keep application traffic below the hard limit and back off on 805/429/904.
+SAFE_RPS = 4.0
+MIN_INTERVAL = 1.0 / SAFE_RPS
+MAX_RETRIES = 7
+DAILY_REQUEST_BUDGET = 95000
 
 st.set_page_config(page_title="Dhan Options Data Downloader", page_icon="📥", layout="wide")
 
@@ -90,18 +92,63 @@ def windows(y: int) -> List[Tuple[str, str]]:
     return out
 
 
+class DhanRateLimiter:
+    def __init__(self, min_interval: float = MIN_INTERVAL):
+        self.min_interval = min_interval
+        self.last_request = 0.0
+        self.total_requests = 0
+
+    def wait(self):
+        now = time.monotonic()
+        sleep_for = self.min_interval - (now - self.last_request)
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        self.last_request = time.monotonic()
+        self.total_requests += 1
+
+
+RATE_LIMITER = DhanRateLimiter()
+
+
 def post(client, token, payload):
-    r = requests.post(DHAN_API + "/charts/rollingoption", headers={
-        "Accept": "application/json", "Content-Type": "application/json",
-        "access-token": token, "client-id": client,
-    }, json=payload, timeout=90)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Dhan HTTP {r.status_code}: {r.text[:700]}")
-    j = r.json()
-    status = str(j.get("status", "")).lower()
-    if status and status not in ("success", "ok"):
-        raise RuntimeError(str(j)[:700])
-    return j
+    delay = 1.0
+    for attempt in range(MAX_RETRIES + 1):
+        RATE_LIMITER.wait()
+        try:
+            r = requests.post(
+                DHAN_API + "/charts/rollingoption",
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "access-token": token,
+                    "client-id": client,
+                },
+                json=payload,
+                timeout=90,
+            )
+        except requests.RequestException as exc:
+            if attempt >= MAX_RETRIES:
+                raise RuntimeError(f"Network error after retries: {exc}") from exc
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+            continue
+
+        if r.status_code < 400:
+            j = r.json()
+            status = str(j.get("status", "")).lower()
+            if status and status not in ("success", "ok"):
+                raise RuntimeError(str(j)[:700])
+            return j
+
+        body_text = r.text[:700]
+        rate_limited = r.status_code in (429, 503) or "805" in body_text or "904" in body_text
+        if rate_limited and attempt < MAX_RETRIES:
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+            continue
+        raise RuntimeError(f"Dhan HTTP {r.status_code}: {body_text}")
+
+    raise RuntimeError("Request retry loop exhausted.")
 
 
 def fetch_one(client, token, row, year, offset, side, expiry_flag, expiry_code):
@@ -109,12 +156,17 @@ def fetch_one(client, token, row, year, offset, side, expiry_flag, expiry_code):
     instrument = "OPTIDX" if row.family == "INDEX" else "OPTSTK"
     for a, b in windows(year):
         payload = {
-            "exchangeSegment": row.exchange_segment, "interval": "1",
-            "securityId": str(int(row.underlying_security_id)), "instrument": instrument,
-            "expiryFlag": expiry_flag, "expiryCode": int(expiry_code),
-            "strike": offset, "drvOptionType": side,
+            "exchangeSegment": row.exchange_segment,
+            "interval": "1",
+            "securityId": str(int(row.underlying_security_id)),
+            "instrument": instrument,
+            "expiryFlag": expiry_flag,
+            "expiryCode": int(expiry_code),
+            "strike": offset,
+            "drvOptionType": side,
             "requiredData": ["open", "high", "low", "close", "iv", "volume", "strike", "oi", "spot"],
-            "fromDate": a, "toDate": b,
+            "fromDate": a,
+            "toDate": b,
         }
         j = post(client, token, payload)
         leg = (j.get("data") or {}).get("ce" if side == "CALL" else "pe") or {}
@@ -122,9 +174,11 @@ def fetch_one(client, token, row, year, offset, side, expiry_flag, expiry_code):
         if not ts:
             continue
         n = len(ts)
+
         def arr(k):
             z = list(leg.get(k) or [])
             return (z + [None] * n)[:n]
+
         f = pd.DataFrame({
             "timestamp": pd.to_datetime(ts, unit="s", utc=True).tz_convert("Asia/Kolkata").tz_localize(None),
             "open": arr("open"), "high": arr("high"), "low": arr("low"), "close": arr("close"),
@@ -163,9 +217,10 @@ with st.sidebar:
     years_text = st.text_input("Years", "2022-2026")
     stock_mode = st.selectbox("F&O stock strikes", ["ATM-3 to ATM+3", "ATM only"])
     expiry_codes = st.multiselect("Expiry codes", [0, 1, 2], default=[0, 1, 2])
-    delay = st.number_input("Delay between API requests (sec)", 0.0, 5.0, 0.25, 0.25)
+    st.number_input("Safety rate limit (requests/sec)", 1.0, 4.0, 4.0, 0.5, disabled=True)
 
-st.info("INDEX OPTIONS: 21 ATM-relative strikes — ATM-10 through ATM+10, inclusive. Both CALL and PUT are downloaded for every requested offset. STOCK F&O: ATM-3 through ATM+3.")
+st.info("Index options: ATM-10 to ATM+10 (21 strikes). Stock F&O: ATM-3 to ATM+3 because that is the documented rolling-option range for non-index contracts.")
+st.warning("Built-in protection: maximum 4 requests/sec, exponential backoff on Dhan rate-limit responses, and a 95,000-request safety ceiling for a single run.")
 
 if not client or not token:
     st.warning("Enter Dhan Client ID and Access Token in the sidebar.")
@@ -207,14 +262,8 @@ if st.button("DOWNLOAD YEAR-WISE DATA", type="primary", use_container_width=True
         st.error("Select valid years, expiry codes and at least one underlying.")
         st.stop()
 
-    idx_offsets = [f"ATM{n:+d}" if n else "ATM" for n in INDEX_OFFSETS]
-    stk_offsets = [f"ATM{n:+d}" if n else "ATM" for n in (STOCK_OFFSETS if stock_mode.startswith("ATM-3") else [0])]
-
-    # Safety check: an index job must always contain exactly the 21 offsets ATM-10..ATM+10.
-    if len(idx_offsets) != 21 or idx_offsets[0] != "ATM-10" or idx_offsets[-1] != "ATM+10":
-        st.error("Internal strike-range configuration error: index range must be ATM-10 through ATM+10.")
-        st.stop()
-
+    idx_offsets = [f"ATM{n:+d}" if n else "ATM" for n in range(-10, 11)]
+    stk_offsets = [f"ATM{n:+d}" if n else "ATM" for n in (range(-3, 4) if stock_mode.startswith("ATM-3") else [0])]
     jobs = []
     for _, r in selected.iterrows():
         offs = idx_offsets if r.family == "INDEX" else stk_offsets
@@ -223,33 +272,36 @@ if st.button("DOWNLOAD YEAR-WISE DATA", type="primary", use_container_width=True
             for ef in flags:
                 for ec in expiry_codes:
                     for off in offs:
-                        # Every ATM-relative index strike is downloaded for BOTH option legs.
                         for side in ["CALL", "PUT"]:
                             jobs.append((r, y, off, side, ef, ec))
 
-    st.caption(f"Index strike range: ATM-10 … ATM+10 ({len(idx_offsets)} strikes) × CALL + PUT. Stock range: {len(stk_offsets)} strikes when enabled. Total request groups: {len(jobs):,}. Historical requests are split into 30-day windows.")
+    if len(jobs) > DAILY_REQUEST_BUDGET:
+        st.error(f"This selection would schedule {len(jobs):,} request groups, above the safety ceiling of {DAILY_REQUEST_BUDGET:,}. Reduce years, underlyings or expiry codes.")
+        st.stop()
+
+    st.caption(f"Total request groups: {len(jobs):,}. Each group is split into 30-day historical windows. API traffic is paced below Dhan's 5 requests/sec Data API ceiling.")
     prog = st.progress(0.0)
     status = st.empty()
     frames, errors = [], []
+
     for i, (r, y, off, side, ef, ec) in enumerate(jobs, 1):
-        status.write(f"{r.underlying_symbol} | {y} | {ef} {ec} | {off} | {side}")
+        status.write(f"{r.underlying_symbol} | {y} | {ef} {ec} | {off} | {side} | API requests: {RATE_LIMITER.total_requests}")
         try:
             z = fetch_one(client, token, r, y, off, side, ef, ec)
             if not z.empty:
                 frames.append(z)
         except Exception as e:
             errors.append({"underlying": r.underlying_symbol, "year": y, "expiry_flag": ef, "expiry_code": ec, "strike": off, "side": side, "error": str(e)})
-        if delay:
-            time.sleep(delay)
         prog.progress(i / len(jobs))
+
     if not frames:
         st.error("No data returned. Check Dhan API/data subscription, token validity, date range and expiry parameters.")
         if errors:
             st.dataframe(pd.DataFrame(errors), use_container_width=True)
     else:
         data = pd.concat(frames, ignore_index=True).drop_duplicates()
-        st.success(f"Downloaded {len(data):,} rows across {data.year.nunique()} year(s).")
+        st.success(f"Downloaded {len(data):,} rows across {data.year.nunique()} year(s). API requests sent: {RATE_LIMITER.total_requests:,}.")
         st.download_button("DOWNLOAD YEAR-WISE ZIP", zip_by_year(data), "dhan_options_yearwise.zip", "application/zip", use_container_width=True)
         if errors:
-            st.warning(f"{len(errors):,} request groups failed.")
+            st.warning(f"{len(errors):,} request groups failed after controlled retries.")
             st.dataframe(pd.DataFrame(errors), use_container_width=True)
