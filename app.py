@@ -10,6 +10,11 @@ import streamlit as st
 DHAN_API = "https://api.dhan.co/v2"
 MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 
+# Index options: exactly 21 ATM-relative strikes = ATM-10 through ATM+10.
+INDEX_OFFSETS = tuple(range(-10, 11))
+# Stock F&O: Dhan rolling historical API supports ATM-3 through ATM+3.
+STOCK_OFFSETS = tuple(range(-3, 4))
+
 st.set_page_config(page_title="Dhan Options Data Downloader", page_icon="📥", layout="wide")
 
 
@@ -160,7 +165,7 @@ with st.sidebar:
     expiry_codes = st.multiselect("Expiry codes", [0, 1, 2], default=[0, 1, 2])
     delay = st.number_input("Delay between API requests (sec)", 0.0, 5.0, 0.25, 0.25)
 
-st.info("Index options: ATM-10 to ATM+10. Stock F&O: ATM-3 to ATM+3 because that is the documented rolling-option range for non-index contracts.")
+st.info("INDEX OPTIONS: 21 ATM-relative strikes — ATM-10 through ATM+10, inclusive. Both CALL and PUT are downloaded for every requested offset. STOCK F&O: ATM-3 through ATM+3.")
 
 if not client or not token:
     st.warning("Enter Dhan Client ID and Access Token in the sidebar.")
@@ -201,8 +206,15 @@ if st.button("DOWNLOAD YEAR-WISE DATA", type="primary", use_container_width=True
     if not ys or not expiry_codes or selected.empty:
         st.error("Select valid years, expiry codes and at least one underlying.")
         st.stop()
-    idx_offsets = [f"ATM{n:+d}" if n else "ATM" for n in range(-10, 11)]
-    stk_offsets = [f"ATM{n:+d}" if n else "ATM" for n in (range(-3, 4) if stock_mode.startswith("ATM-3") else [0])]
+
+    idx_offsets = [f"ATM{n:+d}" if n else "ATM" for n in INDEX_OFFSETS]
+    stk_offsets = [f"ATM{n:+d}" if n else "ATM" for n in (STOCK_OFFSETS if stock_mode.startswith("ATM-3") else [0])]
+
+    # Safety check: an index job must always contain exactly the 21 offsets ATM-10..ATM+10.
+    if len(idx_offsets) != 21 or idx_offsets[0] != "ATM-10" or idx_offsets[-1] != "ATM+10":
+        st.error("Internal strike-range configuration error: index range must be ATM-10 through ATM+10.")
+        st.stop()
+
     jobs = []
     for _, r in selected.iterrows():
         offs = idx_offsets if r.family == "INDEX" else stk_offsets
@@ -211,9 +223,11 @@ if st.button("DOWNLOAD YEAR-WISE DATA", type="primary", use_container_width=True
             for ef in flags:
                 for ec in expiry_codes:
                     for off in offs:
+                        # Every ATM-relative index strike is downloaded for BOTH option legs.
                         for side in ["CALL", "PUT"]:
                             jobs.append((r, y, off, side, ef, ec))
-    st.caption(f"Total request groups: {len(jobs):,}. Historical requests are automatically split into 30-day windows.")
+
+    st.caption(f"Index strike range: ATM-10 … ATM+10 ({len(idx_offsets)} strikes) × CALL + PUT. Stock range: {len(stk_offsets)} strikes when enabled. Total request groups: {len(jobs):,}. Historical requests are split into 30-day windows.")
     prog = st.progress(0.0)
     status = st.empty()
     frames, errors = [], []
