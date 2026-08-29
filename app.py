@@ -103,6 +103,10 @@ def windows(y: int) -> List[Tuple[str, str]]:
     return out
 
 
+def unique_year_windows(ys):
+    return sum((windows(y) for y in ys), [])
+
+
 class DhanRateLimiter:
     def __init__(self, min_interval: float = MIN_INTERVAL):
         self.min_interval = min_interval
@@ -125,9 +129,7 @@ def post(client, token, payload):
     delay = 1.0
     for attempt in range(MAX_RETRIES + 1):
         if RATE_LIMITER.total_requests >= DAILY_REQUEST_BUDGET:
-            raise RuntimeError(
-                f"Daily downloader safety budget reached at {DAILY_REQUEST_BUDGET:,} API requests."
-            )
+            raise RuntimeError(f"Daily downloader safety budget reached at {DAILY_REQUEST_BUDGET:,} API requests.")
         RATE_LIMITER.wait()
         try:
             r = requests.post(
@@ -147,14 +149,12 @@ def post(client, token, payload):
             time.sleep(delay)
             delay = min(delay * 2, 30)
             continue
-
         if r.status_code < 400:
             j = r.json()
             status = str(j.get("status", "")).lower()
             if status and status not in ("success", "ok"):
                 raise RuntimeError(str(j)[:700])
             return j
-
         body_text = r.text[:700]
         rate_limited = r.status_code in (429, 503) or "805" in body_text or "904" in body_text
         if rate_limited and attempt < MAX_RETRIES:
@@ -162,7 +162,6 @@ def post(client, token, payload):
             delay = min(delay * 2, 60)
             continue
         raise RuntimeError(f"Dhan HTTP {r.status_code}: {body_text}")
-
     raise RuntimeError("Request retry loop exhausted.")
 
 
@@ -212,6 +211,32 @@ def fetch_one(client, token, row, year, offset, side, expiry_flag, expiry_code):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+def detect_available_expiry_flags(x, selected, years):
+    """Return only WEEK/MONTH flags that actually occur in the master for the selected indexes/years."""
+    if x.empty or selected.empty:
+        return []
+    work = x[x["underlying_security_id"].isin(selected["underlying_security_id"])].copy()
+    work = work[work["expiry_date"].dt.year.isin(years)]
+    if work.empty:
+        return []
+    flags = set()
+    raw = work["expiry_flag"].astype(str).str.upper().str.strip()
+    for v in raw.dropna().unique():
+        if v in {"W", "WEEK", "WEEKLY"}:
+            flags.add("WEEK")
+        elif v in {"M", "MONTH", "MONTHLY"}:
+            flags.add("MONTH")
+    return [f for f in ("WEEK", "MONTH") if f in flags]
+
+
+def expiry_flag_exists_for_index(x, row, year, flag):
+    work = x[(x.underlying_security_id == row.underlying_security_id) & (x.expiry_date.dt.year == year)].copy()
+    raw = work.expiry_flag.astype(str).str.upper().str.strip()
+    if flag == "WEEK":
+        return raw.isin(["W", "WEEK", "WEEKLY"]).any()
+    return raw.isin(["M", "MONTH", "MONTHLY"]).any()
+
+
 def zip_by_year(df):
     b = io.BytesIO()
     with zipfile.ZipFile(b, "w", zipfile.ZIP_DEFLATED) as z:
@@ -221,7 +246,7 @@ def zip_by_year(df):
 
 
 st.title("📥 Dhan Index Options Data Downloader")
-st.caption("Current scope: BANKNIFTY + FINNIFTY + SENSEX • ATM−10 … ATM+10 • CE + PE")
+st.caption("BANKNIFTY + FINNIFTY + SENSEX • ATM−10 … ATM+10 • CE + PE • year-wise")
 
 with st.sidebar:
     st.header("Dhan Connection")
@@ -230,11 +255,11 @@ with st.sidebar:
     st.divider()
     years_text = st.text_input("Years", "2022-2026")
     expiry_codes = st.multiselect("Expiry codes", [0, 1, 2], default=[0, 1, 2])
-    st.caption("Index strikes are fixed at 21 levels: ATM−10 through ATM+10.")
-    st.caption("Requests are paced below Dhan's published 5 requests/sec Data API limit.")
+    st.caption("Index strikes: 21 levels from ATM−10 through ATM+10.")
+    st.caption("Weekly data is skipped automatically when the instrument master shows no weekly contracts for that index/year.")
 
-st.info("Only these three indexes are enabled right now: BANKNIFTY, FINNIFTY and SENSEX. Each download requests 21 ATM-relative strikes (−10 to +10) for both CALL and PUT.")
-st.warning("Built-in protection: 4 requests/sec application cap, exponential backoff for rate-limit errors, and a 95,000-request safety ceiling.")
+st.info("Current scope: BANKNIFTY, FINNIFTY and SENSEX only. Every available weekly/monthly series is downloaded across ATM−10 to ATM+10 for CALL and PUT.")
+st.warning("Protection: max 4 requests/sec, exponential backoff on rate-limit errors, and a 95,000-request safety ceiling per run.")
 
 if not client or not token:
     st.warning("Enter Dhan Client ID and Access Token in the sidebar.")
@@ -261,7 +286,7 @@ st.subheader("Requested index universe")
 st.dataframe(u, use_container_width=True, height=240)
 
 available = sorted(u.underlying_symbol.unique())
-default_selected = [name for name in available if any(name.upper() in names for names in TARGET_INDEXES.values())]
+default_selected = available
 selected_symbols = st.multiselect("Indexes", available, default=default_selected)
 selected = u[u.underlying_symbol.isin(selected_symbols)].copy()
 st.metric("Selected", len(selected))
@@ -274,49 +299,86 @@ if st.button("DOWNLOAD YEAR-WISE DATA", type="primary", use_container_width=True
 
     idx_offsets = [f"ATM{n:+d}" if n else "ATM" for n in range(-10, 11)]
     jobs = []
+    availability_rows = []
+
     for _, r in selected.iterrows():
         for y in ys:
-            for ef in ["WEEK", "MONTH"]:
+            for ef in ("WEEK", "MONTH"):
+                available_flag = expiry_flag_exists_for_index(st.session_state["contracts"], r, y, ef)
+                availability_rows.append({
+                    "index": r.underlying_symbol,
+                    "year": y,
+                    "expiry_type": ef,
+                    "status": "AVAILABLE" if available_flag else "SKIPPED — NO CONTRACTS",
+                })
+                if not available_flag:
+                    continue
                 for ec in expiry_codes:
                     for off in idx_offsets:
                         for side in ["CALL", "PUT"]:
                             jobs.append((r, y, off, side, ef, ec))
 
-    total_windows_per_job = len(windows(ys[0])) if ys else 0
-    estimated_requests = sum(len(windows(y)) for y in ys) * len(selected) * 2 * len(expiry_codes) * 21 * 1 * 2
+    estimated_requests = sum(len(windows(y)) for _, y, _, _, _, _ in jobs)
+    st.subheader("Expiry availability")
+    st.dataframe(pd.DataFrame(availability_rows), use_container_width=True, hide_index=True)
+    st.caption(f"Planned logical jobs: {len(jobs):,} | estimated API requests after 30-day splitting: {estimated_requests:,}")
+
     if estimated_requests > DAILY_REQUEST_BUDGET:
         st.error(
-            f"This selection is estimated at about {estimated_requests:,} API requests, above the 95,000-request safety ceiling. "
-            "Reduce years or expiry codes for this run."
+            f"This selection is estimated at {estimated_requests:,} API requests, above the 95,000-request safety ceiling. "
+            "Reduce the year range or expiry codes for this run."
         )
         st.stop()
 
-    st.caption(f"Estimated API requests: ~{estimated_requests:,}. Each request covers one 30-day historical window.")
+    if not jobs:
+        st.warning("No weekly/monthly contract availability was found for the selected indexes and years.")
+        st.stop()
+
     prog = st.progress(0.0)
     status = st.empty()
     frames, errors = [], []
     total_jobs = len(jobs)
 
     for i, (r, y, off, side, ef, ec) in enumerate(jobs, 1):
-        status.write(f"{r.underlying_symbol} | {r.exchange_segment} | {y} | {ef} {ec} | {off} | {side} | API calls: {RATE_LIMITER.total_requests}")
+        status.write(
+            f"{r.underlying_symbol} | {r.exchange_segment} | {y} | {ef} {ec} | "
+            f"{off} | {side} | API calls: {RATE_LIMITER.total_requests}"
+        )
         try:
             z = fetch_one(client, token, r, y, off, side, ef, ec)
             if not z.empty:
                 frames.append(z)
         except Exception as e:
-            errors.append({"underlying": r.underlying_symbol, "year": y, "expiry_flag": ef, "expiry_code": ec, "strike": off, "side": side, "error": str(e)})
+            errors.append({
+                "underlying": r.underlying_symbol,
+                "year": y,
+                "expiry_flag": ef,
+                "expiry_code": ec,
+                "strike": off,
+                "side": side,
+                "error": str(e),
+            })
             if "Daily downloader safety budget reached" in str(e):
                 break
         prog.progress(i / total_jobs)
 
     if not frames:
-        st.error("No data returned. Check Dhan API/data subscription, token validity, date range and expiry parameters.")
+        st.error("No data returned. Check Dhan API/data subscription, token validity, dates and instrument availability.")
         if errors:
             st.dataframe(pd.DataFrame(errors), use_container_width=True)
     else:
         data = pd.concat(frames, ignore_index=True).drop_duplicates()
-        st.success(f"Downloaded {len(data):,} rows across {data.year.nunique()} year(s). API requests sent: {RATE_LIMITER.total_requests:,}.")
-        st.download_button("DOWNLOAD YEAR-WISE ZIP", zip_by_year(data), "banknifty_finnifty_sensex_yearwise.zip", "application/zip", use_container_width=True)
+        st.success(
+            f"Downloaded {len(data):,} rows across {data.year.nunique()} year(s). "
+            f"API requests sent: {RATE_LIMITER.total_requests:,}."
+        )
+        st.download_button(
+            "DOWNLOAD YEAR-WISE ZIP",
+            zip_by_year(data),
+            "banknifty_finnifty_sensex_yearwise.zip",
+            "application/zip",
+            use_container_width=True,
+        )
         if errors:
-            st.warning(f"{len(errors):,} request groups had errors or were stopped by the safety budget.")
+            st.warning(f"{len(errors):,} request groups had API errors after controlled retries.")
             st.dataframe(pd.DataFrame(errors), use_container_width=True)
