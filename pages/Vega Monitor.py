@@ -111,8 +111,7 @@ def normalize_chain(chain: dict) -> tuple[pd.DataFrame, float]:
                 "LTP": pd.to_numeric(leg.get("last_price"), errors="coerce"),
             })
     frame = pd.DataFrame(rows)
-    if frame.empty:
-        raise RuntimeError("No option-chain strikes were returned.")
+    if frame.empty: raise RuntimeError("No option-chain strikes were returned.")
     return frame, float(spot)
 
 
@@ -136,8 +135,7 @@ def aggregate_vega(df: pd.DataFrame, mode: str) -> tuple[float, float, float]:
         denom = float(weights.sum())
         valid["Vega value"] = valid["Current Vega"] * weights / denom if denom > 0 else valid["Current Vega"]
         col = "Vega value"
-    else:
-        col = "Current Vega"
+    else: col = "Current Vega"
     call_v = float(valid.loc[valid.Side == "CE", col].sum())
     put_v = float(valid.loc[valid.Side == "PE", col].sum())
     return call_v, put_v, put_v-call_v
@@ -161,17 +159,18 @@ def day_history_key(name: str, date: str, expiry: str, band_size: int, aggregati
 
 
 def update_day_extremes(key: str, table: pd.DataFrame) -> pd.DataFrame:
-    # Each leg gets its own current-day High / Low. Key contains the trading date.
     state_key = f"{key}::leg_extremes"
     state = st.session_state.setdefault(state_key, {})
+    # itertuples sanitizes spaces in column names, so use Current_Vega.
     for row in table.itertuples(index=False):
-        if pd.isna(row["Current Vega"] if isinstance(row, dict) else getattr(row, "Current_Vega")):
+        value = getattr(row, "Current_Vega", np.nan)
+        if pd.isna(value):
             continue
         level = getattr(row, "Level")
         strike = float(getattr(row, "Strike"))
         side = getattr(row, "Side")
-        value = float(getattr(row, "Current_Vega"))
         leg_key = (level, strike, side)
+        value = float(value)
         if leg_key not in state:
             state[leg_key] = {"high": value, "low": value}
         else:
@@ -206,7 +205,6 @@ def monitor():
             signal, count = signal_state(history, 2)
             display = update_day_extremes(key, table)
 
-            # ---- Explicit running/current + day high + day low for ATM CE and ATM PE ----
             atm_rows = display[display["Level"] == "ATM"]
             ce = atm_rows[atm_rows.Side == "CE"].iloc[0] if not atm_rows[atm_rows.Side == "CE"].empty else None
             pe = atm_rows[atm_rows.Side == "PE"].iloc[0] if not atm_rows[atm_rows.Side == "PE"].empty else None
@@ -221,7 +219,7 @@ def monitor():
                 cols[4].metric("PE DAY HIGH VEGA", f"{pe['Day High Vega']:.4f}")
                 cols[5].metric("PE DAY LOW VEGA", f"{pe['Day Low Vega']:.4f}")
             else:
-                st.warning("ATM CE/PE Vega unavailable in the current option-chain response.")
+                st.warning("ATM CE/PE Vega is not available in the current option-chain response.")
 
             st.caption(f"RUNNING = latest live option-chain Vega. High/Low = extrema observed during THIS trading day. Spot: {spot:,.2f} • ATM: {atm:,.0f} • Expiry: {expiry} • Updated: {now.strftime('%H:%M:%S IST')}")
 
