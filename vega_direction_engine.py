@@ -1,12 +1,4 @@
-"""Vega-first market movement detection engine.
-
-The engine answers two separate questions:
-1) Is the option chain entering an abnormal volatility/Vega expansion state?
-2) If so, which side has the stronger asymmetry?
-
-It deliberately does not treat raw Vega level as bullish/bearish. Direction
-comes from changes, acceleration, IV asymmetry, and price confirmation.
-"""
+"""Vega-first market movement detection engine."""
 
 from __future__ import annotations
 
@@ -44,8 +36,7 @@ def _safe_float(value, default=0.0) -> float:
 
 def _pct_change(now: float, old: float) -> float:
     now, old = _safe_float(now), _safe_float(old)
-    denom = max(abs(old), 1e-9)
-    return (now - old) / denom * 100.0
+    return (now - old) / max(abs(old), 1e-9) * 100.0
 
 
 def _range_position(current: float, low: float, high: float) -> float:
@@ -76,28 +67,27 @@ def _side_metrics(history: pd.DataFrame, side: str) -> dict:
     if side_df.empty:
         return {"current": 0.0, "low": 0.0, "high": 0.0, "range_pos": 0.5,
                 "change": 0.0, "acceleration": 0.0, "iv_change": 0.0}
-    side_df = side_df.sort_values("time")
-    current = _safe_float(side_df["vega"].iloc[-1])
-    low = _safe_float(side_df["vega"].min(), current)
-    high = _safe_float(side_df["vega"].max(), current)
-    # Use one aggregated side series at each observation, not strike-level noise.
-    agg = side_df.groupby("time", as_index=False).agg({"vega": "sum", "iv": "mean"}).sort_values("time")
-    change = _recent_delta(agg["vega"], 1)
-    acceleration = _acceleration(agg["vega"], 1, 3)
-    iv_change = _recent_delta(agg["iv"], 1)
+    agg = (
+        side_df.groupby("time", as_index=False)
+        .agg(vega=("vega", "sum"), iv=("iv", "mean"))
+        .sort_values("time")
+    )
+    current = _safe_float(agg["vega"].iloc[-1])
+    low = _safe_float(agg["vega"].min(), current)
+    high = _safe_float(agg["vega"].max(), current)
     return {
         "current": current,
         "low": low,
         "high": high,
         "range_pos": _range_position(current, low, high),
-        "change": change,
-        "acceleration": acceleration,
-        "iv_change": iv_change,
+        "change": _recent_delta(agg["vega"], 1),
+        "acceleration": _acceleration(agg["vega"], 1, 3),
+        "iv_change": _recent_delta(agg["iv"], 1),
     }
 
 
 def calculate_vega_signal(snapshot_history: Iterable[dict]) -> VegaSignal:
-    """Calculate a movement-first Vega signal from timestamped chain snapshots."""
+    """Return movement probability first, then directional asymmetry."""
     rows = []
     for item in snapshot_history:
         time_value = item.get("time")
@@ -110,25 +100,22 @@ def calculate_vega_signal(snapshot_history: Iterable[dict]) -> VegaSignal:
             })
     history = pd.DataFrame(rows)
     if history.empty:
-        return VegaSignal(0, "QUIET", 0, "NEUTRAL", "LOW", 0, 0, 0, 0, 0, .5, .5, False)
+        return VegaSignal(0, "QUIET", 0, "NEUTRAL", "LOW", 0, 0, 0, 0, 0, 50, 50, False)
 
-    ce = _side_metrics(history, "CE")
-    pe = _side_metrics(history, "PE")
+    ce, pe = _side_metrics(history, "CE"), _side_metrics(history, "PE")
 
-    # Movement score: abnormal expansion/acceleration is the core signal.
     total_change = abs(ce["change"]) + abs(pe["change"])
     total_accel = abs(ce["acceleration"]) + abs(pe["acceleration"])
     iv_expansion = max(0.0, ce["iv_change"]) + max(0.0, pe["iv_change"])
     range_energy = max(0.0, ce["range_pos"] - 0.60) + max(0.0, pe["range_pos"] - 0.60)
-
     movement_score = min(100.0, (
         min(total_change, 20.0) / 20.0 * 35.0
         + min(total_accel, 20.0) / 20.0 * 25.0
         + min(iv_expansion, 10.0) / 10.0 * 25.0
         + min(range_energy, 0.8) / 0.8 * 15.0
     ))
-
     expansion = movement_score >= 55.0 and (ce["change"] > 0 or pe["change"] > 0)
+
     if movement_score >= 90:
         movement_state = "EXTREME EXPANSION"
     elif movement_score >= 75:
@@ -140,11 +127,13 @@ def calculate_vega_signal(snapshot_history: Iterable[dict]) -> VegaSignal:
     else:
         movement_state = "QUIET"
 
-    # Direction: positive means CE side stronger; negative means PE side stronger.
     pressure = (ce["change"] - pe["change"]) + 0.75 * (ce["acceleration"] - pe["acceleration"])
     iv_asymmetry = ce["iv_change"] - pe["iv_change"]
-    range_asymmetry = (ce["range_pos"] - 0.5) - (pe["range_pos"] - 0.5)
-    direction_score = float(np.clip(pressure * 1.4 + iv_asymmetry * 3.0 + range_asymmetry * 30.0, -100.0, 100.0))
+    range_asymmetry = ce["range_pos"] - pe["range_pos"]
+    direction_score = float(np.clip(
+        pressure * 1.4 + iv_asymmetry * 3.0 + range_asymmetry * 30.0,
+        -100.0, 100.0
+    ))
 
     if direction_score >= 55:
         direction = "BULLISH"
@@ -157,7 +146,6 @@ def calculate_vega_signal(snapshot_history: Iterable[dict]) -> VegaSignal:
     else:
         direction = "NEUTRAL"
 
-    # Confidence is deliberately conditional on a movement regime.
     magnitude = abs(direction_score)
     if movement_score < 45:
         confidence = "LOW"
@@ -169,17 +157,8 @@ def calculate_vega_signal(snapshot_history: Iterable[dict]) -> VegaSignal:
         confidence = "LOW"
 
     return VegaSignal(
-        movement_score=round(float(movement_score), 1),
-        movement_state=movement_state,
-        direction_score=round(direction_score, 1),
-        direction=direction,
-        confidence=confidence,
-        call_pressure=round(ce["change"], 2),
-        put_pressure=round(pe["change"], 2),
-        call_acceleration=round(ce["acceleration"], 2),
-        put_acceleration=round(pe["acceleration"], 2),
-        iv_asymmetry=round(iv_asymmetry, 2),
-        call_range_position=round(ce["range_pos"] * 100.0, 1),
-        put_range_position=round(pe["range_pos"] * 100.0, 1),
-        expansion=bool(expansion),
+        round(float(movement_score), 1), movement_state, round(direction_score, 1), direction, confidence,
+        round(ce["change"], 2), round(pe["change"], 2),
+        round(ce["acceleration"], 2), round(pe["acceleration"], 2), round(iv_asymmetry, 2),
+        round(ce["range_pos"] * 100.0, 1), round(pe["range_pos"] * 100.0, 1), bool(expansion)
     )
