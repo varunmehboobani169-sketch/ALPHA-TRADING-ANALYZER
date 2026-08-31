@@ -42,11 +42,11 @@ def credentials() -> tuple[str, str]:
 
 
 def require_login() -> tuple[str, str]:
+    """Return fixed client ID + session token, showing the login form when needed."""
     if not is_authenticated():
-        st.warning("Please log in from the Market Access page.")
-        if st.button("OPEN LOGIN", type="primary"):
-            st.switch_page("app.py")
-        st.stop()
+        logged_in = login_form()
+        if not logged_in:
+            st.stop()
     return credentials()
 
 
