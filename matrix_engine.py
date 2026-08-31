@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import io
-import math
-import time
 from typing import Dict, Iterable, Optional
 
 import pandas as pd
@@ -24,7 +22,7 @@ UNIVERSES = {
     "NIFTY TOTAL MARKET": ["NIFTY 500", "NIFTY MICROCAP 250"],
 }
 
-# Four layers mirror the Matrix idea: short, medium, intermediate and long term.
+# Four timeframe layers matching the Matrix-style workflow.
 TIMEFRAMES = {
     "ST": 21,
     "MT": 63,
@@ -34,7 +32,6 @@ TIMEFRAMES = {
 
 DEFAULT_HISTORY_DAYS = 420
 REQUEST_TIMEOUT = 30
-CACHE_TTL_SECONDS = 12 * 60 * 60
 
 
 def _session() -> requests.Session:
@@ -90,8 +87,7 @@ def load_index_members(index_name: str) -> pd.DataFrame:
 
     result = pd.concat(frames, ignore_index=True)
     result = result.drop_duplicates(subset=["symbol"], keep="first")
-    result = result[result["symbol"].ne("") & result["symbol"].ne("NAN")].reset_index(drop=True)
-    return result
+    return result[result["symbol"].ne("") & result["symbol"].ne("NAN")].reset_index(drop=True)
 
 
 def fetch_dhan_instruments() -> pd.DataFrame:
@@ -116,43 +112,49 @@ def resolve_security_ids(members: pd.DataFrame, instruments: pd.DataFrame) -> pd
     if not col_id or not col_sym:
         raise RuntimeError("Dhan scrip master did not contain expected security/symbol columns.")
 
-    # Restrict to NSE cash instruments. Column conventions vary across scrip-master revisions.
     mask = pd.Series(True, index=x.index)
     if col_seg:
         mask &= x[col_seg].astype(str).str.upper().eq("NSE")
     if col_seg2:
-        seg_text = x[col_seg2].astype(str).str.upper()
-        if seg_text.ne("").any():
-            mask &= seg_text.str.contains("EQUITY|NSE_EQ", regex=True, na=False)
+        seg_text = x[col_seg2].astype(str).str.upper().str.strip()
+        # Dhan scrip-master uses E for NSE equity, D for derivatives, I for indices.
+        mask &= seg_text.eq("E")
     if col_inst:
-        inst_text = x[col_inst].astype(str).str.upper()
-        eq_mask = inst_text.eq("EQUITY") | inst_text.str.contains("EQUITY", na=False)
+        inst_text = x[col_inst].astype(str).str.upper().str.strip()
+        eq_mask = inst_text.eq("EQUITY")
         if eq_mask.any():
             mask &= eq_mask
 
     x = x.loc[mask].copy()
     x["_trading_symbol"] = x[col_sym].astype(str).str.upper().str.strip()
-    if col_custom:
-        x["_custom_symbol"] = x[col_custom].astype(str).str.upper().str.strip()
-    else:
-        x["_custom_symbol"] = ""
+    x["_custom_symbol"] = x[col_custom].astype(str).str.upper().str.strip() if col_custom else ""
     x["_security_id"] = x[col_id].astype(str).str.strip()
 
     left = members.copy()
-    left["symbol"] = left["symbol"].str.upper().str.strip()
-    merged = left.merge(x[["_trading_symbol", "_custom_symbol", "_security_id"]], left_on="symbol", right_on="_trading_symbol", how="left")
+    left["symbol"] = left["symbol"].astype(str).str.upper().str.strip()
+    merged = left.merge(
+        x[["_trading_symbol", "_custom_symbol", "_security_id"]],
+        left_on="symbol", right_on="_trading_symbol", how="left"
+    )
     missing = merged["_security_id"].isna() | merged["_security_id"].eq("")
-    if missing.any():
+    if missing.any() and col_custom:
         fallback = x[["_custom_symbol", "_security_id"]].drop_duplicates("_custom_symbol")
-        repl = merged.loc[missing, ["symbol"]].merge(fallback, left_on="symbol", right_on="_custom_symbol", how="left")
+        repl = merged.loc[missing, ["symbol"]].merge(
+            fallback, left_on="symbol", right_on="_custom_symbol", how="left"
+        )
         merged.loc[missing, "_security_id"] = repl["_security_id"].values
-    merged = merged.drop(columns=[c for c in ["_trading_symbol", "_custom_symbol"] if c in merged.columns])
-    return merged
+
+    return merged.drop(columns=["_trading_symbol", "_custom_symbol"], errors="ignore")
 
 
 def fetch_dhan_daily(client_id: str, access_token: str, security_id: str, from_date: str, to_date: str) -> pd.DataFrame:
     url = "https://api.dhan.co/v2/charts/historical"
-    headers = {"Accept": "application/json", "Content-Type": "application/json", "access-token": access_token, "client-id": client_id}
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "access-token": access_token,
+        "client-id": client_id,
+    }
     payload = {
         "securityId": str(security_id),
         "exchangeSegment": "NSE_EQ",
@@ -172,7 +174,8 @@ def fetch_dhan_daily(client_id: str, access_token: str, security_id: str, from_d
     lows = body.get("low") or []
     if not ts or not closes:
         return pd.DataFrame()
-    n = min(len(ts), len(closes), len(highs) or len(ts), len(lows) or len(ts))
+
+    n = min(len(ts), len(closes))
     rows = []
     for i in range(n):
         try:
@@ -180,11 +183,16 @@ def fetch_dhan_daily(client_id: str, access_token: str, security_id: str, from_d
         except Exception:
             dt = pd.to_datetime(ts[i], errors="coerce")
         close = pd.to_numeric(closes[i], errors="coerce")
-        high = pd.to_numeric(highs[i], errors="coerce") if highs else close
-        low = pd.to_numeric(lows[i], errors="coerce") if lows else close
+        high = pd.to_numeric(highs[i], errors="coerce") if i < len(highs) else close
+        low = pd.to_numeric(lows[i], errors="coerce") if i < len(lows) else close
         if pd.isna(dt) or pd.isna(close):
             continue
-        rows.append({"date": dt.normalize(), "close": float(close), "high": float(high) if not pd.isna(high) else float(close), "low": float(low) if not pd.isna(low) else float(close)})
+        rows.append({
+            "date": dt.normalize(),
+            "close": float(close),
+            "high": float(high) if not pd.isna(high) else float(close),
+            "low": float(low) if not pd.isna(low) else float(close),
+        })
     return pd.DataFrame(rows).drop_duplicates("date").sort_values("date").reset_index(drop=True)
 
 
@@ -242,39 +250,36 @@ def score_stock(stock: pd.DataFrame, benchmark: pd.DataFrame) -> Dict[str, objec
     joined = pd.concat([s.rename("stock"), b.rename("benchmark")], axis=1).dropna()
     if joined.empty:
         return {"valid": False}
-    s = joined["stock"]
-    b = joined["benchmark"]
+    s, b = joined["stock"], joined["benchmark"]
     row: Dict[str, object] = {"valid": True, "last_date": str(s.index[-1].date()), "ltp": float(s.iloc[-1])}
-    price_total = 0
-    rs_total = 0
+    price_total = rs_total = 0
     for label, n in TIMEFRAMES.items():
         ps = pattern_score(s, n)
         rs = rs_score(s, b, n)
-        sp = swing_pct(s, n)
         row[f"{label}_price"] = ps
         row[f"{label}_rs"] = rs
-        row[f"{label}_swing_pct"] = sp
+        row[f"{label}_swing_pct"] = swing_pct(s, n)
         price_total += ps
         rs_total += rs
     row["price_score"] = price_total
     row["rs_score"] = rs_total
     row["composite"] = price_total + rs_total
-    row["rank"] = None
-    if row["composite"] >= 12:
+    score = int(row["composite"])
+    if score >= 12:
         row["grade"] = "A+"
-    elif row["composite"] >= 8:
+    elif score >= 8:
         row["grade"] = "A"
-    elif row["composite"] >= 4:
+    elif score >= 4:
         row["grade"] = "B"
-    elif row["composite"] <= -12:
+    elif score <= -12:
         row["grade"] = "C-"
-    elif row["composite"] <= -8:
+    elif score <= -8:
         row["grade"] = "C"
-    elif row["composite"] <= -4:
+    elif score <= -4:
         row["grade"] = "B-"
     else:
         row["grade"] = "NEUTRAL"
-    row["direction"] = "BULLISH" if row["composite"] > 0 else "BEARISH" if row["composite"] < 0 else "NEUTRAL"
+    row["direction"] = "BULLISH" if score > 0 else "BEARISH" if score < 0 else "NEUTRAL"
     return row
 
 
@@ -284,10 +289,7 @@ def build_matrix_rows(members: pd.DataFrame, histories: Dict[str, pd.DataFrame],
         sid = str(member.get("security_id", ""))
         if not sid or sid.lower() == "nan" or sid not in histories:
             continue
-        try:
-            result = score_stock(histories[sid], benchmark)
-        except Exception:
-            continue
+        result = score_stock(histories[sid], benchmark)
         if not result.get("valid"):
             continue
         result.update({
