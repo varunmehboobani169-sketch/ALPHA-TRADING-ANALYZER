@@ -2,6 +2,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import time
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -23,8 +24,10 @@ with st.sidebar:
                         format_func=lambda x: f"ATM−{x} to ATM+{x}", key="vega_band")
     expiry_choice = st.selectbox("Expiry", ["Auto", "Nearest", "Next", "Far"],
                                  index=0, key="vega_expiry_choice")
-    aggregation = st.selectbox("Vega aggregation", ["Simple sum", "OI-weighted"],
-                               index=0, key="vega_aggregation")
+    aggregation = st.selectbox("Vega aggregation", ["Simple sum", "OI-weighted"], index=0,
+                               key="vega_aggregation")
+    count_trigger = st.number_input("Prior consecutive changes before signal", min_value=1, max_value=5,
+                                    value=2, step=1, key="vega_trigger_count")
     refresh_seconds = st.selectbox("Refresh", [5, 10, 15, 30, 60], index=1,
                                    format_func=lambda x: f"Every {x} seconds", key="vega_refresh")
     auto_refresh = st.checkbox("Auto-refresh", value=True, key="vega_auto_refresh")
@@ -135,7 +138,8 @@ def aggregate_vega(df: pd.DataFrame, mode: str) -> tuple[float, float, float]:
         denom = float(weights.sum())
         valid["Vega value"] = valid["Current Vega"] * weights / denom if denom > 0 else valid["Current Vega"]
         col = "Vega value"
-    else: col = "Current Vega"
+    else:
+        col = "Current Vega"
     call_v = float(valid.loc[valid.Side == "CE", col].sum())
     put_v = float(valid.loc[valid.Side == "PE", col].sum())
     return call_v, put_v, put_v-call_v
@@ -161,16 +165,11 @@ def day_history_key(name: str, date: str, expiry: str, band_size: int, aggregati
 def update_day_extremes(key: str, table: pd.DataFrame) -> pd.DataFrame:
     state_key = f"{key}::leg_extremes"
     state = st.session_state.setdefault(state_key, {})
-    # itertuples sanitizes spaces in column names, so use Current_Vega.
     for row in table.itertuples(index=False):
         value = getattr(row, "Current_Vega", np.nan)
-        if pd.isna(value):
-            continue
-        level = getattr(row, "Level")
-        strike = float(getattr(row, "Strike"))
-        side = getattr(row, "Side")
-        leg_key = (level, strike, side)
-        value = float(value)
+        if pd.isna(value): continue
+        level = getattr(row, "Level"); strike = float(getattr(row, "Strike")); side = getattr(row, "Side")
+        leg_key = (level, strike, side); value = float(value)
         if leg_key not in state:
             state[leg_key] = {"high": value, "low": value}
         else:
@@ -202,7 +201,7 @@ def monitor():
             history.append({"time": now, "call": call_v, "put": put_v, "difference": difference, "spot": spot, "atm": atm})
             if len(history) > 500: del history[:-500]
 
-            signal, count = signal_state(history, 2)
+            signal, count = signal_state(history, int(count_trigger))
             display = update_day_extremes(key, table)
 
             atm_rows = display[display["Level"] == "ATM"]
@@ -231,12 +230,9 @@ def monitor():
                 plot_df = hist_df[["time","call","put","difference"]].rename(columns={"time":"Time","call":"Call Vega","put":"Put Vega","difference":"Vega Difference"})
                 st.line_chart(plot_df, x="Time")
 
-            if signal == "BEARISH":
-                st.warning("Vega Difference has increased for the required consecutive observations — bearish pressure.")
-            elif signal == "BULLISH":
-                st.success("Vega Difference has decreased for the required consecutive observations — bullish pressure.")
-            else:
-                st.info(f"Monitoring. Consecutive-change count: {count}.")
+            if signal == "BEARISH": st.warning("Vega Difference has increased for the required consecutive observations — bearish pressure.")
+            elif signal == "BULLISH": st.success("Vega Difference has decreased for the required consecutive observations — bullish pressure.")
+            else: st.info(f"Monitoring. Consecutive-change count: {count}.")
 
             st.download_button(f"DOWNLOAD {name} VEGA HISTORY", hist_df.to_csv(index=False).encode("utf-8"), f"vega_{name.lower()}_{trading_date}.csv", "text/csv", use_container_width=True)
         except Exception as exc:
