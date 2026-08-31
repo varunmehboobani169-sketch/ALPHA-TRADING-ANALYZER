@@ -9,12 +9,11 @@ import streamlit as st
 API = "https://api.dhan.co/v2"
 IST = ZoneInfo("Asia/Kolkata")
 CHAIN_GAP_SECONDS = 3.2
-
 INDEXES = {"NIFTY": {"security_id": 13}, "SENSEX": {"security_id": 51}}
 
 st.set_page_config(page_title="Vega Monitor", page_icon="📈", layout="wide")
 st.title("📈 Vega Monitor")
-st.caption("Live Call / Put Vega monitoring with current-day high/low tracking")
+st.caption("Live Call / Put Vega with CURRENT Vega + Day High + Day Low for every leg")
 
 with st.sidebar:
     st.subheader("Market Access")
@@ -26,8 +25,6 @@ with st.sidebar:
                                  index=0, key="vega_expiry_choice")
     aggregation = st.selectbox("Vega aggregation", ["Simple sum", "OI-weighted"],
                                index=0, key="vega_aggregation")
-    count_trigger = st.number_input("Prior consecutive changes before signal", min_value=1, max_value=5,
-                                    value=2, step=1, key="vega_trigger_count")
     refresh_seconds = st.selectbox("Refresh", [5, 10, 15, 30, 60], index=1,
                                    format_func=lambda x: f"Every {x} seconds", key="vega_refresh")
     auto_refresh = st.checkbox("Auto-refresh", value=True, key="vega_auto_refresh")
@@ -62,9 +59,9 @@ def get_expiries(security_id: int) -> list:
     dates = []
     for value in body.get("data") or []:
         try:
-            date_value = pd.Timestamp(value).date()
-            if date_value >= today:
-                dates.append(date_value)
+            d = pd.Timestamp(value).date()
+            if d >= today:
+                dates.append(d)
         except Exception:
             continue
     dates = sorted(set(dates))
@@ -105,18 +102,23 @@ def normalize_chain(chain: dict) -> tuple[pd.DataFrame, float]:
             leg = node.get("ce" if side == "CE" else "pe") or {}
             if not leg: continue
             greeks = leg.get("greeks") or {}
-            rows.append({"Strike": strike, "Side": side,
-                         "Vega": pd.to_numeric(greeks.get("vega"), errors="coerce"),
-                         "IV": pd.to_numeric(leg.get("implied_volatility"), errors="coerce"),
-                         "OI": pd.to_numeric(leg.get("oi"), errors="coerce"),
-                         "LTP": pd.to_numeric(leg.get("last_price"), errors="coerce")})
+            rows.append({
+                "Strike": strike,
+                "Side": side,
+                "Current Vega": pd.to_numeric(greeks.get("vega"), errors="coerce"),
+                "IV": pd.to_numeric(leg.get("implied_volatility"), errors="coerce"),
+                "OI": pd.to_numeric(leg.get("oi"), errors="coerce"),
+                "LTP": pd.to_numeric(leg.get("last_price"), errors="coerce"),
+            })
     frame = pd.DataFrame(rows)
-    if frame.empty: raise RuntimeError("No option-chain strikes were returned.")
+    if frame.empty:
+        raise RuntimeError("No option-chain strikes were returned.")
     return frame, float(spot)
 
 
 def select_band(df: pd.DataFrame, spot: float, band_size: int) -> tuple[float, pd.DataFrame]:
     strikes = sorted(df["Strike"].dropna().unique().tolist())
+    if not strikes: raise RuntimeError("No valid strikes returned.")
     atm = min(strikes, key=lambda x: abs(x - spot))
     center = strikes.index(atm)
     selected_strikes = [strikes[i] for i in range(center-band_size, center+band_size+1) if 0 <= i < len(strikes)]
@@ -127,17 +129,18 @@ def select_band(df: pd.DataFrame, spot: float, band_size: int) -> tuple[float, p
 
 
 def aggregate_vega(df: pd.DataFrame, mode: str) -> tuple[float, float, float]:
-    valid = df.dropna(subset=["Vega"]).copy()
+    valid = df.dropna(subset=["Current Vega"]).copy()
     if valid.empty: return 0.0, 0.0, 0.0
     if mode == "OI-weighted":
         weights = pd.to_numeric(valid["OI"], errors="coerce").fillna(0.0)
         denom = float(weights.sum())
-        valid["Vega value"] = valid["Vega"] * weights / denom if denom > 0 else valid["Vega"]
+        valid["Vega value"] = valid["Current Vega"] * weights / denom if denom > 0 else valid["Current Vega"]
         col = "Vega value"
-    else: col = "Vega"
-    c = float(valid.loc[valid.Side == "CE", col].sum())
-    p = float(valid.loc[valid.Side == "PE", col].sum())
-    return c, p, p-c
+    else:
+        col = "Current Vega"
+    call_v = float(valid.loc[valid.Side == "CE", col].sum())
+    put_v = float(valid.loc[valid.Side == "PE", col].sum())
+    return call_v, put_v, put_v-call_v
 
 
 def signal_state(history: list[dict], prior_changes: int) -> tuple[str, int]:
@@ -157,22 +160,26 @@ def day_history_key(name: str, date: str, expiry: str, band_size: int, aggregati
     return f"vega_history::{name}::{date}::{expiry}::{band_size}::{aggregation_name}"
 
 
-def update_leg_day_extremes(key: str, table: pd.DataFrame) -> pd.DataFrame:
-    """Persist high/low Vega separately for every leg for the CURRENT trading day."""
+def update_day_extremes(key: str, table: pd.DataFrame) -> pd.DataFrame:
+    # Each leg gets its own current-day High / Low. Key contains the trading date.
     state_key = f"{key}::leg_extremes"
     state = st.session_state.setdefault(state_key, {})
     for row in table.itertuples(index=False):
-        if pd.isna(row.Vega): continue
-        leg_key = (row.Level, float(row.Strike), row.Side)
-        val = float(row.Vega)
+        if pd.isna(row["Current Vega"] if isinstance(row, dict) else getattr(row, "Current_Vega")):
+            continue
+        level = getattr(row, "Level")
+        strike = float(getattr(row, "Strike"))
+        side = getattr(row, "Side")
+        value = float(getattr(row, "Current_Vega"))
+        leg_key = (level, strike, side)
         if leg_key not in state:
-            state[leg_key] = {"high": val, "low": val}
+            state[leg_key] = {"high": value, "low": value}
         else:
-            state[leg_key]["high"] = max(state[leg_key]["high"], val)
-            state[leg_key]["low"] = min(state[leg_key]["low"], val)
+            state[leg_key]["high"] = max(state[leg_key]["high"], value)
+            state[leg_key]["low"] = min(state[leg_key]["low"], value)
     out = table.copy()
-    out["Day High Vega"] = out.apply(lambda r: state.get((r.Level,float(r.Strike),r.Side),{}).get("high"), axis=1)
-    out["Day Low Vega"] = out.apply(lambda r: state.get((r.Level,float(r.Strike),r.Side),{}).get("low"), axis=1)
+    out["Day High Vega"] = out.apply(lambda r: state.get((r["Level"],float(r["Strike"]),r["Side"]),{}).get("high"), axis=1)
+    out["Day Low Vega"] = out.apply(lambda r: state.get((r["Level"],float(r["Strike"]),r["Side"]),{}).get("low"), axis=1)
     out["Vega Range"] = out["Day High Vega"] - out["Day Low Vega"]
     return out
 
@@ -190,35 +197,36 @@ def monitor():
             atm, table = select_band(raw, spot, int(band))
 
             key = day_history_key(name, trading_date, expiry, int(band), aggregation)
-            call_v, put_v, diff = aggregate_vega(table, aggregation)
+            call_v, put_v, difference = aggregate_vega(table, aggregation)
             history = st.session_state.setdefault(key, [])
-            prev = history[-1] if history else None
-            history.append({"time": now, "call": call_v, "put": put_v, "difference": diff, "spot": spot, "atm": atm})
+            previous = history[-1] if history else None
+            history.append({"time": now, "call": call_v, "put": put_v, "difference": difference, "spot": spot, "atm": atm})
             if len(history) > 500: del history[:-500]
 
-            signal, count = signal_state(history, int(count_trigger))
-            display = update_leg_day_extremes(key, table)
+            signal, count = signal_state(history, 2)
+            display = update_day_extremes(key, table)
 
-            # ---------------- ATM summary ----------------
+            # ---- Explicit running/current + day high + day low for ATM CE and ATM PE ----
             atm_rows = display[display["Level"] == "ATM"]
             ce = atm_rows[atm_rows.Side == "CE"].iloc[0] if not atm_rows[atm_rows.Side == "CE"].empty else None
             pe = atm_rows[atm_rows.Side == "PE"].iloc[0] if not atm_rows[atm_rows.Side == "PE"].empty else None
-            st.markdown("**ATM Vega — current day**")
+
+            st.markdown("### ATM VEGA — CURRENT RUNNING / DAY HIGH / DAY LOW")
             if ce is not None and pe is not None:
-                a,b,c,d,e,f = st.columns(6)
-                a.metric("ATM CE Vega", f"{ce.Vega:.4f}")
-                b.metric("CE Day High", f"{ce['Day High Vega']:.4f}")
-                c.metric("CE Day Low", f"{ce['Day Low Vega']:.4f}")
-                d.metric("ATM PE Vega", f"{pe.Vega:.4f}")
-                e.metric("PE Day High", f"{pe['Day High Vega']:.4f}")
-                f.metric("PE Day Low", f"{pe['Day Low Vega']:.4f}")
+                cols = st.columns(6)
+                cols[0].metric("CE CURRENT VEGA", f"{ce['Current Vega']:.4f}")
+                cols[1].metric("CE DAY HIGH VEGA", f"{ce['Day High Vega']:.4f}")
+                cols[2].metric("CE DAY LOW VEGA", f"{ce['Day Low Vega']:.4f}")
+                cols[3].metric("PE CURRENT VEGA", f"{pe['Current Vega']:.4f}")
+                cols[4].metric("PE DAY HIGH VEGA", f"{pe['Day High Vega']:.4f}")
+                cols[5].metric("PE DAY LOW VEGA", f"{pe['Day Low Vega']:.4f}")
             else:
-                st.warning("ATM CE/PE Vega is not available in the current option-chain response.")
+                st.warning("ATM CE/PE Vega unavailable in the current option-chain response.")
 
-            st.caption(f"Spot: {spot:,.2f} • ATM: {atm:,.0f} • Expiry: {expiry} • Band: ATM−{band} to ATM+{band} • Trading day: {trading_date} • Updated: {now.strftime('%H:%M:%S IST')}")
+            st.caption(f"RUNNING = latest live option-chain Vega. High/Low = extrema observed during THIS trading day. Spot: {spot:,.2f} • ATM: {atm:,.0f} • Expiry: {expiry} • Updated: {now.strftime('%H:%M:%S IST')}")
 
-            st.markdown("**Current-day Vega by individual leg**")
-            st.dataframe(display[["Level","Strike","Side","Vega","Day High Vega","Day Low Vega","Vega Range","IV","OI","LTP"]], use_container_width=True, hide_index=True)
+            st.markdown("### ALL LEGS — CURRENT VEGA / DAY HIGH / DAY LOW")
+            st.dataframe(display[["Level","Strike","Side","Current Vega","Day High Vega","Day Low Vega","Vega Range","IV","OI","LTP"]], use_container_width=True, hide_index=True)
 
             hist_df = pd.DataFrame(history)
             if not hist_df.empty:
@@ -230,7 +238,7 @@ def monitor():
             elif signal == "BULLISH":
                 st.success("Vega Difference has decreased for the required consecutive observations — bullish pressure.")
             else:
-                st.info(f"Monitoring. Current consecutive-change count: {count}.")
+                st.info(f"Monitoring. Consecutive-change count: {count}.")
 
             st.download_button(f"DOWNLOAD {name} VEGA HISTORY", hist_df.to_csv(index=False).encode("utf-8"), f"vega_{name.lower()}_{trading_date}.csv", "text/csv", use_container_width=True)
         except Exception as exc:
