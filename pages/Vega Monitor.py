@@ -7,19 +7,23 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from auth import require_login, logout_button, FIXED_CLIENT_ID
+
 API = "https://api.dhan.co/v2"
 IST = ZoneInfo("Asia/Kolkata")
 CHAIN_GAP_SECONDS = 3.2
 INDEXES = {"NIFTY": {"security_id": 13}, "SENSEX": {"security_id": 51}}
 
 st.set_page_config(page_title="Vega Monitor", page_icon="📈", layout="wide")
+client_id, access_token = require_login()
+
 st.title("📈 Vega Monitor")
 st.caption("Live Call / Put Vega with CURRENT Vega + Day High + Day Low for every leg")
+logout_button()
 
 with st.sidebar:
     st.subheader("Market Access")
-    client_id = st.text_input("Client ID", key="vega_client_id")
-    access_token = st.text_input("Access Token", type="password", key="vega_access_token")
+    st.caption(f"Fixed Client ID: {FIXED_CLIENT_ID}")
     band = st.selectbox("Combined strike band", [2, 3, 5, 10], index=0,
                         format_func=lambda x: f"ATM−{x} to ATM+{x}", key="vega_band")
     expiry_choice = st.selectbox("Expiry", ["Auto", "Nearest", "Next", "Far"],
@@ -31,10 +35,6 @@ with st.sidebar:
     refresh_seconds = st.selectbox("Refresh", [5, 10, 15, 30, 60], index=1,
                                    format_func=lambda x: f"Every {x} seconds", key="vega_refresh")
     auto_refresh = st.checkbox("Auto-refresh", value=True, key="vega_auto_refresh")
-
-if not client_id or not access_token:
-    st.info("Enter Client ID and Access Token to start the Vega Monitor.")
-    st.stop()
 
 
 def post(path: str, payload: dict) -> dict:
@@ -205,23 +205,23 @@ def monitor():
             display = update_day_extremes(key, table)
 
             atm_rows = display[display["Level"] == "ATM"]
-            ce = atm_rows[atm_rows.Side == "CE"].iloc[0] if not atm_rows[atm_rows.Side == "CE"].empty else None
-            pe = atm_rows[atm_rows.Side == "PE"].iloc[0] if not atm_rows[atm_rows.Side == "PE"].empty else None
-
             st.markdown("### ATM VEGA — CURRENT RUNNING / DAY HIGH / DAY LOW")
-            if ce is not None and pe is not None:
+            if not atm_rows.empty:
                 cols = st.columns(6)
-                cols[0].metric("CE CURRENT VEGA", f"{ce['Current Vega']:.4f}")
-                cols[1].metric("CE DAY HIGH VEGA", f"{ce['Day High Vega']:.4f}")
-                cols[2].metric("CE DAY LOW VEGA", f"{ce['Day Low Vega']:.4f}")
-                cols[3].metric("PE CURRENT VEGA", f"{pe['Current Vega']:.4f}")
-                cols[4].metric("PE DAY HIGH VEGA", f"{pe['Day High Vega']:.4f}")
-                cols[5].metric("PE DAY LOW VEGA", f"{pe['Day Low Vega']:.4f}")
+                ce = atm_rows[atm_rows.Side == "CE"].iloc[0] if not atm_rows[atm_rows.Side == "CE"].empty else None
+                pe = atm_rows[atm_rows.Side == "PE"].iloc[0] if not atm_rows[atm_rows.Side == "PE"].empty else None
+                if ce is not None:
+                    cols[0].metric("CE CURRENT VEGA", f"{ce['Current Vega']:.4f}")
+                    cols[1].metric("CE DAY HIGH VEGA", f"{ce['Day High Vega']:.4f}")
+                    cols[2].metric("CE DAY LOW VEGA", f"{ce['Day Low Vega']:.4f}")
+                if pe is not None:
+                    cols[3].metric("PE CURRENT VEGA", f"{pe['Current Vega']:.4f}")
+                    cols[4].metric("PE DAY HIGH VEGA", f"{pe['Day High Vega']:.4f}")
+                    cols[5].metric("PE DAY LOW VEGA", f"{pe['Day Low Vega']:.4f}")
             else:
                 st.warning("ATM CE/PE Vega is not available in the current option-chain response.")
 
             st.caption(f"RUNNING = latest live option-chain Vega. High/Low = extrema observed during THIS trading day. Spot: {spot:,.2f} • ATM: {atm:,.0f} • Expiry: {expiry} • Updated: {now.strftime('%H:%M:%S IST')}")
-
             st.markdown("### ALL LEGS — CURRENT VEGA / DAY HIGH / DAY LOW")
             st.dataframe(display[["Level","Strike","Side","Current Vega","Day High Vega","Day Low Vega","Vega Range","IV","OI","LTP"]], use_container_width=True, hide_index=True)
 
