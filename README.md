@@ -18,16 +18,41 @@ A lightweight Streamlit market monitor focused on NIFTY and SENSEX.
 - Combines Vega across a configurable ATM−N to ATM+N strike band; default is ATM−2 to ATM+2.
 - Displays Call Vega, Put Vega and a transparent Vega Difference defined as Put Vega − Call Vega.
 - Tracks Vega change between refreshes and keeps a rolling signal history in the Streamlit session.
-- Uses the script's observable interpretation: rising Vega Difference = bearish pressure; falling Vega Difference = bullish pressure.
-- Implements the script's continuous-count idea: after the configured number of prior consecutive changes, the next same-direction change produces a signal. Default prior count is 2, so the signal appears on the third consecutive change.
+- **Now also tracks ATM Call Vega current/high/low and ATM Put Vega current/high/low for the trading day.**
 - On an expiry day, Auto expiry switches to the next available expiry, matching the behavior described in the supplied script.
-- Expiry discovery is cached for the trading day and option-chain requests are spaced by at least 3.2 seconds to stay above the documented 3-second request interval.
+- Expiry discovery is cached for the trading day and option-chain requests are spaced by at least 3.2 seconds.
+
+## Theta Vega Ratio
+`theta_vega_ratio.py` contains the strategy core and `pages/Theta Vega Ratio.py` is the live dashboard module.
+
+### Current strategy rules
+- At 09:16 IST, use the first completed 1-minute NIFTY candle to select the nearest ATM strike.
+- Freeze that ATM strike for the whole day.
+- Use the near weekly expiry.
+- Start looking for entries after 09:36 IST.
+- Entry requires Theta/Vega Ratio >= 1.5.
+- Entry also requires 15-minute IV change <= +2%.
+- Sell the fixed ATM CE + PE straddle.
+- Target is 30% decay in combined premium from actual entry.
+- Stop is 15% expansion in combined premium from actual entry.
+- Maximum 2 trades per day.
+- Enforce a 10-minute cooldown after an exit.
+- Square off all open positions at 15:05 IST.
+- No overnight position.
+
+### Vega monitoring added to the strategy module
+The strategy core records Vega separately for the ATM Call and ATM Put and exposes:
+- Current CE Vega / Day High CE Vega / Day Low CE Vega.
+- Current PE Vega / Day High PE Vega / Day Low PE Vega.
+- Current combined ATM Vega / combined high / combined low.
+
+These Vega high/low values are monitoring information only and do not currently change the entry/exit rules.
+
+### Strategy note
+The current research version reconstructs Theta/Vega with a Black-Scholes-style calculation. The exact expiry calendar, IV convention, risk-free assumption, lot size, transaction costs and execution/slippage should be validated before production use.
 
 ### Vega calculation note
-The supplied script describes a proprietary combined-strike Vega calculation but does not disclose its exact weighting formula. The dashboard therefore uses a transparent simple sum by default, with an optional OI-weighted aggregation for research comparison. It does not claim to reproduce an undisclosed proprietary formula exactly.
-
-## Data handling
-The 10:00 lock is reconstructed from minute historical data, so the monitor can still capture the 10:00 snapshot when opened later during the same trading day. Previous-day IV is reconstructed consistently from the previous close option premium, previous index close, strike, expiry and the configurable calculation rate.
+The supplied original Vega script does not disclose its exact proprietary strike-weighting formula. The dashboard therefore keeps the combined-band aggregation transparent rather than claiming to reproduce an undisclosed formula exactly.
 
 ## Run
 ```bash
