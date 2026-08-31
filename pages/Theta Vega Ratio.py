@@ -6,27 +6,25 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from auth import require_login, logout_button, FIXED_CLIENT_ID
 from theta_vega_ratio import ThetaVegaConfig, VegaLegState, VegaState
 
 API = "https://api.dhan.co/v2"
 IST = ZoneInfo("Asia/Kolkata")
 
 st.set_page_config(page_title="Theta Vega Ratio", page_icon="Θ", layout="wide")
+client_id, access_token = require_login()
 st.title("Θ Theta Vega Ratio")
 st.caption("Intraday NIFTY short-premium monitor: Theta/Vega carry + IV condition + Vega high/low tracking")
+logout_button()
 
 with st.sidebar:
     st.subheader("Market Access")
-    client_id = st.text_input("Client ID", key="tvr_client_id")
-    access_token = st.text_input("Access Token", type="password", key="tvr_access_token")
+    st.caption(f"Fixed Client ID: {FIXED_CLIENT_ID}")
     refresh = st.selectbox("Refresh", [5, 10, 15, 30, 60], index=1, format_func=lambda x: f"Every {x}s")
     auto_refresh = st.checkbox("Auto-refresh", value=True)
     band = st.selectbox("ATM monitoring band", [0, 1, 2, 3], index=0,
                         format_func=lambda x: "ATM only" if x == 0 else f"ATM ±{x} strikes")
-
-if not client_id or not access_token:
-    st.info("Enter Client ID and Access Token to run the live Theta Vega Ratio monitor.")
-    st.stop()
 
 HEADERS = {
     "Accept": "application/json",
@@ -79,8 +77,7 @@ def flatten(data):
                 continue
             greeks = leg.get("greeks") or {}
             rows.append({
-                "Strike": strike,
-                "Side": side,
+                "Strike": strike, "Side": side,
                 "LTP": pd.to_numeric(leg.get("last_price"), errors="coerce"),
                 "IV": pd.to_numeric(leg.get("implied_volatility"), errors="coerce"),
                 "OI": pd.to_numeric(leg.get("oi"), errors="coerce"),
@@ -134,7 +131,6 @@ def live():
         atm = pick_atm(raw, spot)
         table, call_v, put_v, theta, vega, ratio, iv, premium = build_metrics(raw, atm, band)
 
-        # Persist day-high/day-low independently for each leg.
         state_key = f"tvr_vega_state_{expiry.isoformat()}"
         state = st.session_state.get(state_key)
         if state is None:
