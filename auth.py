@@ -1,5 +1,7 @@
 import streamlit as st
 
+# Fixed Dhan client ID requested for this dashboard.
+FIXED_CLIENT_ID = "1113195747"
 CLIENT_KEY = "shared_client_id"
 TOKEN_KEY = "shared_access_token"
 AUTH_KEY = "shared_authenticated"
@@ -7,18 +9,18 @@ AUTH_KEY = "shared_authenticated"
 
 def login_form() -> bool:
     st.title("Market Access")
-    st.caption("Sign in once to use all monitoring modules.")
+    st.caption("Client ID is fixed for this dashboard. Enter only the Access Token.")
+    st.info(f"Client ID: {FIXED_CLIENT_ID}")
 
     with st.form("shared_login_form"):
-        client_id = st.text_input("Client ID", key="login_client_id")
         access_token = st.text_input("Access Token", type="password", key="login_access_token")
         submitted = st.form_submit_button("LOGIN", type="primary", use_container_width=True)
 
     if submitted:
-        if not client_id.strip() or not access_token.strip():
-            st.error("Enter both Client ID and Access Token.")
+        if not access_token.strip():
+            st.error("Enter Access Token.")
             return False
-        st.session_state[CLIENT_KEY] = client_id.strip()
+        st.session_state[CLIENT_KEY] = FIXED_CLIENT_ID
         st.session_state[TOKEN_KEY] = access_token.strip()
         st.session_state[AUTH_KEY] = True
         st.rerun()
@@ -28,7 +30,7 @@ def login_form() -> bool:
 def is_authenticated() -> bool:
     return bool(
         st.session_state.get(AUTH_KEY)
-        and st.session_state.get(CLIENT_KEY)
+        and st.session_state.get(CLIENT_KEY) == FIXED_CLIENT_ID
         and st.session_state.get(TOKEN_KEY)
     )
 
@@ -36,7 +38,7 @@ def is_authenticated() -> bool:
 def credentials() -> tuple[str, str]:
     if not is_authenticated():
         raise RuntimeError("Not authenticated")
-    return st.session_state[CLIENT_KEY], st.session_state[TOKEN_KEY]
+    return FIXED_CLIENT_ID, st.session_state[TOKEN_KEY]
 
 
 def require_login() -> tuple[str, str]:
