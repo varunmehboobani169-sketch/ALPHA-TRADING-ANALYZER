@@ -18,9 +18,34 @@ A lightweight Streamlit market monitor focused on NIFTY and SENSEX.
 - Combines Vega across a configurable ATM−N to ATM+N strike band; default is ATM−2 to ATM+2.
 - Displays Call Vega, Put Vega and a transparent Vega Difference defined as Put Vega − Call Vega.
 - Tracks Vega change between refreshes and keeps a rolling signal history in the Streamlit session.
-- **Now also tracks ATM Call Vega current/high/low and ATM Put Vega current/high/low for the trading day.**
+- Tracks ATM Call Vega current/high/low and ATM Put Vega current/high/low for the trading day.
+- Shows current Vega, day high and day low for every monitored option leg.
 - On an expiry day, Auto expiry switches to the next available expiry, matching the behavior described in the supplied script.
 - Expiry discovery is cached for the trading day and option-chain requests are spaced by at least 3.2 seconds.
+
+## Vega Move Engine
+`vega_direction_engine.py` and `pages/Vega Move Engine.py` implement the new movement-first research engine.
+
+### Objective
+First answer: **Is a meaningful market move building?**
+Only after that answer is strong do we use Vega asymmetry to estimate direction.
+
+### Live outputs
+- Movement Score: 0–100.
+- Movement state: Quiet / Elevated / Movement Building / High Probability Move / Extreme Expansion.
+- Call-side Vega pressure and acceleration.
+- Put-side Vega pressure and acceleration.
+- IV asymmetry between calls and puts.
+- Call and put Vega position within the observed session range.
+- Direction Score: −100 to +100.
+- Direction: Neutral / Mild Bullish / Bullish / Mild Bearish / Bearish.
+- Confidence: Low / Medium / High.
+- Call Vega, Put Vega, ATM Vega and per-leg current/day-high/day-low values.
+
+The movement score intentionally treats simultaneous Call + Put Vega expansion as volatility expansion first, rather than automatically labeling it bullish or bearish.
+
+### Research interpretation
+The engine is a live research detector, not yet a validated trading edge. The next research step is to backtest each movement alert against forward NIFTY returns (5m, 10m, 15m, 30m and 60m) and measure how often different movement thresholds precede statistically meaningful moves.
 
 ## Theta Vega Ratio
 `theta_vega_ratio.py` contains the strategy core and `pages/Theta Vega Ratio.py` is the live dashboard module.
@@ -54,10 +79,11 @@ The current research version reconstructs Theta/Vega with a Black-Scholes-style 
 ### Vega calculation note
 The supplied original Vega script does not disclose its exact proprietary strike-weighting formula. The dashboard therefore keeps the combined-band aggregation transparent rather than claiming to reproduce an undisclosed formula exactly.
 
+## Authentication
+The Vega modules use a fixed Client ID configured as `1113195747`. The user enters only the Dhan Access Token; the Client ID is not manually changeable in those modules.
+
 ## Run
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-Enter the Client ID and Access Token in the sidebar. Credentials are kept in the Streamlit session.
