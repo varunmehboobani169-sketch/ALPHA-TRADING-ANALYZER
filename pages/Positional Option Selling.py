@@ -1,23 +1,82 @@
+import io
+import zipfile
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from positional_option_selling import STRATEGY_PRESETS, StrategyConfig, backtest, combine_csvs
+from positional_option_selling import STRATEGY_PRESETS, StrategyConfig, backtest, combine_csvs, normalize_option_data
 
 
 st.set_page_config(page_title="Positional Option Selling", page_icon="📈", layout="wide")
 st.title("📈 Positional Option Selling")
-st.caption("Historical NIFTY option-selling research • multi-year CSV backtest • strategy comparison")
+st.caption("Historical NIFTY option-selling research • upload one ZIP • validate • backtest • compare")
+
+
+def read_zip_dataset(uploaded_file):
+    """Extract every CSV from one uploaded ZIP and normalize into one dataset."""
+    raw_bytes = uploaded_file.getvalue()
+    with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+        members = [
+            name for name in zf.namelist()
+            if name.lower().endswith(".csv") and not name.startswith("__MACOSX/") and not name.endswith("/")
+        ]
+        if not members:
+            raise ValueError("The ZIP contains no CSV files.")
+
+        frames = []
+        errors = []
+        for member in members:
+            try:
+                with zf.open(member) as fh:
+                    raw = pd.read_csv(fh)
+                norm = normalize_option_data(raw)
+                norm["source_file"] = member
+                frames.append(norm)
+            except Exception as exc:
+                errors.append(f"{member}: {exc}")
+
+        if errors:
+            # Do not silently discard failed files; make the problem visible.
+            st.warning("Some ZIP members could not be read:\n\n" + "\n".join(errors))
+        if not frames:
+            raise ValueError("No readable CSV files were found inside the ZIP.")
+
+        data = pd.concat(frames, ignore_index=True)
+        data = data.drop_duplicates().sort_values("datetime").reset_index(drop=True)
+        return data, members
+
+
+def read_csv_dataset(uploaded_file):
+    raw = pd.read_csv(uploaded_file)
+    data = normalize_option_data(raw)
+    data["source_file"] = uploaded_file.name
+    return data.drop_duplicates().sort_values("datetime").reset_index(drop=True), [uploaded_file.name]
+
+
+def load_local_dataset():
+    paths = sorted(Path("data").glob("*.csv"))
+    if not paths:
+        return None, []
+    data = combine_csvs([str(p) for p in paths])
+    return data, [p.name for p in paths]
+
+
+def load_upload(uploaded_file):
+    if uploaded_file.name.lower().endswith(".zip"):
+        return read_zip_dataset(uploaded_file)
+    return read_csv_dataset(uploaded_file)
+
 
 with st.sidebar:
-    st.header("Data")
-    uploaded = st.file_uploader("Upload NIFTY option CSVs", type=["csv"], accept_multiple_files=True)
-    local_files = sorted(Path("data").glob("*.csv"))
-    if local_files:
-        st.caption(f"Repository data found: {len(local_files)} CSV file(s)")
-    else:
-        st.caption("No CSVs are currently stored in /data")
+    st.header("Historical Data")
+    uploaded = st.file_uploader(
+        "Upload one NIFTY option ZIP",
+        type=["zip", "csv"],
+        accept_multiple_files=False,
+        help="Preferred: one ZIP containing your NIFTY option CSVs for 2022–2026.",
+    )
+    st.caption("ZIP is the preferred format. Every CSV inside it is extracted, normalized and combined automatically.")
 
     st.header("Backtest")
     run_mode = st.radio("Mode", ["Compare strategies", "Single strategy"], index=0)
@@ -32,47 +91,51 @@ with st.sidebar:
     run = st.button("RUN BACKTEST", type="primary", use_container_width=True)
 
 
-def load_uploaded(files):
-    return combine_csvs(files)
+# Session persistence: the current uploaded dataset and its inventory remain available
+# across Streamlit reruns during the dashboard session.
+if uploaded is not None:
+    try:
+        data, members = load_upload(uploaded)
+        st.session_state["positional_dataset"] = data
+        st.session_state["positional_dataset_name"] = uploaded.name
+        st.session_state["positional_dataset_files"] = members
+    except Exception as exc:
+        st.error(f"Data load failed: {exc}")
+        st.stop()
+elif "positional_dataset" in st.session_state:
+    data = st.session_state["positional_dataset"]
+    members = st.session_state.get("positional_dataset_files", [])
+elif Path("data").exists():
+    try:
+        data, members = load_local_dataset()
+    except Exception as exc:
+        st.error(f"Repository data load failed: {exc}")
+        st.stop()
+else:
+    data, members = None, []
 
-
-def load_local(files):
-    return combine_csvs(files)
-
-
-def strategy_config(name: str) -> StrategyConfig:
-    return StrategyConfig(
-        name=name,
-        entry_time=entry_time,
-        exit_time=exit_time,
-        hold_trading_days=int(hold_days),
-        short_steps=int(short_steps),
-        wing_steps=int(wing_steps),
-    )
-
-
-files = uploaded if uploaded else local_files
-
-if not files:
-    st.info("Upload the NIFTY option CSV files or place them in the repository /data folder to begin.")
-    st.markdown("### Built-in strategy set")
-    st.write("ATM Short Straddle • OTM Short Strangle • Wide OTM Strangle • Iron Condor")
-    st.markdown("### Required historical fields")
+if data is None or data.empty:
+    st.info("Upload one ZIP containing the NIFTY option CSVs. The app will extract, validate and combine them automatically.")
+    st.markdown("### Expected dataset")
     st.write("Date/Datetime, Expiry, Strike, CE/PE and Close/LTP. Spot/Underlying is strongly recommended for ATM selection.")
+    st.markdown("### Strategy set")
+    st.write("ATM Short Straddle • OTM Short Strangle • Wide OTM Strangle • Iron Condor")
     st.stop()
 
-try:
-    data = load_uploaded(files) if uploaded else load_local(files)
-except Exception as exc:
-    st.error(f"Data load failed: {exc}")
-    st.stop()
+st.success(f"Loaded {len(members)} CSV file(s) from the current dataset.")
+with st.expander("Files detected", expanded=False):
+    st.write(members)
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Rows", f"{len(data):,}")
 c2.metric("Trading days", f"{data['date'].nunique():,}")
 c3.metric("Strikes", f"{data['strike'].nunique():,}")
 c4.metric("Expiries", f"{data['expiry'].dropna().nunique():,}")
-c5.metric("Files", f"{data['source_file'].nunique():,}")
+c5.metric("Spot rows", f"{data['spot'].notna().sum():,}")
+
+st.subheader("Detected data structure")
+st.write("Canonical fields:", list(data.columns))
+st.dataframe(data.head(20), use_container_width=True, hide_index=True)
 
 st.subheader("Data coverage")
 st.write({
@@ -103,7 +166,15 @@ if run:
     trade_logs = {}
 
     for name in names:
-        config = strategy_config(name)
+        base = STRATEGY_PRESETS[name]
+        config = StrategyConfig(
+            name=base.name,
+            entry_time=entry_time,
+            exit_time=exit_time,
+            hold_trading_days=int(hold_days),
+            short_steps=int(short_steps),
+            wing_steps=int(wing_steps),
+        )
         try:
             trades, stats = backtest(data, config, initial_capital=float(initial_capital), lot_size=int(lot_size))
             comparison.append({
@@ -149,8 +220,8 @@ if run:
                 mime="text/csv",
             )
     else:
-        st.warning("No valid trades were produced. Check the data timestamps, expiry coverage, and whether the dataset contains spot prices.")
+        st.warning("No valid trades were produced. Check timestamps, expiry coverage, and spot availability.")
 
 st.divider()
 st.subheader("Research guardrails")
-st.write("This is a research backtest engine. It does not yet model brokerage, exchange charges, taxes, bid/ask spread, slippage, margin utilisation, early assignment/exercise, or special expiry-day rules. Those should be added before judging live-trading viability.")
+st.write("This tab is the historical research layer. It does not yet assume a winning strategy. Costs, slippage, margin utilisation, event filters, expiry-day rules, adjustments and out-of-sample validation should be added before live-trading conclusions.")
