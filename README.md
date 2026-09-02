@@ -1,21 +1,25 @@
-# NIFTY Options Data Collector
+# NIFTY Historical Options Data Collector
 
-A clean Streamlit dashboard dedicated to collecting NIFTY option-chain data for research.
-
-## Collection universe
-- NIFTY nearest active option expiry (or manually selected expiry)
-- ATM determined from the NIFTY underlying using a 50-point strike step
-- ATM−20 through ATM+20 = 41 strikes
-- Both CE and PE = 82 option rows per snapshot
-
-## Collected fields
-Capture timestamp, trading date/time, expiry, NIFTY spot, ATM, strike offset, strike, option type, security ID, LTP, previous close, price change, OI, previous OI, OI change, volume, IV, Delta, Theta, Gamma, Vega, best bid/ask and quantities.
+This repository now focuses on historical NIFTY weekly-options data collection for research.
 
 ## Dashboard
-The Dhan login/token panel is permanently on the left sidebar. After connection, the dashboard lets you select expiry, set the polling interval, start/stop collection, inspect the complete ATM ±20 chain, monitor collection quality, and export the collected dataset as CSV.
+- Dhan login in the left sidebar.
+- Select a six-month block from 2024 onward.
+- Click **DOWNLOAD SIX MONTHS**.
+- The backend automatically splits the requested range into Dhan-compliant chunks of no more than 90 days.
+- NIFTY weekly expiries are discovered from Dhan's detailed instrument master.
+- NIFTY 1-minute spot data is used to determine the ATM strike for every minute.
+- The collector keeps contracts from ATM−20 through ATM+20 and both CE and PE.
+- Every completed weekly expiry is stored as an individual Parquet file and skipped on a future run, allowing the job to resume.
 
-## Dhan API
-The collector uses DhanHQ v2 Option Chain and Expiry List endpoints. Dhan documents the NIFTY underlying security ID as 13 for the example Option Chain request, and the Option Chain API supplies LTP, OI, IV, Greeks, volume and bid/ask data across strikes. The documented Option Chain rate limit is one unique request every 3 seconds, so the dashboard enforces a minimum 3-second polling interval.
+## Stored data
+`timestamp`, `date`, `time`, `expiry`, `security_id`, `spot`, `atm`, `strike_offset`, `moneyness`, `strike`, `option_type`, `open_price`, `high_price`, `low_price`, `close_price`, `volume`, `open_interest`, `iv`, `delta`, `gamma`, `theta`, `vega`, `time_to_expiry_years`.
+
+## Greeks
+Dhan's historical intraday endpoint provides 1-minute OHLC, volume and OI. Historical IV/Delta/Gamma/Theta/Vega are reconstructed locally from option close, NIFTY spot, strike, time to expiry and the selected risk-free rate using Black-Scholes-style calculations. Dhan's live Option Chain endpoint provides current OI, Greeks, volume, LTP, bid/ask and IV, but it is not a historical Greek series.
+
+## Important data limitation
+Dhan's dedicated expired-options rolling endpoint supplies historical minute-level OHLC, IV, OI, volume and spot, but its documented strike range for index options is ATM±10. The collector therefore attempts the requested ATM±20 universe through individual option Security IDs using the historical intraday endpoint. Any contract that Dhan does not make available historically is explicitly counted as a failed/missing contract rather than silently filled.
 
 ## Run
 ```bash
@@ -23,4 +27,4 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Keep the Dhan Access Token private and never commit it to GitHub.
+Never commit a Dhan Access Token to the repository.
