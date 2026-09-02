@@ -4,14 +4,12 @@ import json
 import math
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
 import requests
-from scipy.special import ndtr
 
 API = "https://api.dhan.co/v2"
 MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
@@ -94,11 +92,21 @@ def candles(client_id: str, token: str, security_id: str, segment: str, instrume
     if not frames: return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
     return pd.concat(frames, ignore_index=True).drop_duplicates("timestamp").sort_values("timestamp")
 
+def _ndtr(x):
+    """Standard normal CDF using NumPy only; avoids a SciPy runtime dependency."""
+    x = np.asarray(x, dtype=float)
+    ax = np.abs(x)
+    t = 1.0 / (1.0 + 0.2316419 * ax)
+    poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+    pdf = np.exp(-0.5 * ax * ax) / math.sqrt(2 * math.pi)
+    cdf_pos = 1.0 - pdf * poly
+    return np.where(x >= 0, cdf_pos, 1.0 - cdf_pos)
+
 def bs_price(S, K, T, r, sigma, call):
     T = np.maximum(T, 1e-8); sigma = np.maximum(sigma, 1e-8); sqrtT = np.sqrt(T)
     d1 = (np.log(np.maximum(S, 1e-12) / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
     d2 = d1 - sigma * sqrtT; df = np.exp(-r * T)
-    return np.where(call, S * ndtr(d1) - K * df * ndtr(d2), K * df * ndtr(-d2) - S * ndtr(-d1))
+    return np.where(call, S * _ndtr(d1) - K * df * _ndtr(d2), K * df * _ndtr(-d2) - S * _ndtr(-d1))
 
 def implied_vol(price, S, K, T, r, call):
     price, S, K, T = map(lambda x: np.asarray(x, float), (price, S, K, T)); call = np.asarray(call, bool)
@@ -118,8 +126,8 @@ def add_greeks(df: pd.DataFrame, r: float) -> pd.DataFrame:
     iv = implied_vol(price, S, K, T, r, call); sqrtT = np.sqrt(np.maximum(T, 1e-8)); sig = np.maximum(iv, 1e-8)
     d1 = (np.log(np.maximum(S,1e-12)/K) + (r + .5*sig*sig)*T) / (sig*sqrtT); d2 = d1 - sig*sqrtT
     pdf = np.exp(-.5*d1*d1)/math.sqrt(2*math.pi); dfact = np.exp(-r*T)
-    dc = ndtr(d1); gamma = pdf/(np.maximum(S,1e-12)*sig*sqrtT); vega = S*pdf*sqrtT/100.0
-    tc = (-(S*pdf*sig)/(2*sqrtT) - r*K*dfact*ndtr(d2))/365.0; tp = (-(S*pdf*sig)/(2*sqrtT) + r*K*dfact*ndtr(-d2))/365.0
+    dc = _ndtr(d1); gamma = pdf/(np.maximum(S,1e-12)*sig*sqrtT); vega = S*pdf*sqrtT/100.0
+    tc = (-(S*pdf*sig)/(2*sqrtT) - r*K*dfact*_ndtr(d2))/365.0; tp = (-(S*pdf*sig)/(2*sqrtT) + r*K*dfact*_ndtr(-d2))/365.0
     x["iv"], x["delta"], x["gamma"], x["vega"], x["theta"] = iv*100, np.where(call, dc, dc-1), gamma, vega, np.where(call, tc, tp)
     return x
 
