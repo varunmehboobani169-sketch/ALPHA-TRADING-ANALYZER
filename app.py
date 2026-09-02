@@ -1,135 +1,124 @@
 from __future__ import annotations
 
-import time
+import json
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
 
-from nifty_collector import capture_snapshot, expiries, WINDOW, STRIKE_STEP
+from auth import FIXED_CLIENT_ID, is_authenticated, credentials, login_form, logout_button
+from historical_nifty import JobConfig, run_job
 
-st.set_page_config(page_title="NIFTY ATM ±20 Collector", page_icon="📊", layout="wide")
-
-if "data" not in st.session_state:
-    st.session_state.data = pd.DataFrame()
-if "connected" not in st.session_state:
-    st.session_state.connected = False
-if "expiry_list" not in st.session_state:
-    st.session_state.expiry_list = []
-if "running" not in st.session_state:
-    st.session_state.running = False
+st.set_page_config(page_title="NIFTY 1-Min Historical Collector", page_icon="📊", layout="wide")
 
 with st.sidebar:
     st.header("🔐 Dhan Login")
-    client_id = st.text_input("Dhan Client ID", value="1113195747")
-    access_token = st.text_input("Dhan Access Token", type="password")
-    if st.button("Connect to Dhan", use_container_width=True, type="primary"):
-        if not access_token.strip():
-            st.error("Enter your Dhan Access Token.")
-        else:
-            try:
-                st.session_state.expiry_list = expiries(client_id, access_token)
-                st.session_state.connected = True
-                st.success("Dhan connected")
-            except Exception as exc:
-                st.session_state.connected = False
-                st.error(f"Connection failed: {exc}")
-
-    if st.session_state.connected:
-        st.success("API status: Connected")
-    st.divider()
-    st.subheader("Collection")
-    interval = st.number_input("Interval (seconds)", min_value=3, max_value=60, value=5, step=1)
-    expiry_mode = st.radio("Expiry", ["Nearest active", "Choose expiry"])
-    if st.session_state.connected and st.session_state.expiry_list:
-        expiry = st.session_state.expiry_list[0] if expiry_mode == "Nearest active" else st.selectbox("Expiry", st.session_state.expiry_list)
+    if is_authenticated():
+        st.success(f"Connected • {FIXED_CLIENT_ID}")
+        logout_button()
     else:
-        expiry = None
+        st.caption("Use your Dhan Access Token. It stays in the Streamlit session and is never written to GitHub.")
+        login_form()
+
+st.title("📊 NIFTY Weekly Options — Historical Data Collector")
+st.caption("Six-month blocks • 1-minute candles • weekly expiry • dynamic ATM ±20 • OI + Volume + IV + Greeks")
+
+if not is_authenticated():
+    st.info("Log in from the left sidebar to access the historical collector.")
+    st.stop()
+
+client_id, token = credentials()
+out_dir = Path("data/historical")
+out_dir.mkdir(parents=True, exist_ok=True)
+
+with st.sidebar:
     st.divider()
-    st.write("**Universe**")
-    st.write("NIFTY ATM−20 … ATM … ATM+20")
-    st.write("41 strikes × CE/PE = 82 rows/snapshot")
-    st.write(f"Strike step: {STRIKE_STEP} points")
-    if st.button("Clear collected data", use_container_width=True):
-        st.session_state.data = pd.DataFrame()
-        st.session_state.running = False
-        st.rerun()
-    st.caption("The access token is held only in the current Streamlit session; do not commit it to GitHub.")
+    st.subheader("Historical Range")
+    period = st.selectbox("Six-month block", [
+        "2024 H1  • Jan–Jun", "2024 H2  • Jul–Dec",
+        "2025 H1  • Jan–Jun", "2025 H2  • Jul–Dec",
+        "2026 H1  • Jan–Jun", "2026 H2  • Jul–Dec",
+    ], index=0)
+    rf = st.number_input("Risk-free rate (%)", min_value=0.0, max_value=20.0, value=6.5, step=0.25)
+    start_button = st.button("🚀 DOWNLOAD SIX MONTHS", type="primary", use_container_width=True)
+    st.caption("The backend automatically chunks the selected six-month period into API-safe windows and resumes completed expiries.")
 
-st.title("📊 NIFTY Options Data Collection Dashboard")
-st.caption("Clean collection layer for future backtesting and strategy research.")
+ranges = {
+    "2024 H1  • Jan–Jun": ("2024-01-01", "2024-07-01"),
+    "2024 H2  • Jul–Dec": ("2024-07-01", "2025-01-01"),
+    "2025 H1  • Jan–Jun": ("2025-01-01", "2025-07-01"),
+    "2025 H2  • Jul–Dec": ("2025-07-01", "2026-01-01"),
+    "2026 H1  • Jan–Jun": ("2026-01-01", "2026-07-01"),
+    "2026 H2  • Jul–Dec": ("2026-07-01", "2027-01-01"),
+}
+start, end = ranges[period]
+job_dir = out_dir / period.split("  ")[0].replace(" ", "_")
+job_dir.mkdir(parents=True, exist_ok=True)
 
-if not st.session_state.connected:
-    st.info("Connect to Dhan from the left sidebar to begin.")
-    st.stop()
-if not expiry:
-    st.error("No active NIFTY option expiry found.")
-    st.stop()
-
-c1, c2, c3, c4 = st.columns(4)
-if c1.button("▶ Start", type="primary", use_container_width=True):
-    st.session_state.running = True
-if c2.button("⏹ Stop", use_container_width=True):
-    st.session_state.running = False
-c3.metric("Selected expiry", expiry)
-snapshots = int(st.session_state.data["captured_at"].nunique()) if not st.session_state.data.empty else 0
-c4.metric("Snapshots", f"{snapshots:,}")
-
-if st.session_state.running:
+summary_path = job_dir / "job_summary.json"
+if summary_path.exists():
     try:
-        snap = capture_snapshot(client_id, access_token, expiry)
-        st.session_state.data = pd.concat([st.session_state.data, snap], ignore_index=True)
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if summary.get("status") == "complete":
+            st.success(f"Completed: {period} • {summary.get('expiry_done', 0)}/{summary.get('expiry_total', 0)} weekly expiries • {summary.get('rows', 0):,} rows")
+    except Exception:
+        pass
+
+st.subheader("Collection specification")
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Period", period.split("  ")[0])
+c2.metric("Frequency", "1 minute")
+c3.metric("Universe", "ATM −20 … +20")
+c4.metric("Sides", "CE + PE")
+c5.metric("Per minute", "Up to 82 contracts")
+
+st.info("The backend breaks the six-month range into chunks of at most 90 days, discovers NIFTY weekly contracts from Dhan's instrument master, retrieves 1-minute OHLC/OI/Volume, maps each minute to the actual ATM strike using NIFTY spot, and keeps only ATM−20 through ATM+20. Each weekly expiry is checkpointed separately.")
+
+progress_bar = st.progress(0.0)
+status_box = st.empty()
+
+if start_button:
+    def update_progress(p):
+        total = max(int(p.get("expiry_total", 1)), 1)
+        done = int(p.get("expiry_done", 0))
+        progress_bar.progress(min(done / total, 1.0))
+        status_box.write(
+            f"**{p.get('status', 'running').upper()}** — expiry {p.get('expiry', 'preparing')} — "
+            f"{done}/{total} expiries — {int(p.get('rows', 0)):,} rows — "
+            f"failed contracts: {int(p.get('failed_contracts', 0)):,}"
+        )
+    try:
+        result = run_job(
+            client_id, token,
+            JobConfig(start=start, end=end, risk_free_rate=float(rf) / 100.0),
+            job_dir, progress_cb=update_progress,
+        )
+        progress_bar.progress(1.0)
+        status_box.success(f"Historical collection completed for {period}. {result.get('rows', 0):,} rows written.")
     except Exception as exc:
-        st.error(f"Collection error: {exc}")
+        status_box.error(f"Collector failed: {exc}")
 
-if not st.session_state.data.empty:
-    df = st.session_state.data.copy()
-    latest_ts = df["captured_at"].max()
-    latest = df[df["captured_at"] == latest_ts].copy()
-    spot = float(latest["spot"].iloc[0])
-    atm = int(latest["atm"].iloc[0])
+files = sorted(job_dir.glob("nifty_weekly_*.parquet"))
+if files:
+    st.subheader("Saved weekly datasets")
+    rows = []
+    for path in files:
+        try:
+            d = pd.read_parquet(path, columns=["timestamp", "expiry", "strike_offset", "option_type"])
+            rows.append({"File": path.name, "Expiry": str(d["expiry"].iloc[0]) if len(d) else "", "Rows": len(d), "Strikes observed": d["strike_offset"].nunique() if len(d) else 0, "Size MB": round(path.stat().st_size / 1e6, 1)})
+        except Exception:
+            rows.append({"File": path.name, "Expiry": "error", "Rows": 0, "Strikes observed": 0, "Size MB": round(path.stat().st_size / 1e6, 1)})
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    chosen = st.selectbox("Preview dataset", [p.name for p in files])
+    preview_path = job_dir / chosen
+    try:
+        preview = pd.read_parquet(preview_path)
+        st.dataframe(preview.head(300), use_container_width=True, hide_index=True)
+        st.download_button("⬇ Download selected weekly Parquet", preview_path.read_bytes(), file_name=chosen, mime="application/octet-stream", use_container_width=True)
+    except Exception as exc:
+        st.error(f"Preview failed: {exc}")
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("NIFTY Spot", f"{spot:,.2f}")
-    m2.metric("ATM", f"{atm:,}")
-    m3.metric("Rows", f"{len(latest):,}/82")
-    m4.metric("Snapshots", f"{snapshots:,}")
-    m5.metric("Last capture", str(latest_ts)[11:19])
-
-    st.subheader("Current ATM ±20 Chain")
-    ce = latest[latest.option_type == "CE"].set_index("strike")
-    pe = latest[latest.option_type == "PE"].set_index("strike")
-    table = pd.DataFrame({"Strike": sorted(set(ce.index).union(pe.index))})
-    table["Offset"] = ((table["Strike"] - atm) / STRIKE_STEP).astype(int)
-    table["Level"] = table["Offset"].map(lambda x: "ATM" if x == 0 else f"ATM{x:+d}")
-    for side, frame in (("CE", ce), ("PE", pe)):
-        for field, label in (("last_price", "LTP"), ("oi", "OI"), ("oi_change", "OI Chg"), ("volume", "Volume"), ("iv", "IV"), ("vega", "Vega"), ("bid", "Bid"), ("ask", "Ask")):
-            table[f"{side} {label}"] = table["Strike"].map(frame[field])
-    st.dataframe(table, use_container_width=True, hide_index=True)
-
-    st.subheader("ATM Summary")
-    if atm in ce.index and atm in pe.index:
-        a = st.columns(6)
-        a[0].metric("ATM CE", f"{float(ce.loc[atm, 'last_price']):,.2f}")
-        a[1].metric("ATM PE", f"{float(pe.loc[atm, 'last_price']):,.2f}")
-        a[2].metric("Straddle", f"{float(ce.loc[atm, 'last_price']) + float(pe.loc[atm, 'last_price']):,.2f}")
-        a[3].metric("CE OI", f"{int(ce.loc[atm, 'oi']):,}")
-        a[4].metric("PE OI", f"{int(pe.loc[atm, 'oi']):,}")
-        avg_iv = (float(ce.loc[atm, 'iv']) + float(pe.loc[atm, 'iv'])) / 2
-        a[5].metric("ATM Avg IV", f"{avg_iv:.2f}")
-
-    st.subheader("Collection Quality")
-    q = st.columns(4)
-    q[0].metric("Rows/snapshot", f"{len(latest)}/82")
-    q[1].metric("Missing LTP", f"{int(latest['last_price'].isna().sum())}")
-    q[2].metric("Missing OI", f"{int(latest['oi'].isna().sum())}")
-    q[3].metric("Strikes captured", f"{latest['strike'].nunique()}/41")
-
-    st.subheader("Collected Data")
-    st.dataframe(df.sort_values("captured_at", ascending=False).head(82 * 10), use_container_width=True, hide_index=True)
-    st.download_button("⬇ Download CSV", df.to_csv(index=False).encode("utf-8"), f"nifty_atm_pm20_{expiry}.csv", "text/csv", use_container_width=True)
-else:
-    st.info("No snapshots yet. Press Start to collect the first ATM ±20 snapshot.")
-
-if st.session_state.running:
-    st.caption(f"Collector running — polling every {interval} seconds.")
-    time.sleep(int(interval))
-    st.rerun()
+st.divider()
+st.subheader("Dataset schema")
+st.code("timestamp, date, time, expiry, security_id, spot, atm, strike_offset, moneyness, strike, option_type, open_price, high_price, low_price, close_price, volume, open_interest, iv, delta, gamma, theta, vega, time_to_expiry_years")
+st.caption("IV and Greeks are reconstructed from historical option close + NIFTY spot using Black-Scholes-style calculations and the selected risk-free rate. Dhan's historical intraday endpoint supplies 1-minute OHLC/OI/Volume; current Dhan Option Chain supplies live Greeks but is not a historical Greek series.")
