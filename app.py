@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
+import traceback
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from auth import FIXED_CLIENT_ID, is_authenticated, credentials, login_form, logout_button
-from historical_nifty import JobConfig, run_job
 
 st.set_page_config(page_title="NIFTY 1-Min Historical Collector", page_icon="📊", layout="wide")
 
@@ -78,25 +78,33 @@ progress_bar = st.progress(0.0)
 status_box = st.empty()
 
 if start_button:
-    def update_progress(p):
-        total = max(int(p.get("expiry_total", 1)), 1)
-        done = int(p.get("expiry_done", 0))
-        progress_bar.progress(min(done / total, 1.0))
-        status_box.write(
-            f"**{p.get('status', 'running').upper()}** — expiry {p.get('expiry', 'preparing')} — "
-            f"{done}/{total} expiries — {int(p.get('rows', 0)):,} rows — "
-            f"failed contracts: {int(p.get('failed_contracts', 0)):,}"
-        )
     try:
+        # Lazy import: keeps the Streamlit UI bootable even if a data-processing module has an environment issue.
+        from historical_nifty import JobConfig, run_job
+
+        def update_progress(p):
+            total = max(int(p.get("expiry_total", 1)), 1)
+            done = int(p.get("expiry_done", 0))
+            progress_bar.progress(min(done / total, 1.0))
+            status_box.write(
+                f"**{p.get('status', 'running').upper()}** — expiry {p.get('expiry', 'preparing')} — "
+                f"{done}/{total} expiries — {int(p.get('rows', 0)):,} rows — "
+                f"failed contracts: {int(p.get('failed_contracts', 0)):,}"
+            )
+
         result = run_job(
-            client_id, token,
+            client_id,
+            token,
             JobConfig(start=start, end=end, risk_free_rate=float(rf) / 100.0),
-            job_dir, progress_cb=update_progress,
+            job_dir,
+            progress_cb=update_progress,
         )
         progress_bar.progress(1.0)
         status_box.success(f"Historical collection completed for {period}. {result.get('rows', 0):,} rows written.")
     except Exception as exc:
         status_box.error(f"Collector failed: {exc}")
+        with st.expander("Technical error details"):
+            st.code(traceback.format_exc())
 
 files = sorted(job_dir.glob("nifty_weekly_*.parquet"))
 if files:
@@ -106,8 +114,8 @@ if files:
         try:
             d = pd.read_parquet(path, columns=["timestamp", "expiry", "strike_offset", "option_type"])
             rows.append({"File": path.name, "Expiry": str(d["expiry"].iloc[0]) if len(d) else "", "Rows": len(d), "Strikes observed": d["strike_offset"].nunique() if len(d) else 0, "Size MB": round(path.stat().st_size / 1e6, 1)})
-        except Exception:
-            rows.append({"File": path.name, "Expiry": "error", "Rows": 0, "Strikes observed": 0, "Size MB": round(path.stat().st_size / 1e6, 1)})
+        except Exception as exc:
+            rows.append({"File": path.name, "Expiry": f"read error: {exc}", "Rows": 0, "Strikes observed": 0, "Size MB": round(path.stat().st_size / 1e6, 1)})
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     chosen = st.selectbox("Preview dataset", [p.name for p in files])
     preview_path = job_dir / chosen
